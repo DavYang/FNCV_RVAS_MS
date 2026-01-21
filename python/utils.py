@@ -31,13 +31,14 @@ def get_env_var(name: str) -> str:
 # FIX: Added driver_mem parameter
 def init_hail(log_prefix: str, driver_mem="8g", reference="GRCh38"):
     hl.init(
-        default_reference=reference, 
         log=f'/tmp/hail_{log_prefix}.log',
         spark_conf={
             'spark.driver.memory': driver_mem,
             'spark.executor.memory': '8g'
         }
     )
+    if reference:
+        hl.default_reference(reference)
 
 def setup_logger(name: str) -> logging.Logger:
     logging.basicConfig(
