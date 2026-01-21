@@ -30,7 +30,7 @@ def main():
     config = load_config("config/config.json")
     
     # Initialize with high memory
-    init_hail("data_prep", driver_mem="16g")
+    init_hail("data_prep", driver_mem="16g", reference="GRCh38")
 
     # Paths
     ANCESTRY_PATH = config['inputs']['ancestry_pred']

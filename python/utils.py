@@ -29,9 +29,9 @@ def get_env_var(name: str) -> str:
     return val
 
 # FIX: Added driver_mem parameter
-def init_hail(log_prefix: str, driver_mem="8g"):
+def init_hail(log_prefix: str, driver_mem="8g", reference="GRCh38"):
     hl.init(
-        default_reference='GRCh38', 
+        default_reference=reference, 
         log=f'/tmp/hail_{log_prefix}.log',
         spark_conf={
             'spark.driver.memory': driver_mem,
