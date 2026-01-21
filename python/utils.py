@@ -16,7 +16,6 @@ def load_config(config_path="config/config.json"):
     # Inject Bucket into output paths dynamically if needed
     bucket = os.getenv("WORKSPACE_BUCKET")
     if bucket:
-        # Helper to prepend bucket to relative output paths
         for key in config['outputs']:
             if not config['outputs'][key].startswith("gs://"):
                 config['outputs'][key] = f"{bucket}/{config['outputs'][key]}"
@@ -29,8 +28,16 @@ def get_env_var(name: str) -> str:
         raise EnvironmentError(f"Required environment variable {name} is not set.")
     return val
 
-def init_hail(log_prefix: str):
-    hl.init(default_reference='GRCh38', log=f'/tmp/hail_{log_prefix}.log')
+# FIX: Added driver_mem parameter
+def init_hail(log_prefix: str, driver_mem="8g"):
+    hl.init(
+        default_reference='GRCh38', 
+        log=f'/tmp/hail_{log_prefix}.log',
+        spark_conf={
+            'spark.driver.memory': driver_mem,
+            'spark.executor.memory': '8g'
+        }
+    )
 
 def setup_logger(name: str) -> logging.Logger:
     logging.basicConfig(

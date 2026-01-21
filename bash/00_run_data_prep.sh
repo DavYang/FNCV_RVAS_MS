@@ -35,9 +35,6 @@ if [ ! -f "${PYTHON_DIR}/${SCRIPT_NAME}.py" ]; then
 fi
 
 # Run in background with nohup
-# > redirects standard output to log
-# 2>&1 redirects errors to the same log
-# & puts it in the background
 nohup python3 "${PYTHON_DIR}/${SCRIPT_NAME}.py" > "${LOG_FILE}" 2>&1 &
 
 PID=$!

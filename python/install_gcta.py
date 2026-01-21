@@ -16,7 +16,6 @@ def install_gcta():
         return
 
     logger.info("Installing GCTA...")
-    # Using the updated URL for version 1.94.4
     url = "https://yanglab.westlake.edu.cn/software/gcta/bin/gcta-1.94.4-linux-kernel-3-x86_64.zip"
     zip_name = "gcta.zip"
     
@@ -25,7 +24,6 @@ def install_gcta():
         subprocess.run(["unzip", "-o", zip_name], check=True)
         
         # Find binary and move it
-        # The zip usually extracts to a folder named gcta-1.94.4-linux-kernel-3-x86_64
         extracted_folder = "gcta-1.94.4-linux-kernel-3-x86_64"
         src = os.path.join(extracted_folder, "gcta64")
         

@@ -39,7 +39,6 @@ def main():
         return
 
     # 4. Greedy Clumping (Distance-Based)
-    # Move to Pandas for simple iteration (assuming <100k hits)
     logger.info("Collecting hits for clumping...")
     df_sig = sig_ht.select('p_value').to_pandas()
     df_sig['chrom'] = df_sig['locus'].apply(lambda x: x.contig)
