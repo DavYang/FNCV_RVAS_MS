@@ -1,0 +1,27 @@
+{
+    "inputs": {
+        "wgs_mt": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt",
+        "ancestry_pred": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
+        "phenotype_gwas": "gs://fc-aou-datasets-controlled/AllxAll/v1/ht/ACAF/EUR/phenotype_NS_326.1_ACAF_results.ht"
+    },
+    "outputs": {
+        "base_dir": "results",
+        "intermediate_dir": "tmp",
+        "data_dir": "data",
+        "loci_bed": "results/phase2_defined_loci.bed",
+        "finemap_dir": "results/fine_mapping"
+    },
+    "params": {
+        "n_intervals": 4000,
+        "window_size": 50000,
+        "target_variants": 500000,
+        "maf_threshold": 0.05,
+        "call_rate_threshold": 0.95,
+        "gwas_p_threshold": 5e-8,
+        "locus_flank_window": 500000,
+        "mhc_interval": "chr6:25000000-35000000"
+    },
+    "tools": {
+        "gcta": "tools/gcta64"
+    }
+}
