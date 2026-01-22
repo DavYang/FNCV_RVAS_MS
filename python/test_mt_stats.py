@@ -61,9 +61,9 @@ def main():
         
         logger.info(f"Testing PLINK export to: {test_export_path}")
         
-        # REPARTITION TO FIX PERFORMANCE BLOCK
-        logger.info("Repartitioning to 100 partitions before sampling/export...")
-        mt = mt.repartition(100)
+        # REPARTITION TO FIX PERFORMANCE BLOCK (FAST)
+        logger.info("Coalescing to 100 partitions (naive_coalesce) before sampling/export...")
+        mt = mt.naive_coalesce(100)
         
         # Downsample drastically for test (0.001% of rows)
         mt_small = mt.sample_rows(0.00001, seed=42)

@@ -121,17 +121,14 @@ def process_mt_for_export(mt, params):
     """Process MatrixTable (QC, filtering) for export."""
     
     # Repartition to fix 145k partition issue
-    # Reduced to 100 partitions for lightweight data export efficiency
-    logger.info("Repartitioning MatrixTable to 100 partitions...")
-    mt = mt.repartition(100)
+    # Use naive_coalesce for INSTANT repartitioning (no shuffle)
+    logger.info("Coalescing MatrixTable to 100 partitions (naive_coalesce)...")
+    mt = mt.naive_coalesce(100)
     
     # HARDCODED: SKIP VARIANT QC
-    # We are explicitly skipping Hail-based QC to speed up the process.
-    # QC will be performed using PLINK on the exported files.
     logger.info("Skipping Hail Variant QC (QC will be performed in PLINK)")
 
     # HARDCODED: SKIP DOWNSAMPLING
-    # We are exporting all variants to PLINK for downstream QC and analysis.
     logger.info("Skipping downsampling (all variants will be exported)")
     
     n_total = mt.count_rows()
