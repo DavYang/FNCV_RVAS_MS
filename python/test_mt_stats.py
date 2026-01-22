@@ -61,8 +61,14 @@ def main():
         
         logger.info(f"Testing PLINK export to: {test_export_path}")
         
+        # REPARTITION TO FIX PERFORMANCE BLOCK
+        logger.info("Repartitioning to 100 partitions before sampling/export...")
+        mt = mt.repartition(100)
+        
         # Downsample drastically for test (0.001% of rows)
         mt_small = mt.sample_rows(0.00001, seed=42)
+        
+        # Force a count to ensure repartition is processed
         n_small = mt_small.count_rows()
         logger.info(f"Exporting small sample ({n_small} variants)...")
         
