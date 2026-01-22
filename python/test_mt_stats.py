@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import os
 import hail as hl
 from utils import load_config, init_hail, setup_logger
 
@@ -48,10 +49,56 @@ def main():
         logger.info(f"Row fields:   {row_fields[:5]}...")  # First 5 fields
         
         logger.info("=======================================")
+        
+        # --- TEST EXPORT TO BUCKET ---
+        workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
+        if not workspace_bucket:
+            logger.error("❌ WORKSPACE_BUCKET environment variable not found!")
+            sys.exit(1)
+            
+        logger.info(f"Detected Workspace Bucket: {workspace_bucket}")
+        test_export_path = f"{workspace_bucket}/tmp/test_plink_export/test_sample"
+        
+        logger.info(f"Testing PLINK export to: {test_export_path}")
+        
+        # Downsample drastically for test (0.001% of rows)
+        mt_small = mt.sample_rows(0.00001, seed=42)
+        n_small = mt_small.count_rows()
+        logger.info(f"Exporting small sample ({n_small} variants)...")
+        
+        if n_small == 0:
+             logger.warning("Sample too small, taking first 100 rows instead.")
+             mt_small = mt.head(100)
+        
+        hl.export_plink(
+            mt_small,
+            test_export_path,
+            ind_id=mt_small.s,
+            fam_id=mt_small.s
+        )
+        
+        # Verify files exist
+        extensions = ['.bed', '.bim', '.fam']
+        missing = []
+        for ext in extensions:
+            path = test_export_path + ext
+            if hl.hadoop_exists(path):
+                logger.info(f"✅ Created: {path}")
+            else:
+                logger.error(f"❌ FAILED to create: {path}")
+                missing.append(path)
+                
+        if missing:
+            logger.error("Export test FAILED.")
+            sys.exit(1)
+            
+        logger.info("✅ PLINK export test successful.")
+        
+        logger.info("=======================================")
         logger.info("Test completed successfully.")
         
     except Exception as e:
-        logger.error(f"Failed to read MatrixTable: {e}")
+        logger.error(f"Test failed with error: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

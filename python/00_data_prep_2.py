@@ -12,27 +12,30 @@ logger = setup_logger("data_prep")
 def perform_plink_export(mt, output_dir, config, timestamp):
     """Export MatrixTable to PLINK with dated directory."""
     
-    # Create dated output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # Note: os.makedirs is not needed for gs:// paths and won't work
+    if not output_dir.startswith("gs://"):
+        os.makedirs(output_dir, exist_ok=True)
     
-    # Update latest symlink
-    latest_link = f"{config['outputs']['data_dir']}/latest"
-    
-    # Use lexists to catch broken symlinks too
-    if os.path.lexists(latest_link):
+    # Symlinks don't work on GS, so we skip that logic if using GS
+    if not output_dir.startswith("gs://"):
+        # Update latest symlink (Local only)
+        latest_link = f"{os.path.dirname(output_dir)}/latest"
+        
+        if os.path.lexists(latest_link):
+            try:
+                if os.path.islink(latest_link):
+                    os.remove(latest_link)
+                else:
+                    logger.warning(f"{latest_link} exists but is not a symlink. Skipping update.")
+            except Exception as e:
+                logger.warning(f"Could not remove existing symlink {latest_link}: {e}")
+                
         try:
-            if os.path.islink(latest_link):
-                os.remove(latest_link)
-            else:
-                logger.warning(f"{latest_link} exists but is not a symlink. Skipping update.")
+            os.symlink(os.path.basename(output_dir), latest_link)
         except Exception as e:
-            logger.warning(f"Could not remove existing symlink {latest_link}: {e}")
-            
-    try:
-        # Create relative symlink
-        os.symlink(os.path.basename(output_dir), latest_link)
-    except Exception as e:
-        logger.warning(f"Could not create symlink {latest_link}: {e}")
+            logger.warning(f"Could not create symlink {latest_link}: {e}")
+    else:
+        logger.info(f"Skipping symlink creation for GS path: {output_dir}")
     
     # Export base path
     plink_base = f"{output_dir}/eur_common_snps_500k"
@@ -46,18 +49,20 @@ def perform_plink_export(mt, output_dir, config, timestamp):
         fam_id=mt.s
     )
     
-    # Write export metadata
+    # Write export metadata (Supports both local and GS)
     metadata_file = f"{output_dir}/export_metadata.txt"
-    with open(metadata_file, 'w') as f:
-        f.write(f"Export timestamp: {timestamp}\n")
-        f.write(f"Variants: {mt.count_rows()}\n")
-        f.write(f"Samples: {mt.count_cols()}\n")
-        f.write(f"Checkpoint source: {config['outputs']['intermediate_dir']}/wgs_eur_intervals.mt\n")
-        f.write(f"Config: {config}\n")
+    try:
+        with hl.hadoop_open(metadata_file, 'w') as f:
+            f.write(f"Export timestamp: {timestamp}\n")
+            f.write(f"Variants: {mt.count_rows()}\n")
+            f.write(f"Samples: {mt.count_cols()}\n")
+            f.write(f"Checkpoint source: {config['outputs']['intermediate_dir']}/wgs_eur_intervals.mt\n")
+            f.write(f"Config: {config}\n")
+    except Exception as e:
+        logger.warning(f"Failed to write metadata file to {metadata_file}: {e}")
     
     logger.info(f"PLINK export complete: {plink_base}")
     logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Latest symlink: {latest_link}")
 
 def perform_filtering_and_checkpoint(config, checkpoint_path, params):
     """Run the initial filtering pipeline and checkpoint."""
@@ -148,11 +153,23 @@ def main():
     # Checkpoint path
     checkpoint_path = f"{config['outputs']['intermediate_dir']}/wgs_eur_intervals.mt"
     
-    # Output directory with timestamp
-    if params.get('dated_exports', True):
-        dated_output_dir = f"{config['outputs']['data_dir']}/{timestamp}"
+    # Determine Output Directory (Workspace Bucket vs Local)
+    workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
+    data_dir_suffix = config['outputs'].get('data_dir_suffix', 'data')
+    
+    if workspace_bucket:
+        logger.info(f"Detected AoU Workspace Bucket: {workspace_bucket}")
+        base_data_dir = f"{workspace_bucket}/{data_dir_suffix}"
     else:
-        dated_output_dir = config['outputs']['data_dir']
+        logger.warning("WORKSPACE_BUCKET not found. Falling back to local 'data' directory (WARNING: Disk space low!)")
+        base_data_dir = "data"
+
+    if params.get('dated_exports', True):
+        dated_output_dir = f"{base_data_dir}/{timestamp}"
+    else:
+        dated_output_dir = base_data_dir
+
+    logger.info(f"Target Output Directory: {dated_output_dir}")
 
     # Check for existing checkpoint
     if hl.hadoop_exists(checkpoint_path):

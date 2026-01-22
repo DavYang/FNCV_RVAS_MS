@@ -7,7 +7,7 @@
     "outputs": {
         "base_dir": "results",
         "intermediate_dir": "gs://fc-secure-b43840eb-548f-464d-bece-31ac7a969abd/tmp",
-        "data_dir": "data",
+        "data_dir_suffix": "data",
         "loci_bed": "results/phase2_defined_loci.bed",
         "finemap_dir": "results/fine_mapping"
     },
