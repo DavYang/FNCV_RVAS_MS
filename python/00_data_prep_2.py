@@ -76,20 +76,28 @@ def perform_filtering_and_checkpoint(config, checkpoint_path, params):
     eur_ids = set(ancestry_df[ancestry_df['ancestry_pred'] == 'eur']['research_id'].astype(str))
 
     # Intervals
-    logger.info("Generating random intervals...")
+    logger.info("Generating random intervals (Optimized: Fewer, Larger)...")
     rg = hl.get_reference('GRCh38')
     lengths = rg.lengths
     chroms = [f"chr{i}" for i in range(1, 23)]
     hl_intervals = []
     
-    # Generate random intervals (Original Simple Method)
-    for _ in range(params['n_intervals']):
+    # --- OPTIMIZED INTERVAL STRATEGY ---
+    # Analysis Plan: "Randomly select 4,000 genomic intervals of 50kb each... ~200Mb"
+    # To fix 145k partition issue, we generate 40 x 5Mb intervals instead.
+    # Total coverage: 40 * 5Mb = 200Mb.
+    
+    n_large_intervals = 40
+    large_window_size = 5_000_000  # 5 Mb
+    
+    logger.info(f"Strategy: {n_large_intervals} intervals of {large_window_size/1e6} Mb each")
+    
+    for _ in range(n_large_intervals):
         chrom = random.choice(chroms)
         chrom_len = lengths[chrom]
-        start = random.randint(1, chrom_len - params['window_size'])
-        if start + params['window_size'] > chrom_len:
-            start = chrom_len - params['window_size']
-        interval = hl.locus_interval(chrom, start, start + params['window_size'], reference_genome='GRCh38')
+        # Ensure we don't go out of bounds
+        start = random.randint(1, chrom_len - large_window_size)
+        interval = hl.locus_interval(chrom, start, start + large_window_size, reference_genome='GRCh38')
         hl_intervals.append(interval)
 
     # 1. Read WGS MatrixTable
@@ -97,7 +105,7 @@ def perform_filtering_and_checkpoint(config, checkpoint_path, params):
     wgs_mt = hl.read_matrix_table(WGS_MT_PATH)
     
     # 2. Filter to Intervals (Optimized)
-    logger.info(f"Filtering MatrixTable to {len(hl_intervals)} intervals using filter_intervals...")
+    logger.info(f"Filtering MatrixTable to {len(hl_intervals)} large intervals using filter_intervals...")
     # Use filter_intervals which is much faster than filter_rows with lookup
     mt = hl.filter_intervals(wgs_mt, hl_intervals)
     
@@ -122,6 +130,7 @@ def process_mt_for_export(mt, params):
     
     # Repartition to fix 145k partition issue
     # Use naive_coalesce for INSTANT repartitioning (no shuffle)
+    # 100 partitions is appropriate for ~200Mb of genotype data
     logger.info("Coalescing MatrixTable to 100 partitions (naive_coalesce)...")
     mt = mt.naive_coalesce(100)
     

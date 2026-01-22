@@ -2,7 +2,7 @@
 set -e
 
 # --- Configuration ---
-SCRIPT_NAME="00_data_prep"
+SCRIPT_NAME="00_data_prep_2"
 BASE_DIR=$(pwd)
 PYTHON_DIR="${BASE_DIR}/python"
 LOG_DIR="${BASE_DIR}/logs"
