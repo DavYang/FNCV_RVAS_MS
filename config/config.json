@@ -19,7 +19,9 @@
         "call_rate_threshold": 0.95,
         "gwas_p_threshold": 5e-8,
         "locus_flank_window": 500000,
-        "mhc_interval": "chr6:25000000-35000000"
+        "mhc_interval": "chr6:25000000-35000000",
+        "skip_variant_qc": true,
+        "dated_exports": true
     },
     "tools": {
         "gcta": "tools/gcta64"

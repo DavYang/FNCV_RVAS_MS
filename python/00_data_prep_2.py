@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+import os
+import sys
+import random
+import hail as hl
+import pandas as pd
+from datetime import datetime
+from utils import load_config, init_hail, setup_logger
+
+logger = setup_logger("data_prep")
+
+def perform_plink_export(mt, output_dir, config, timestamp):
+    """Export MatrixTable to PLINK with dated directory."""
+    
+    # Create dated output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Update latest symlink
+    latest_link = f"{config['outputs']['data_dir']}/latest"
+    
+    # Use lexists to catch broken symlinks too
+    if os.path.lexists(latest_link):
+        try:
+            if os.path.islink(latest_link):
+                os.remove(latest_link)
+            else:
+                logger.warning(f"{latest_link} exists but is not a symlink. Skipping update.")
+        except Exception as e:
+            logger.warning(f"Could not remove existing symlink {latest_link}: {e}")
+            
+    try:
+        # Create relative symlink
+        os.symlink(os.path.basename(output_dir), latest_link)
+    except Exception as e:
+        logger.warning(f"Could not create symlink {latest_link}: {e}")
+    
+    # Export base path
+    plink_base = f"{output_dir}/eur_common_snps_500k"
+    
+    logger.info(f"Exporting to PLINK: {plink_base}")
+    
+    hl.export_plink(
+        mt,
+        plink_base,
+        ind_id=mt.s,
+        fam_id=mt.s
+    )
+    
+    # Write export metadata
+    metadata_file = f"{output_dir}/export_metadata.txt"
+    with open(metadata_file, 'w') as f:
+        f.write(f"Export timestamp: {timestamp}\n")
+        f.write(f"Variants: {mt.count_rows()}\n")
+        f.write(f"Samples: {mt.count_cols()}\n")
+        f.write(f"Checkpoint source: {config['outputs']['intermediate_dir']}/wgs_eur_intervals.mt\n")
+        f.write(f"Config: {config}\n")
+    
+    logger.info(f"PLINK export complete: {plink_base}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Latest symlink: {latest_link}")
+
+def perform_filtering_and_checkpoint(config, checkpoint_path, params):
+    """Run the initial filtering pipeline and checkpoint."""
+    ANCESTRY_PATH = config['inputs']['ancestry_pred']
+    WGS_MT_PATH = config['inputs']['wgs_mt']
+    
+    # Samples
+    logger.info("Loading EUR sample list...")
+    with hl.hadoop_open(ANCESTRY_PATH, 'r') as f:
+        ancestry_df = pd.read_csv(f, sep="\t")
+    eur_ids = set(ancestry_df[ancestry_df['ancestry_pred'] == 'eur']['research_id'].astype(str))
+
+    # Intervals
+    logger.info("Generating random intervals...")
+    rg = hl.get_reference('GRCh38')
+    lengths = rg.lengths
+    chroms = [f"chr{i}" for i in range(1, 23)]
+    hl_intervals = []
+    
+    # Generate random intervals (Original Simple Method)
+    for _ in range(params['n_intervals']):
+        chrom = random.choice(chroms)
+        chrom_len = lengths[chrom]
+        start = random.randint(1, chrom_len - params['window_size'])
+        if start + params['window_size'] > chrom_len:
+            start = chrom_len - params['window_size']
+        interval = hl.locus_interval(chrom, start, start + params['window_size'], reference_genome='GRCh38')
+        hl_intervals.append(interval)
+
+    # 1. Read WGS MatrixTable
+    logger.info("Reading WGS MatrixTable...")
+    wgs_mt = hl.read_matrix_table(WGS_MT_PATH)
+    
+    # 2. Filter to Intervals (Optimized)
+    logger.info(f"Filtering MatrixTable to {len(hl_intervals)} intervals using filter_intervals...")
+    # Use filter_intervals which is much faster than filter_rows with lookup
+    mt = hl.filter_intervals(wgs_mt, hl_intervals)
+    
+    # 3. Filter Samples
+    logger.info(f"Filtering to {len(eur_ids)} EUR samples...")
+    mt = mt.filter_cols(hl.literal(eur_ids).contains(mt.s))
+    
+    # 4. Select fields early
+    mt = mt.select_entries('GT')
+    
+    # 5. Checkpoint (Crucial Step)
+    logger.info(f"Checkpointing filtered MT to {checkpoint_path}...")
+    
+    # Checkpointing saves the filtered subset to disk, preventing re-reads of the massive WGS MT
+    mt = mt.checkpoint(checkpoint_path, overwrite=True)
+    
+    logger.info(f"Checkpoint complete. Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
+    return mt
+
+def process_mt_for_export(mt, params):
+    """Process MatrixTable (QC, filtering) for export."""
+    
+    # Repartition to fix 145k partition issue
+    # Reduced to 100 partitions for lightweight data export efficiency
+    logger.info("Repartitioning MatrixTable to 100 partitions...")
+    mt = mt.repartition(100)
+    
+    # HARDCODED: SKIP VARIANT QC
+    # We are explicitly skipping Hail-based QC to speed up the process.
+    # QC will be performed using PLINK on the exported files.
+    logger.info("Skipping Hail Variant QC (QC will be performed in PLINK)")
+
+    # HARDCODED: SKIP DOWNSAMPLING
+    # We are exporting all variants to PLINK for downstream QC and analysis.
+    logger.info("Skipping downsampling (all variants will be exported)")
+    
+    n_total = mt.count_rows()
+    logger.info(f"Total variants to export: {n_total}")
+        
+    return mt
+
+def main():
+    config = load_config("config/config.json")
+    
+    # Initialize with high memory
+    init_hail("data_prep", driver_mem="16g", reference="GRCh38")
+
+    params = config['params']
+    
+    # Get timestamp from environment or generate new one
+    timestamp = os.environ.get('EXPORT_TIMESTAMP', datetime.now().strftime("%Y%m%d_%H%M%S"))
+    
+    # Checkpoint path
+    checkpoint_path = f"{config['outputs']['intermediate_dir']}/wgs_eur_intervals.mt"
+    
+    # Output directory with timestamp
+    if params.get('dated_exports', True):
+        dated_output_dir = f"{config['outputs']['data_dir']}/{timestamp}"
+    else:
+        dated_output_dir = config['outputs']['data_dir']
+
+    # Check for existing checkpoint
+    if hl.hadoop_exists(checkpoint_path):
+        logger.info(f"Found checkpoint at {checkpoint_path}")
+        logger.info("Skipping filtering, proceeding to processing...")
+        
+        mt = hl.read_matrix_table(checkpoint_path)
+        logger.info(f"Loaded MT: {mt.count_rows()} variants, {mt.count_cols()} samples")
+        
+    else:
+        logger.info("No checkpoint found, running full filtering pipeline...")
+        mt = perform_filtering_and_checkpoint(config, checkpoint_path, params)
+
+    # Process MT (repartition, SKIP QC, SKIP DOWNSAMPLING)
+    mt = process_mt_for_export(mt, params)
+    
+    # Export
+    perform_plink_export(mt, dated_output_dir, config, timestamp)
+    
+    logger.info("Job completed successfully.")
+
+if __name__ == "__main__":
+    main()
