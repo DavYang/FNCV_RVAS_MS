@@ -8,7 +8,8 @@ logger = setup_logger("define_loci")
 
 def main():
     config = load_config("config/config.json")
-    init_hail("define_loci")
+    # Initialize with reference genome to avoid warnings
+    init_hail("define_loci", reference="GRCh38")
     
     # Paths
     GWAS_PATH = config['inputs']['phenotype_gwas']
