@@ -14,12 +14,15 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$PYTHON_DIR"
 mkdir -p "$CONFIG_DIR"
 
-# Generate a timestamp for the log file
+# Generate a timestamp for the log file and export
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${LOG_DIR}/${SCRIPT_NAME}_${TIMESTAMP}.log"
 
+# Export timestamp for Python script
+export EXPORT_TIMESTAMP="${TIMESTAMP}"
+
 echo "==========================================="
-echo "   Starting Data Prep Pipeline"
+echo "   Starting Data Prep Pipeline (Optimized)"
 echo "==========================================="
 echo "Date: ${TIMESTAMP}"
 echo "Script: ${PYTHON_DIR}/${SCRIPT_NAME}.py"
@@ -33,6 +36,8 @@ if [ ! -f "${PYTHON_DIR}/${SCRIPT_NAME}.py" ]; then
     echo "Error: Python script not found at ${PYTHON_DIR}/${SCRIPT_NAME}.py"
     exit 1
 fi
+
+echo "Checking for existing checkpoint will happen inside the script."
 
 # Run in background with nohup
 nohup python3 "${PYTHON_DIR}/${SCRIPT_NAME}.py" > "${LOG_FILE}" 2>&1 &
