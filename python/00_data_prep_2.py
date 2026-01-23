@@ -116,7 +116,13 @@ def perform_filtering_and_checkpoint(config, checkpoint_path, params):
     # 4. Select fields early
     mt = mt.select_entries('GT')
     
-    # 5. Checkpoint (Crucial Step)
+    # 5. Pre-Checkpoint Optimization
+    # Fix the "9000 partitions" issue here. Since we filtered down to ~200Mb of genome,
+    # we don't need the thousands of partitions from the original WGS MT.
+    logger.info("Coalescing filtered data to 100 partitions BEFORE checkpoint...")
+    mt = mt.naive_coalesce(100)
+    
+    # 6. Checkpoint (Crucial Step)
     logger.info(f"Checkpointing filtered MT to {checkpoint_path}...")
     
     # Checkpointing saves the filtered subset to disk, preventing re-reads of the massive WGS MT
@@ -127,12 +133,6 @@ def perform_filtering_and_checkpoint(config, checkpoint_path, params):
 
 def process_mt_for_export(mt, params):
     """Process MatrixTable (QC, filtering) for export."""
-    
-    # Repartition to fix 145k partition issue
-    # Use naive_coalesce for INSTANT repartitioning (no shuffle)
-    # 100 partitions is appropriate for ~1M genotype data
-    logger.info("Coalescing MatrixTable to 100 partitions (naive_coalesce)...")
-    mt = mt.naive_coalesce(100)
     
     # HARDCODED: SKIP VARIANT QC
     logger.info("Skipping Hail Variant QC (QC will be performed in PLINK)")
@@ -198,7 +198,7 @@ def main():
         logger.info("No checkpoint found, running full filtering pipeline...")
         mt = perform_filtering_and_checkpoint(config, checkpoint_path, params)
 
-    # Process MT (repartition, SKIP QC, DOWNSAMPLE to 1M)
+    # Process MT (SKIP QC, DOWNSAMPLE to 1M)
     mt = process_mt_for_export(mt, params)
     
     # Export
