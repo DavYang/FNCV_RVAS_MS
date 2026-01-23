@@ -56,7 +56,7 @@ def perform_plink_export(mt, output_dir, config, timestamp):
             f.write(f"Export timestamp: {timestamp}\n")
             f.write(f"Variants: {mt.count_rows()}\n")
             f.write(f"Samples: {mt.count_cols()}\n")
-            f.write(f"Checkpoint source: {config['outputs']['intermediate_dir']}/wgs_eur_intervals.mt\n")
+            f.write(f"Source: ACAF common variants MatrixTable\n")
             f.write(f"Config: {config}\n")
     except Exception as e:
         logger.warning(f"Failed to write metadata file to {metadata_file}: {e}")
@@ -64,8 +64,8 @@ def perform_plink_export(mt, output_dir, config, timestamp):
     logger.info(f"PLINK export complete: {plink_base}")
     logger.info(f"Output directory: {output_dir}")
 
-def perform_filtering_and_checkpoint(config, checkpoint_path, params):
-    """Run the initial filtering pipeline and checkpoint."""
+def perform_filtering(config, params):
+    """Run the initial filtering pipeline."""
     ANCESTRY_PATH = config['inputs']['ancestry_pred']
     WGS_MT_PATH = config['inputs']['wgs_mt']
     
@@ -75,30 +75,43 @@ def perform_filtering_and_checkpoint(config, checkpoint_path, params):
         ancestry_df = pd.read_csv(f, sep="\t")
     eur_ids = set(ancestry_df[ancestry_df['ancestry_pred'] == 'eur']['research_id'].astype(str))
 
-    # Intervals
-    logger.info("Generating random intervals (Optimized: Fewer, Larger)...")
+    # Intervals - Using contiguous blocks for faster processing
+    logger.info("Generating contiguous genomic blocks (Optimized for speed)...")
     rg = hl.get_reference('GRCh38')
     lengths = rg.lengths
     chroms = [f"chr{i}" for i in range(1, 23)]
     hl_intervals = []
     
-    # --- OPTIMIZED INTERVAL STRATEGY ---
-    # Analysis Plan: "Randomly select 4,000 genomic intervals of 50kb each... ~200Mb"
-    # To fix 145k partition issue, we generate 40 x 5Mb intervals instead.
-    # Total coverage: 40 * 5Mb = 200Mb.
+    # --- CONTIGUOUS BLOCK STRATEGY (FASTER) ---
+    # Divide genome into systematic contiguous blocks for better partitioning
+    # Total coverage: ~200Mb in contiguous segments
     
-    n_large_intervals = 40
+    n_blocks = 40
     large_window_size = 5_000_000  # 5 Mb
     
-    logger.info(f"Strategy: {n_large_intervals} intervals of {large_window_size/1e6} Mb each")
+    logger.info(f"Strategy: {n_blocks} contiguous blocks of {large_window_size/1e6} Mb each")
     
-    for _ in range(n_large_intervals):
-        chrom = random.choice(chroms)
+    # Calculate total autosomal genome size
+    total_size = sum(lengths[chrom] for chrom in chroms)
+    block_size = total_size // n_blocks
+    
+    # Create contiguous blocks across chromosomes
+    for chrom in chroms:
+        if len(hl_intervals) >= n_blocks:
+            break
+            
         chrom_len = lengths[chrom]
-        # Ensure we don't go out of bounds
-        start = random.randint(1, chrom_len - large_window_size)
-        interval = hl.locus_interval(chrom, start, start + large_window_size, reference_genome='GRCh38')
-        hl_intervals.append(interval)
+        current_pos = 1
+        
+        while current_pos < chrom_len and len(hl_intervals) < n_blocks:
+            start = current_pos
+            end = min(current_pos + large_window_size, chrom_len)
+            
+            # Create interval
+            interval = hl.locus_interval(chrom, start, end, reference_genome='GRCh38')
+            hl_intervals.append(interval)
+            
+            current_pos = end + 1
 
     # 1. Read WGS MatrixTable
     logger.info("Reading WGS MatrixTable...")
@@ -113,44 +126,28 @@ def perform_filtering_and_checkpoint(config, checkpoint_path, params):
     logger.info(f"Filtering to {len(eur_ids)} EUR samples...")
     mt = mt.filter_cols(hl.literal(eur_ids).contains(mt.s))
     
-    # 4. Select fields early
-    mt = mt.select_entries('GT')
+    # 4. Keep all entry fields (GT, AD, DP, GQ, etc.)
+    # No select_entries() call - keeping all fields for complete data
     
-    # 5. Pre-Checkpoint Optimization
+    # 5. Optimize partitioning
     # Fix the "9000 partitions" issue here. Since we filtered down to ~200Mb of genome,
     # we don't need the thousands of partitions from the original WGS MT.
-    logger.info("Coalescing filtered data to 100 partitions BEFORE checkpoint...")
+    logger.info("Coalescing filtered data to 100 partitions...")
     mt = mt.naive_coalesce(100)
     
-    # 6. Checkpoint (Crucial Step)
-    logger.info(f"Checkpointing filtered MT to {checkpoint_path}...")
-    
-    # Checkpointing saves the filtered subset to disk, preventing re-reads of the massive WGS MT
-    mt = mt.checkpoint(checkpoint_path, overwrite=True)
-    
-    logger.info(f"Checkpoint complete. Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
+    logger.info(f"Filtering complete. Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
     return mt
 
 def process_mt_for_export(mt, params):
-    """Process MatrixTable (QC, filtering) for export."""
+    """Process MatrixTable for export."""
     
     # HARDCODED: SKIP VARIANT QC
     logger.info("Skipping Hail Variant QC (QC will be performed in PLINK)")
 
-    # --- DOWNSAMPLING STRATEGY ---
-    # Goal: 500k common SNPs for regression.
-    # Approach: Downsample to 1M variants buffer to allow for QC loss (MAF, HWE) in PLINK.
-    target_buffer = 1_000_000
-    
+    # NO DOWNSAMPLING - Export all variants
     n_total = mt.count_rows()
-    logger.info(f"Total variants available: {n_total}")
-    
-    if n_total > target_buffer:
-        fraction = target_buffer / n_total
-        logger.info(f"Downsampling {n_total} -> {target_buffer} variants (fraction={fraction:.5f}) for efficiency...")
-        mt = mt.sample_rows(fraction, seed=42)
-    else:
-        logger.info(f"Variant count ({n_total}) is below buffer target ({target_buffer}). Keeping all.")
+    logger.info(f"Total variants to export: {n_total}")
+    logger.info("Keeping all variants (no downsampling)")
         
     return mt
 
@@ -165,16 +162,17 @@ def main():
     # Get timestamp from environment or generate new one
     timestamp = os.environ.get('EXPORT_TIMESTAMP', datetime.now().strftime("%Y%m%d_%H%M%S"))
     
-    # Checkpoint path
-    checkpoint_path = f"{config['outputs']['intermediate_dir']}/wgs_eur_intervals.mt"
-    
     # Determine Output Directory (Workspace Bucket vs Local)
     workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
     data_dir_suffix = config['outputs'].get('data_dir_suffix', 'data')
     
     if workspace_bucket:
+        # Handle case where workspace_bucket already includes gs:// prefix
+        if workspace_bucket.startswith('gs://'):
+            base_data_dir = f"{workspace_bucket}/{data_dir_suffix}"
+        else:
+            base_data_dir = f"gs://{workspace_bucket}/{data_dir_suffix}"
         logger.info(f"Detected AoU Workspace Bucket: {workspace_bucket}")
-        base_data_dir = f"{workspace_bucket}/{data_dir_suffix}"
     else:
         logger.warning("WORKSPACE_BUCKET not found. Falling back to local 'data' directory (WARNING: Disk space low!)")
         base_data_dir = "data"
@@ -186,19 +184,11 @@ def main():
 
     logger.info(f"Target Output Directory: {dated_output_dir}")
 
-    # Check for existing checkpoint
-    if hl.hadoop_exists(checkpoint_path):
-        logger.info(f"Found checkpoint at {checkpoint_path}")
-        logger.info("Skipping filtering, proceeding to processing...")
-        
-        mt = hl.read_matrix_table(checkpoint_path)
-        logger.info(f"Loaded MT: {mt.count_rows()} variants, {mt.count_cols()} samples")
-        
-    else:
-        logger.info("No checkpoint found, running full filtering pipeline...")
-        mt = perform_filtering_and_checkpoint(config, checkpoint_path, params)
+    # Always run full filtering pipeline (no checkpoint)
+    logger.info("Running full filtering pipeline...")
+    mt = perform_filtering(config, params)
 
-    # Process MT (SKIP QC, DOWNSAMPLE to 1M)
+    # Process MT (SKIP QC, NO DOWNSAMPLING)
     mt = process_mt_for_export(mt, params)
     
     # Export
