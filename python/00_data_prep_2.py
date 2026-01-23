@@ -130,18 +130,27 @@ def process_mt_for_export(mt, params):
     
     # Repartition to fix 145k partition issue
     # Use naive_coalesce for INSTANT repartitioning (no shuffle)
-    # 100 partitions is appropriate for ~200Mb of genotype data
+    # 100 partitions is appropriate for ~1M genotype data
     logger.info("Coalescing MatrixTable to 100 partitions (naive_coalesce)...")
     mt = mt.naive_coalesce(100)
     
     # HARDCODED: SKIP VARIANT QC
     logger.info("Skipping Hail Variant QC (QC will be performed in PLINK)")
 
-    # HARDCODED: SKIP DOWNSAMPLING
-    logger.info("Skipping downsampling (all variants will be exported)")
+    # --- DOWNSAMPLING STRATEGY ---
+    # Goal: 500k common SNPs for regression.
+    # Approach: Downsample to 1M variants buffer to allow for QC loss (MAF, HWE) in PLINK.
+    target_buffer = 1_000_000
     
     n_total = mt.count_rows()
-    logger.info(f"Total variants to export: {n_total}")
+    logger.info(f"Total variants available: {n_total}")
+    
+    if n_total > target_buffer:
+        fraction = target_buffer / n_total
+        logger.info(f"Downsampling {n_total} -> {target_buffer} variants (fraction={fraction:.5f}) for efficiency...")
+        mt = mt.sample_rows(fraction, seed=42)
+    else:
+        logger.info(f"Variant count ({n_total}) is below buffer target ({target_buffer}). Keeping all.")
         
     return mt
 
@@ -189,7 +198,7 @@ def main():
         logger.info("No checkpoint found, running full filtering pipeline...")
         mt = perform_filtering_and_checkpoint(config, checkpoint_path, params)
 
-    # Process MT (repartition, SKIP QC, SKIP DOWNSAMPLING)
+    # Process MT (repartition, SKIP QC, DOWNSAMPLE to 1M)
     mt = process_mt_for_export(mt, params)
     
     # Export
