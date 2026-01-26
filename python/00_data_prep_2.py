@@ -38,7 +38,7 @@ def perform_plink_export(mt, output_dir, config, timestamp):
         logger.info(f"Skipping symlink creation for GS path: {output_dir}")
     
     # Export base path
-    plink_base = f"{output_dir}/eur_common_snps_500k"
+    plink_base = f"{output_dir}/eur_common_snps_sampled"
     
     logger.info(f"Exporting to PLINK: {plink_base}")
     
@@ -56,7 +56,7 @@ def perform_plink_export(mt, output_dir, config, timestamp):
             f.write(f"Export timestamp: {timestamp}\n")
             f.write(f"Variants: {mt.count_rows()}\n")
             f.write(f"Samples: {mt.count_cols()}\n")
-            f.write(f"Source: ACAF common variants MatrixTable\n")
+            f.write(f"Source: ACAF Threshold VCFs (Sampled)\n")
             f.write(f"Config: {config}\n")
     except Exception as e:
         logger.warning(f"Failed to write metadata file to {metadata_file}: {e}")
@@ -65,90 +65,61 @@ def perform_plink_export(mt, output_dir, config, timestamp):
     logger.info(f"Output directory: {output_dir}")
 
 def perform_filtering(config, params):
-    """Run the initial filtering pipeline."""
+    """Run the VCF sampling and filtering pipeline."""
     ANCESTRY_PATH = config['inputs']['ancestry_pred']
-    WGS_MT_PATH = config['inputs']['wgs_mt']
+    VCF_BASE = config['inputs']['wgs_vcf_base']
     
-    # Samples
+    # 1. Samples
     logger.info("Loading EUR sample list...")
     with hl.hadoop_open(ANCESTRY_PATH, 'r') as f:
         ancestry_df = pd.read_csv(f, sep="\t")
     eur_ids = set(ancestry_df[ancestry_df['ancestry_pred'] == 'eur']['research_id'].astype(str))
 
-    # Intervals - Using contiguous blocks for faster processing
-    logger.info("Generating contiguous genomic blocks (Optimized for speed)...")
-    rg = hl.get_reference('GRCh38')
-    lengths = rg.lengths
-    chroms = [f"chr{i}" for i in range(1, 23)]
-    hl_intervals = []
+    # 2. Select Random VCF Shards
+    total_shards = params.get('total_shards', 24744)
+    n_sample = params.get('n_shards_to_sample', 500)
     
-    # --- CONTIGUOUS BLOCK STRATEGY (FASTER) ---
-    # Divide genome into systematic contiguous blocks for better partitioning
-    # Total coverage: ~200Mb in contiguous segments
+    logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards}...")
     
-    n_blocks = 40
-    large_window_size = 5_000_000  # 5 Mb
+    # Generate random shard indices
+    # We use sample to get unique indices
+    random_indices = random.sample(range(total_shards), n_sample)
     
-    logger.info(f"Strategy: {n_blocks} contiguous blocks of {large_window_size/1e6} Mb each")
+    # Construct paths: 0000000000.vcf.bgz format
+    vcf_paths = [f"{VCF_BASE}/{i:010d}.vcf.bgz" for i in random_indices]
     
-    # Calculate total autosomal genome size
-    total_size = sum(lengths[chrom] for chrom in chroms)
-    block_size = total_size // n_blocks
-    
-    # Create contiguous blocks across chromosomes
-    for chrom in chroms:
-        if len(hl_intervals) >= n_blocks:
-            break
-            
-        chrom_len = lengths[chrom]
-        current_pos = 1
-        
-        while current_pos < chrom_len and len(hl_intervals) < n_blocks:
-            start = current_pos
-            end = min(current_pos + large_window_size, chrom_len)
-            
-            # Create interval
-            interval = hl.locus_interval(chrom, start, end, reference_genome='GRCh38')
-            hl_intervals.append(interval)
-            
-            current_pos = end + 1
+    # Log first few for verification
+    if len(vcf_paths) > 0:
+        logger.info(f"Example VCFs to load: {vcf_paths[:3]}")
 
-    # 1. Read WGS MatrixTable
-    logger.info("Reading WGS MatrixTable...")
-    wgs_mt = hl.read_matrix_table(WGS_MT_PATH)
+    # 3. Import VCFs
+    logger.info("Importing VCFs...")
+    # force_bgz is required for AoU files; reference_genome ensures proper contig handling
+    # array_elements_required=False handles fields that might vary in length
+    mt = hl.import_vcf(
+        vcf_paths, 
+        reference_genome='GRCh38', 
+        force_bgz=True,
+        array_elements_required=False
+    )
     
-    # 2. Filter to Intervals (Optimized)
-    logger.info(f"Filtering MatrixTable to {len(hl_intervals)} large intervals using filter_intervals...")
-    # Use filter_intervals which is much faster than filter_rows with lookup
-    mt = hl.filter_intervals(wgs_mt, hl_intervals)
-    
-    # 3. Filter Samples
+    # 4. Split Multi-allelic Variants
+    # The 'splitMT' you used before had this done already. For raw VCFs, we must do it manually
+    # to ensure compatibility with PLINK and downstream tools.
+    logger.info("Splitting multi-allelic variants (split_multi_hts)...")
+    mt = hl.split_multi_hts(mt)
+
+    # 5. Filter Samples
     logger.info(f"Filtering to {len(eur_ids)} EUR samples...")
     mt = mt.filter_cols(hl.literal(eur_ids).contains(mt.s))
     
-    # 4. Keep all entry fields (GT, AD, DP, GQ, etc.)
-    # No select_entries() call - keeping all fields for complete data
-    
-    # 5. Optimize partitioning
-    # Fix the "9000 partitions" issue here. Since we filtered down to ~200Mb of genome,
-    # we don't need the thousands of partitions from the original WGS MT.
-    logger.info("Coalescing filtered data to 100 partitions...")
+    # 6. Repartitioning
+    # Importing many small files might result in awkward partitioning. 
+    # Coalesce to a reasonable number (e.g., 100) for downstream processing.
+    logger.info("Coalescing to 100 partitions...")
     mt = mt.naive_coalesce(100)
     
     logger.info(f"Filtering complete. Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
-    return mt
-
-def process_mt_for_export(mt, params):
-    """Process MatrixTable for export."""
-    
-    # HARDCODED: SKIP VARIANT QC
-    logger.info("Skipping Hail Variant QC (QC will be performed in PLINK)")
-
-    # NO DOWNSAMPLING - Export all variants
-    n_total = mt.count_rows()
-    logger.info(f"Total variants to export: {n_total}")
-    logger.info("Keeping all variants (no downsampling)")
-        
     return mt
 
 def main():
@@ -184,14 +155,12 @@ def main():
 
     logger.info(f"Target Output Directory: {dated_output_dir}")
 
-    # Always run full filtering pipeline (no checkpoint)
-    logger.info("Running full filtering pipeline...")
+    # Run filtering pipeline
+    logger.info("Running VCF sampling pipeline...")
     mt = perform_filtering(config, params)
 
-    # Process MT (SKIP QC, NO DOWNSAMPLING)
-    mt = process_mt_for_export(mt, params)
-    
     # Export
+    # No extra processing or QC steps needed as variants are pre-filtered
     perform_plink_export(mt, dated_output_dir, config, timestamp)
     
     logger.info("Job completed successfully.")
