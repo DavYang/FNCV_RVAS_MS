@@ -78,11 +78,13 @@ def perform_filtering(config, params):
     # 2. Select Random VCF Shards
     total_shards = params.get('total_shards', 24744)
     n_sample = params.get('n_shards_to_sample', 500)
+    seed = params.get('random_seed', 42)
     
-    logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards}...")
+    logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards} using seed {seed}...")
     
     # Generate random shard indices
     # We use sample to get unique indices
+    random.seed(seed)
     random_indices = random.sample(range(total_shards), n_sample)
     
     # Construct paths: 0000000000.vcf.bgz format
