@@ -137,21 +137,35 @@ def main():
     
     # Determine Output Directory (Workspace Bucket vs Local)
     workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
-    data_dir_suffix = config['outputs'].get('data_dir_suffix', 'data')
+    
+    # We want the 'data_dir_suffix' (e.g., FNCV_RVAS_MS)
+    # utils.load_config may have already injected the bucket prefix into config['outputs'] if the env var was set.
+    # To be safe and avoid duplication, we check if the path already starts with gs://
+    
+    raw_suffix = config['outputs'].get('data_dir_suffix', 'data')
     
     if workspace_bucket:
-        # Handle case where workspace_bucket already includes gs:// prefix
-        if workspace_bucket.startswith('gs://'):
-            base_data_dir = f"{workspace_bucket}/{data_dir_suffix}"
-        else:
-            base_data_dir = f"gs://{workspace_bucket}/{data_dir_suffix}"
         logger.info(f"Detected AoU Workspace Bucket: {workspace_bucket}")
+        
+        if raw_suffix.startswith("gs://"):
+            # It's already a full path (likely modified by utils.load_config)
+            base_data_dir = raw_suffix
+        else:
+            # It's just a suffix, need to prepend bucket
+            # Ensure we don't double up if workspace_bucket ends with / or suffix starts with /
+            # But simpler here: assume standard format
+            if workspace_bucket.startswith("gs://"):
+                 base_data_dir = f"{workspace_bucket}/{raw_suffix}"
+            else:
+                 base_data_dir = f"gs://{workspace_bucket}/{raw_suffix}"
     else:
         logger.warning("WORKSPACE_BUCKET not found. Falling back to local 'data' directory (WARNING: Disk space low!)")
-        base_data_dir = "data"
+        # If no workspace bucket, we assume we are local. 
+        # If load_config didn't inject anything, raw_suffix is just "FNCV_RVAS_MS" or "data"
+        base_data_dir = raw_suffix
 
     if params.get('dated_exports', True):
-        dated_output_dir = f"{base_data_dir}/{timestamp}"
+        dated_output_dir = f"{base_data_dir}/background_EUR_common_snps_sampled_{timestamp}"
     else:
         dated_output_dir = base_data_dir
 
@@ -162,7 +176,6 @@ def main():
     mt = perform_filtering(config, params)
 
     # Export
-    # No extra processing or QC steps needed as variants are pre-filtered
     perform_plink_export(mt, dated_output_dir, config, timestamp)
     
     logger.info("Job completed successfully.")
