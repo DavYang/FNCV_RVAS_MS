@@ -12,31 +12,6 @@ logger = setup_logger("data_prep")
 def perform_plink_export(mt, output_dir, config, timestamp):
     """Export MatrixTable to PLINK with dated directory and optimizations."""
     
-    # Note: os.makedirs is not needed for gs:// paths and won't work
-    if not output_dir.startswith("gs://"):
-        os.makedirs(output_dir, exist_ok=True)
-    
-    # Symlinks don't work on GS, so we skip that logic if using GS
-    if not output_dir.startswith("gs://"):
-        # Update latest symlink (Local only)
-        latest_link = f"{os.path.dirname(output_dir)}/latest"
-        
-        if os.path.lexists(latest_link):
-            try:
-                if os.path.islink(latest_link):
-                    os.remove(latest_link)
-                else:
-                    logger.warning(f"{latest_link} exists but is not a symlink. Skipping update.")
-            except Exception as e:
-                logger.warning(f"Could not remove existing symlink {latest_link}: {e}")
-                
-        try:
-            os.symlink(os.path.basename(output_dir), latest_link)
-        except Exception as e:
-            logger.warning(f"Could not create symlink {latest_link}: {e}")
-    else:
-        logger.info(f"Skipping symlink creation for GS path: {output_dir}")
-    
     # Export base path
     plink_base = f"{output_dir}/eur_common_snps_sampled"
     
@@ -47,7 +22,6 @@ def perform_plink_export(mt, output_dir, config, timestamp):
     logger.info("Repartitioning to 500 partitions for export...")
     mt = mt.repartition(500)
     
-    
     hl.export_plink(
         mt,
         plink_base,
@@ -55,7 +29,7 @@ def perform_plink_export(mt, output_dir, config, timestamp):
         fam_id=mt.s
     )
     
-    # Write export metadata (Supports both local and GS)
+    # Write export metadata
     metadata_file = f"{output_dir}/export_metadata.txt"
     try:
         with hl.hadoop_open(metadata_file, 'w') as f:
@@ -83,14 +57,12 @@ def perform_filtering(config, params):
 
     # 2. Select Random VCF Shards
     total_shards = params.get('total_shards', 24744)
-    n_sample = params.get('n_shards_to_sample', 100)
-    seed = params.get('random_seed', 42)
+    n_sample = params.get('n_shards_to_sample', 250)
     
-    logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards} using seed {seed}...")
+    logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards}...")
     
     # Generate random shard indices
     # We use sample to get unique indices
-    random.seed(seed)
     random_indices = random.sample(range(total_shards), n_sample)
     
     # Construct paths: 0000000000.vcf.bgz format
@@ -142,45 +114,24 @@ def main():
     # Get timestamp from environment or generate new one
     timestamp = os.environ.get('EXPORT_TIMESTAMP', datetime.now().strftime("%Y%m%d_%H%M%S"))
     
-    # Determine Output Directory (Workspace Bucket vs Local)
+    # Determine Output Directory - Always use workspace bucket
     workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
     
-    # We want the 'data_dir_suffix' (e.g., FNCV_RVAS_MS)
-    # utils.load_config may have already injected the bucket prefix into config['outputs'] if the env var was set.
-    # To be safe and avoid duplication, we check if the path already starts with gs://
+    if not workspace_bucket:
+        logger.error("WORKSPACE_BUCKET environment variable not set!")
+        logger.error("This script requires running in an AoU workspace with bucket access.")
+        sys.exit(1)
     
-    raw_suffix = config['outputs'].get('data_dir_suffix', 'data')
-    
-    if workspace_bucket:
-<<<<<<< HEAD
-        # Handle case where workspace_bucket already includes gs:// prefix
-        if workspace_bucket.startswith('gs://'):
-            base_data_dir = f"{workspace_bucket}"
-        else:
-            base_data_dir = f"gs://{workspace_bucket}"
-=======
-        logger.info(f"Detected AoU Workspace Bucket: {workspace_bucket}")
-        
-        if raw_suffix.startswith("gs://"):
-            # It's already a full path (likely modified by utils.load_config)
-            base_data_dir = raw_suffix
-        else:
-            # It's just a suffix, need to prepend bucket
-            # Ensure we don't double up if workspace_bucket ends with / or suffix starts with /
-            # But simpler here: assume standard format
-            if workspace_bucket.startswith("gs://"):
-                 base_data_dir = f"{workspace_bucket}/{raw_suffix}"
-            else:
-                 base_data_dir = f"gs://{workspace_bucket}/{raw_suffix}"
+    # Handle case where workspace_bucket already includes gs:// prefix
+    if workspace_bucket.startswith('gs://'):
+        base_data_dir = workspace_bucket
     else:
-        logger.warning("WORKSPACE_BUCKET not found. Falling back to local 'data' directory (WARNING: Disk space low!)")
-        # If no workspace bucket, we assume we are local. 
-        # If load_config didn't inject anything, raw_suffix is just "FNCV_RVAS_MS" or "data"
-        base_data_dir = raw_suffix
->>>>>>> cab97136c5b6bbc8bada25ab8a882a351986602a
+        base_data_dir = f"gs://{workspace_bucket}"
+    
+    logger.info(f"Detected AoU Workspace Bucket: {base_data_dir}")
 
     if params.get('dated_exports', True):
-        dated_output_dir = f"{base_data_dir}/background_EUR_common_snps_sampled_{timestamp}"
+        dated_output_dir = f"{base_data_dir}/FNCV_RVAS_MS_{timestamp}"
     else:
         dated_output_dir = base_data_dir
 
@@ -206,16 +157,8 @@ def main():
         mt = mt.checkpoint(checkpoint_path, overwrite=True)
         logger.info("Checkpoint saved successfully.")
 
-<<<<<<< HEAD
     # Export with optimizations
     logger.info("Proceeding to PLINK export...")
-=======
-    # Run filtering pipeline
-    logger.info("Running VCF sampling pipeline...")
-    mt = perform_filtering(config, params)
-
-    # Export
->>>>>>> cab97136c5b6bbc8bada25ab8a882a351986602a
     perform_plink_export(mt, dated_output_dir, config, timestamp)
     
     logger.info("Job completed successfully.")
