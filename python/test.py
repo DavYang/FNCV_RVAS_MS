@@ -28,7 +28,7 @@ def main():
 
     # 4. Use the AoU splitMT (Standard for WGS analysis)
     # Note: We use the common splitMT path directly if not in config
-    SPLIT_MT_PATH = config['inputs'].get('split_mt', 'gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/splitMT/splitMT.mt')
+    SPLIT_MT_PATH = config['inputs'].get('split_mt', 'gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt')
     ANCESTRY_PATH = config['inputs']['ancestry_pred']
     
     # Load 10 EUR samples for the test
