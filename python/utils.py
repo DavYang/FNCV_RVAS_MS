@@ -21,12 +21,12 @@ def get_env_var(name: str) -> str:
         raise EnvironmentError(f"Required environment variable {name} is not set.")
     return val
 
-def init_hail(log_prefix: str, driver_mem="32g", reference="GRCh38"):
+def init_hail(log_prefix: str, driver_mem="8g", reference="GRCh38"):
     hl.init(
         log=f'/tmp/hail_{log_prefix}.log',
         spark_conf={
             'spark.driver.memory': driver_mem,
-            'spark.executor.memory': '32g'
+            'spark.executor.memory': '8g'
         }
     )
     if reference:
