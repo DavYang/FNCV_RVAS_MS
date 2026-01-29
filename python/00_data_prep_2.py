@@ -84,11 +84,13 @@ def perform_filtering(config, params):
     # 2. Select Random VCF Shards
     total_shards = params.get('total_shards', 24744)
     n_sample = params.get('n_shards_to_sample', 100)
+    seed = params.get('random_seed', 42)
     
-    logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards}...")
+    logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards} using seed {seed}...")
     
     # Generate random shard indices
     # We use sample to get unique indices
+    random.seed(seed)
     random_indices = random.sample(range(total_shards), n_sample)
     
     # Construct paths: 0000000000.vcf.bgz format
@@ -142,17 +144,43 @@ def main():
     
     # Determine Output Directory (Workspace Bucket vs Local)
     workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
-    data_dir_suffix = config['outputs'].get('data_dir_suffix', 'data')
+    
+    # We want the 'data_dir_suffix' (e.g., FNCV_RVAS_MS)
+    # utils.load_config may have already injected the bucket prefix into config['outputs'] if the env var was set.
+    # To be safe and avoid duplication, we check if the path already starts with gs://
+    
+    raw_suffix = config['outputs'].get('data_dir_suffix', 'data')
     
     if workspace_bucket:
+<<<<<<< HEAD
         # Handle case where workspace_bucket already includes gs:// prefix
         if workspace_bucket.startswith('gs://'):
             base_data_dir = f"{workspace_bucket}"
         else:
             base_data_dir = f"gs://{workspace_bucket}"
+=======
+        logger.info(f"Detected AoU Workspace Bucket: {workspace_bucket}")
+        
+        if raw_suffix.startswith("gs://"):
+            # It's already a full path (likely modified by utils.load_config)
+            base_data_dir = raw_suffix
+        else:
+            # It's just a suffix, need to prepend bucket
+            # Ensure we don't double up if workspace_bucket ends with / or suffix starts with /
+            # But simpler here: assume standard format
+            if workspace_bucket.startswith("gs://"):
+                 base_data_dir = f"{workspace_bucket}/{raw_suffix}"
+            else:
+                 base_data_dir = f"gs://{workspace_bucket}/{raw_suffix}"
+    else:
+        logger.warning("WORKSPACE_BUCKET not found. Falling back to local 'data' directory (WARNING: Disk space low!)")
+        # If no workspace bucket, we assume we are local. 
+        # If load_config didn't inject anything, raw_suffix is just "FNCV_RVAS_MS" or "data"
+        base_data_dir = raw_suffix
+>>>>>>> cab97136c5b6bbc8bada25ab8a882a351986602a
 
     if params.get('dated_exports', True):
-        dated_output_dir = f"{base_data_dir}/{timestamp}"
+        dated_output_dir = f"{base_data_dir}/background_EUR_common_snps_sampled_{timestamp}"
     else:
         dated_output_dir = base_data_dir
 
@@ -178,8 +206,16 @@ def main():
         mt = mt.checkpoint(checkpoint_path, overwrite=True)
         logger.info("Checkpoint saved successfully.")
 
+<<<<<<< HEAD
     # Export with optimizations
     logger.info("Proceeding to PLINK export...")
+=======
+    # Run filtering pipeline
+    logger.info("Running VCF sampling pipeline...")
+    mt = perform_filtering(config, params)
+
+    # Export
+>>>>>>> cab97136c5b6bbc8bada25ab8a882a351986602a
     perform_plink_export(mt, dated_output_dir, config, timestamp)
     
     logger.info("Job completed successfully.")

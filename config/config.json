@@ -6,12 +6,13 @@
     },
     "outputs": {
         "base_dir": "results",
-        "intermediate_dir": "tmp/v2",
-        "data_dir_suffix": "data"
+        "intermediate_dir": "tmp/",
+        "data_dir_suffix": "FNCV_RVAS_MS"
     },
     "params": {
         "total_shards": 24744,
         "n_shards_to_sample": 500,
+        "random_seed": 42,
         "target_variants": 1000000,
         "dated_exports": true
     },
