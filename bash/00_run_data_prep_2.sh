@@ -16,7 +16,7 @@ mkdir -p "$CONFIG_DIR"
 
 # Generate a timestamp for the log file and export
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="${LOG_DIR}/${SCRIPT_NAME}_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/00_data_prep_2_${TIMESTAMP}.log"
 
 # Export timestamp for Python script
 export EXPORT_TIMESTAMP="${TIMESTAMP}"
@@ -25,22 +25,22 @@ echo "==========================================="
 echo "   Starting Data Prep Pipeline (Optimized)"
 echo "==========================================="
 echo "Date: ${TIMESTAMP}"
-echo "Script: ${PYTHON_DIR}/${SCRIPT_NAME}.py"
+echo "Script: ${PYTHON_DIR}/00_data_prep_2.py"
 echo "Log File: ${LOG_FILE}"
 echo "Config: ${CONFIG_DIR}/config.json"
 echo "==========================================="
 
 # --- Execution ---
 # Check if the python script exists
-if [ ! -f "${PYTHON_DIR}/${SCRIPT_NAME}.py" ]; then
-    echo "Error: Python script not found at ${PYTHON_DIR}/${SCRIPT_NAME}.py"
+if [ ! -f "${PYTHON_DIR}/00_data_prep_2.py" ]; then
+    echo "Error: Python script not found at ${PYTHON_DIR}/00_data_prep_2.py"
     exit 1
 fi
 
 echo "Checking for existing checkpoint will happen inside the script."
 
 # Run in background with nohup
-nohup python3 "${PYTHON_DIR}/${SCRIPT_NAME}.py" > "${LOG_FILE}" 2>&1 &
+nohup python3 "${PYTHON_DIR}/00_data_prep_2.py" > "${LOG_FILE}" 2>&1 &
 
 PID=$!
 echo "Job submitted successfully!"

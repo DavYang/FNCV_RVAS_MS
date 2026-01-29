@@ -13,13 +13,6 @@ def load_config(config_path="config/config.json"):
     with open(config_path, 'r') as f:
         config = json.load(f)
     
-    # Inject Bucket into output paths dynamically if needed
-    bucket = os.getenv("WORKSPACE_BUCKET")
-    if bucket:
-        for key in config['outputs']:
-            if not config['outputs'][key].startswith("gs://"):
-                config['outputs'][key] = f"{bucket}/{config['outputs'][key]}"
-    
     return config
 
 def get_env_var(name: str) -> str:
@@ -28,13 +21,12 @@ def get_env_var(name: str) -> str:
         raise EnvironmentError(f"Required environment variable {name} is not set.")
     return val
 
-# FIX: Added driver_mem parameter
-def init_hail(log_prefix: str, driver_mem="8g", reference="GRCh38"):
+def init_hail(log_prefix: str, driver_mem="32g", reference="GRCh38"):
     hl.init(
         log=f'/tmp/hail_{log_prefix}.log',
         spark_conf={
             'spark.driver.memory': driver_mem,
-            'spark.executor.memory': '8g'
+            'spark.executor.memory': '32g'
         }
     )
     if reference:
