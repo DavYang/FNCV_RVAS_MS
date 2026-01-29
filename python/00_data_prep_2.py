@@ -107,7 +107,7 @@ def main():
     
     # OPTIMIZATION: Increase memory allocation for large datasets
     # Increased driver memory from 16g to 32g to handle large MatrixTable operations
-    init_hail("data_prep", driver_mem="32g", executor_mem="16g", reference="GRCh38")
+    init_hail("data_prep", driver_mem="32g", reference="GRCh38")
 
     params = config['params']
     
