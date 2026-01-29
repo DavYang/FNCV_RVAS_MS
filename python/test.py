@@ -2,7 +2,6 @@
 import os
 import sys
 import hail as hl
-import pandas as pd
 from datetime import datetime
 from utils import load_config, init_hail, setup_logger
 
@@ -31,29 +30,30 @@ def main():
     SPLIT_MT_PATH = config['inputs'].get('split_mt', 'gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt')
     ANCESTRY_PATH = config['inputs']['ancestry_pred']
     
-    # Load 10 EUR samples for the test
-    logger.info("Accessing ancestry file...")
-    with hl.hadoop_open(ANCESTRY_PATH, 'r') as f:
-        ancestry_df = pd.read_csv(f, sep="\t")
-    eur_sample_subset = list(ancestry_df[ancestry_df['ancestry_pred'] == 'eur']['research_id'].astype(str))[:10]
-
-    # 5. Load and Slice Data
+    # 5. Load and Slice Data FIRST (more efficient)
     logger.info(f"Reading MatrixTable: {SPLIT_MT_PATH}")
     mt = hl.read_matrix_table(SPLIT_MT_PATH)
 
-    # Filter to a stable, variant-dense region on Chr22 (smaller than Chr1 for a faster test)
-    logger.info("Extracting test interval on Chr22...")
-    test_interval = [hl.parse_locus_interval('chr22:20000000-20050000', reference_genome='GRCh38')]
-    
+    # Filter to a predetermined region on Chr1 for the smoke test
+    logger.info("Extracting test interval on Chr1...")
+    test_interval = [hl.parse_locus_interval('chr1:10000000-10100000', reference_genome='GRCh38')]
     mt_test = hl.filter_intervals(mt, test_interval)
+    
+    # Sample 1 variant immediately (no need to count)
+    mt_test = mt_test.head(1)
+    
+    # Get first 10 EUR samples efficiently using Hail
+    logger.info("Finding first 10 European samples...")
+    ancestry_ht = hl.import_table(ANCESTRY_PATH, impute=True)
+    ancestry_ht = ancestry_ht.key_by('research_id')
+    eur_samples_ht = ancestry_ht.filter(ancestry_ht.ancestry_pred == 'eur')
+    
+    # Get the first 10 EUR sample IDs
+    eur_sample_list = eur_samples_ht.research_id.take(10)
+    eur_sample_subset = [str(s) for s in eur_sample_list]
+    
+    # Filter to those 10 samples
     mt_test = mt_test.filter_cols(hl.literal(set(eur_sample_subset)).contains(mt_test.s))
-
-    # Force 1 variant for the smoke test
-    if mt_test.count_rows() > 0:
-        mt_test = mt_test.head(1)
-    else:
-        logger.error("No variants found in test interval. Check genomic coordinates.")
-        sys.exit(1)
 
     # 6. Export to PLINK
     # This checks if your workspace bucket is writable by the Spark workers
