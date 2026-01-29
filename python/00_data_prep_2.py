@@ -10,7 +10,7 @@ from utils import load_config, init_hail, setup_logger
 logger = setup_logger("data_prep")
 
 def perform_plink_export(mt, output_dir, config, timestamp):
-    """Export MatrixTable to PLINK with dated directory."""
+    """Export MatrixTable to PLINK with dated directory and optimizations."""
     
     # Note: os.makedirs is not needed for gs:// paths and won't work
     if not output_dir.startswith("gs://"):
@@ -41,6 +41,12 @@ def perform_plink_export(mt, output_dir, config, timestamp):
     plink_base = f"{output_dir}/eur_common_snps_sampled"
     
     logger.info(f"Exporting to PLINK: {plink_base}")
+    
+    # OPTIMIZATION: Repartition before export to prevent memory issues
+    # More partitions = smaller tasks = less memory per executor
+    logger.info("Repartitioning to 500 partitions for export...")
+    mt = mt.repartition(500)
+    
     
     hl.export_plink(
         mt,
@@ -77,7 +83,7 @@ def perform_filtering(config, params):
 
     # 2. Select Random VCF Shards
     total_shards = params.get('total_shards', 24744)
-    n_sample = params.get('n_shards_to_sample', 500)
+    n_sample = params.get('n_shards_to_sample', 100)
     
     logger.info(f"Sampling {n_sample} random VCF shards from pool of {total_shards}...")
     
@@ -125,8 +131,9 @@ def perform_filtering(config, params):
 def main():
     config = load_config("config/config.json")
     
-    # Initialize with high memory
-    init_hail("data_prep", driver_mem="16g", reference="GRCh38")
+    # OPTIMIZATION: Increase memory allocation for large datasets
+    # Increased driver memory from 16g to 32g to handle large MatrixTable operations
+    init_hail("data_prep", driver_mem="32g", executor_mem="16g", reference="GRCh38")
 
     params = config['params']
     
@@ -140,13 +147,9 @@ def main():
     if workspace_bucket:
         # Handle case where workspace_bucket already includes gs:// prefix
         if workspace_bucket.startswith('gs://'):
-            base_data_dir = f"{workspace_bucket}/{data_dir_suffix}"
+            base_data_dir = f"{workspace_bucket}"
         else:
-            base_data_dir = f"gs://{workspace_bucket}/{data_dir_suffix}"
-        logger.info(f"Detected AoU Workspace Bucket: {workspace_bucket}")
-    else:
-        logger.warning("WORKSPACE_BUCKET not found. Falling back to local 'data' directory (WARNING: Disk space low!)")
-        base_data_dir = "data"
+            base_data_dir = f"gs://{workspace_bucket}"
 
     if params.get('dated_exports', True):
         dated_output_dir = f"{base_data_dir}/{timestamp}"
@@ -154,13 +157,29 @@ def main():
         dated_output_dir = base_data_dir
 
     logger.info(f"Target Output Directory: {dated_output_dir}")
+    
+    # NEW: Define checkpoint path for filtered MatrixTable
+    checkpoint_path = f"{dated_output_dir}/filtered_mt.mt"
+    
+    # NEW: Check if checkpoint exists from previous run
+    if hl.hadoop_exists(checkpoint_path):
+        logger.info(f"Found existing checkpoint: {checkpoint_path}")
+        logger.info("Loading filtered MatrixTable from checkpoint (skipping VCF import)...")
+        mt = hl.read_matrix_table(checkpoint_path)
+        logger.info(f"Loaded MT - Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
+    else:
+        # Run filtering pipeline
+        logger.info("No checkpoint found. Running VCF sampling pipeline...")
+        mt = perform_filtering(config, params)
+        
+        # NEW: Save checkpoint before attempting export
+        logger.info(f"Saving checkpoint to: {checkpoint_path}")
+        logger.info("This allows resuming from this point if export fails.")
+        mt = mt.checkpoint(checkpoint_path, overwrite=True)
+        logger.info("Checkpoint saved successfully.")
 
-    # Run filtering pipeline
-    logger.info("Running VCF sampling pipeline...")
-    mt = perform_filtering(config, params)
-
-    # Export
-    # No extra processing or QC steps needed as variants are pre-filtered
+    # Export with optimizations
+    logger.info("Proceeding to PLINK export...")
     perform_plink_export(mt, dated_output_dir, config, timestamp)
     
     logger.info("Job completed successfully.")
