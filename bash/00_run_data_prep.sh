@@ -2,7 +2,7 @@
 set -e
 
 # --- Configuration ---
-SCRIPT_NAME="00_data_prep"
+SCRIPT_NAME="00_background_SNPs_mt"
 BASE_DIR=$(pwd)
 PYTHON_DIR="${BASE_DIR}/python"
 LOG_DIR="${BASE_DIR}/logs"
@@ -19,7 +19,7 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${LOG_DIR}/${SCRIPT_NAME}_${TIMESTAMP}.log"
 
 echo "==========================================="
-echo "   Starting Data Prep Pipeline"
+echo "   Starting Background SNP Sampling Pipeline"
 echo "==========================================="
 echo "Date: ${TIMESTAMP}"
 echo "Script: ${PYTHON_DIR}/${SCRIPT_NAME}.py"
@@ -34,6 +34,12 @@ if [ ! -f "${PYTHON_DIR}/${SCRIPT_NAME}.py" ]; then
     exit 1
 fi
 
+# Check if config exists
+if [ ! -f "${CONFIG_DIR}/config.json" ]; then
+    echo "Error: Config file not found at ${CONFIG_DIR}/config.json"
+    exit 1
+fi
+
 # Run in background with nohup
 nohup python3 "${PYTHON_DIR}/${SCRIPT_NAME}.py" > "${LOG_FILE}" 2>&1 &
 
@@ -43,4 +49,7 @@ echo "PID: ${PID}"
 echo ""
 echo "To monitor progress, run:"
 echo "  tail -f ${LOG_FILE}"
+echo ""
+echo "To check job status, run:"
+echo "  ps -p ${PID}"
 echo "==========================================="

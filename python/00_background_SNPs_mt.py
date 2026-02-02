@@ -7,149 +7,170 @@ import pandas as pd
 from datetime import datetime
 from utils import load_config, init_hail, setup_logger
 
-logger = setup_logger("data_prep")
 
-def perform_plink_export(mt, output_dir, config, timestamp):
-    """Export MatrixTable to PLINK with dated directory and optimizations."""
+def load_ancestry_data(config, logger):
+    """Load ancestry predictions and filter to European ancestry samples."""
+    logger.info("Loading ancestry data...")
     
-    # Export base path
-    plink_base = f"{output_dir}/eur_common_snps_sampled"
-    
-    logger.info(f"Exporting to PLINK: {plink_base}")
-    
-    # OPTIMIZATION: Repartition before export to prevent memory issues
-    # More partitions = smaller tasks = less memory per executor
-    logger.info("Repartitioning to 500 partitions for export...")
-    mt = mt.repartition(500)
-    
-    hl.export_plink(
-        mt,
-        plink_base,
-        ind_id=mt.s,
-        fam_id=mt.s
+    # Load ancestry TSV as Hail Table
+    ancestry_ht = hl.import_table(
+        config['inputs']['ancestry_pred'],
+        impute=True,
+        types={'sample_id': hl.tstr, 'predicted_ancestry': hl.tstr}
     )
     
-    # Write export metadata
-    metadata_file = f"{output_dir}/export_metadata.txt"
+    # Filter to European ancestry samples
+    eur_samples = ancestry_ht.filter(ancestry_ht.predicted_ancestry == 'EUR')
+    eur_sample_ids = eur_samples.aggregate(hl.agg.collect(eur_samples.sample_id))
+    
+    logger.info(f"Found {len(eur_sample_ids)} European ancestry samples")
+    return eur_sample_ids
+
+
+def sample_background_snps(config, logger):
+    """Main function to sample 1M random common SNPs from EUR ancestry samples."""
+    logger.info("Starting background SNP sampling...")
+    
+    # Initialize Hail
+    init_hail(log_prefix="background_snps", driver_mem="8g", reference="GRCh38")
+    
     try:
-        with hl.hadoop_open(metadata_file, 'w') as f:
-            f.write(f"Export timestamp: {timestamp}\n")
-            f.write(f"Variants: {mt.count_rows()}\n")
-            f.write(f"Samples: {mt.count_cols()}\n")
-            f.write(f"Source: AoU splitMT (EUR samples)\n")
-            f.write(f"Config: {config}\n")
+        # Load ancestry data
+        eur_sample_ids = load_ancestry_data(config, logger)
+        
+        # Load pre-filtered ACAF MatrixTable
+        logger.info("Loading ACAF MatrixTable...")
+        mt_path = config['inputs']['wgs_vcf_base']
+        
+        # Since this is VCF data, we need to import it
+        # For now, assuming we have a MatrixTable path or need to import VCFs
+        # This will need adjustment based on actual data structure
+        
+        # Get list of VCF files (assuming sharded structure)
+        # This is a placeholder - actual implementation may vary
+        mt = hl.import_vcf(f"{mt_path}/*.vcf.bgz", force_bgz=True, min_partitions=100)
+        
+        logger.info(f"Loaded MatrixTable with {mt.count_rows()} variants and {mt.count_cols()} samples")
+        
+        # Filter to EUR ancestry samples
+        logger.info("Filtering to European ancestry samples...")
+        mt = mt.filter_cols(hl.literal(eur_sample_ids).contains(mt.s))
+        
+        logger.info(f"After ancestry filtering: {mt.count_rows()} variants, {mt.count_cols()} samples")
+        
+        # Calculate sampling fraction for 1M variants
+        total_variants = mt.count_rows()
+        target_variants = config['params']['target_variants']
+        sampling_fraction = target_variants / total_variants
+        
+        logger.info(f"Total variants: {total_variants}, Target: {target_variants}")
+        logger.info(f"Sampling fraction: {sampling_fraction:.6f}")
+        
+        # Random sampling of variants
+        logger.info("Sampling random variants...")
+        mt_sampled = mt.sample_rows(sampling_fraction, seed=config['params']['random_seed'])
+        
+        actual_variants = mt_sampled.count_rows()
+        logger.info(f"Sampled {actual_variants} variants")
+        
+        # Quality checks
+        logger.info("Performing quality checks...")
+        
+        # Check allele frequency distribution
+        mt_sampled = mt_sampled.annotate_rows(
+            af = hl.agg.mean(mt_sampled.GT.n_alt_alleles()) / (2 * mt_sampled.count_cols())
+        )
+        
+        af_stats = mt_sampled.aggregate_rows(hl.struct(
+            mean_af = hl.agg.mean(mt_sampled.af),
+            median_af = hl.agg.approx_median(mt_sampled.af),
+            min_af = hl.agg.min(mt_sampled.af),
+            max_af = hl.agg.max(mt_sampled.af)
+        ))
+        
+        logger.info(f"AF stats - Mean: {af_stats.mean_af:.4f}, Median: {af_stats.median_af:.4f}")
+        logger.info(f"AF range - Min: {af_stats.min_af:.4f}, Max: {af_stats.max_af:.4f}")
+        
+        # Export results
+        logger.info("Exporting results...")
+        
+        # Create output directory
+        output_dir = os.path.join(
+            config['outputs']['base_dir'],
+            config['outputs']['data_dir_suffix'],
+            "background_snps"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Export filtered MatrixTable
+        mt_output_path = os.path.join(output_dir, "background_1M_snps.mt")
+        mt_sampled.write(mt_output_path, overwrite=True)
+        logger.info(f"Filtered MatrixTable exported to {mt_output_path}")
+        
+        # Also export as Hail Table for easier querying
+        ht_output_path = os.path.join(output_dir, "background_1M_snps.ht")
+        mt_sampled.rows().write(ht_output_path, overwrite=True)
+        logger.info(f"Variant table exported to {ht_output_path}")
+        
+        # Generate summary report
+        summary = {
+            'timestamp': datetime.now().isoformat(),
+            'total_samples': mt_sampled.count_cols(),
+            'total_variants': actual_variants,
+            'target_variants': target_variants,
+            'sampling_fraction': sampling_fraction,
+            'ancestry': 'EUR',
+            'af_stats': {
+                'mean': af_stats.mean_af,
+                'median': af_stats.median_af,
+                'min': af_stats.min_af,
+                'max': af_stats.max_af
+            },
+            'outputs': {
+                'matrix_table': mt_output_path,
+                'variant_table': ht_output_path
+            }
+        }
+        
+        # Save summary report
+        summary_path = os.path.join(output_dir, "sampling_summary.json")
+        import json
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        logger.info(f"Summary report saved to {summary_path}")
+        logger.info("Background SNP sampling completed successfully!")
+        
+        return summary
+        
     except Exception as e:
-        logger.warning(f"Failed to write metadata file to {metadata_file}: {e}")
-    
-    logger.info(f"PLINK export complete: {plink_base}")
-    logger.info(f"Output directory: {output_dir}")
+        logger.error(f"Error during background SNP sampling: {str(e)}")
+        raise
+    finally:
+        # Stop Hail session
+        hl.stop()
 
-def perform_filtering(config, params):
-    """Load pre-processed MT and filter to EUR samples."""
-    ANCESTRY_PATH = config['inputs']['ancestry_pred']
-    SPLIT_MT_PATH = config['inputs'].get('split_mt', 
-                                          'gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/splitMT/splitMT.mt')
-    
-    # 1. Load EUR sample list
-    logger.info("Loading EUR sample list...")
-    with hl.hadoop_open(ANCESTRY_PATH, 'r') as f:
-        ancestry_df = pd.read_csv(f, sep="\t")
-    eur_ids = set(ancestry_df[ancestry_df['ancestry_pred'] == 'eur']['research_id'].astype(str))
-    logger.info(f"Found {len(eur_ids)} EUR samples")
-
-    # 2. Read pre-processed MatrixTable (MUCH faster than importing VCFs)
-    logger.info(f"Reading pre-processed MatrixTable from: {SPLIT_MT_PATH}")
-    mt = hl.read_matrix_table(SPLIT_MT_PATH)
-    logger.info(f"Loaded MT - Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
-
-    # 3. Filter to EUR samples
-    logger.info(f"Filtering to {len(eur_ids)} EUR samples...")
-    mt = mt.filter_cols(hl.literal(eur_ids).contains(mt.s))
-    logger.info(f"After sample filter - Cols: {mt.count_cols()}")
-    
-    # 4. Optional: Filter to common variants (uncomment if desired)
-    # This can dramatically reduce export time
-    # logger.info("Filtering to common variants (MAF > 1%, call rate > 95%)...")
-    # mt = hl.variant_qc(mt)
-    # mt = mt.filter_rows(
-    #     (mt.variant_qc.AF[1] > 0.01) &           # MAF > 1%
-    #     (mt.variant_qc.call_rate > 0.95)         # Call rate > 95%
-    # )
-    # logger.info(f"After variant filter - Rows: {mt.count_rows()}")
-    
-    # 5. Optional: Sample variants randomly (uncomment if you want a subset)
-    variant_sample_fraction = params.get('variant_sample_fraction', None)
-    if variant_sample_fraction:
-        logger.info(f"Randomly sampling {variant_sample_fraction*100}% of variants...")
-        mt = mt.sample_rows(variant_sample_fraction, seed=42)
-        logger.info(f"After sampling - Rows: {mt.count_rows()}")
-    
-    # 6. Repartitioning for efficient processing
-    logger.info("Coalescing to 100 partitions...")
-    mt = mt.naive_coalesce(100)
-    
-    logger.info(f"Filtering complete. Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
-    return mt
 
 def main():
-    config = load_config("config/config.json")
+    """Main execution function."""
+    # Setup logging
+    logger = setup_logger("background_snps")
     
-    # OPTIMIZATION: Increase memory allocation for large datasets
-    init_hail("data_prep", driver_mem="32g", executor_mem="16g", reference="GRCh38")
-
-    params = config['params']
-    
-    # Get timestamp from environment or generate new one
-    timestamp = os.environ.get('EXPORT_TIMESTAMP', datetime.now().strftime("%Y%m%d_%H%M%S"))
-    
-    # Determine Output Directory - Always use workspace bucket
-    workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
-    
-    if not workspace_bucket:
-        logger.error("WORKSPACE_BUCKET environment variable not set!")
-        logger.error("This script requires running in an AoU workspace with bucket access.")
-        sys.exit(1)
-    
-    # Handle case where workspace_bucket already includes gs:// prefix
-    if workspace_bucket.startswith('gs://'):
-        base_data_dir = workspace_bucket
-    else:
-        base_data_dir = f"gs://{workspace_bucket}"
-    
-    logger.info(f"Detected AoU Workspace Bucket: {base_data_dir}")
-
-    if params.get('dated_exports', True):
-        dated_output_dir = f"{base_data_dir}/{timestamp}"
-    else:
-        dated_output_dir = base_data_dir
-
-    logger.info(f"Target Output Directory: {dated_output_dir}")
-    
-    # Define checkpoint path for filtered MatrixTable
-    checkpoint_path = f"{dated_output_dir}/filtered_mt.mt"
-    
-    # Check if checkpoint exists from previous run
-    if hl.hadoop_exists(checkpoint_path):
-        logger.info(f"Found existing checkpoint: {checkpoint_path}")
-        logger.info("Loading filtered MatrixTable from checkpoint...")
-        mt = hl.read_matrix_table(checkpoint_path)
-        logger.info(f"Loaded MT - Rows: {mt.count_rows()}, Cols: {mt.count_cols()}")
-    else:
-        # Run filtering pipeline
-        logger.info("No checkpoint found. Running filtering pipeline...")
-        mt = perform_filtering(config, params)
+    try:
+        # Load configuration
+        config = load_config()
+        logger.info("Configuration loaded successfully")
         
-        # Save checkpoint before attempting export
-        logger.info(f"Saving checkpoint to: {checkpoint_path}")
-        logger.info("This allows resuming from this point if export fails.")
-        mt = mt.checkpoint(checkpoint_path, overwrite=True)
-        logger.info("Checkpoint saved successfully.")
+        # Run background SNP sampling
+        summary = sample_background_snps(config, logger)
+        
+        logger.info("Analysis completed successfully!")
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Analysis failed: {str(e)}")
+        sys.exit(1)
 
-    # Export with optimizations
-    logger.info("Proceeding to PLINK export...")
-    perform_plink_export(mt, dated_output_dir, config, timestamp)
-    
-    logger.info("Job completed successfully.")
 
 if __name__ == "__main__":
     main()
