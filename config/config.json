@@ -1,6 +1,6 @@
 {
     "inputs": {
-        "wgs_vcf_base": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/vcf",
+        "wgs_matrix_table": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt",
         "ancestry_pred": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
         "phenotype_gwas": "gs://fc-aou-datasets-controlled/AllxAll/v1/ht/ACAF/EUR/phenotype_NS_326.1_ACAF_results.ht"
     },
@@ -10,8 +10,6 @@
         "data_dir_suffix": "FNCV_RVAS_MS"
     },
     "params": {
-        "total_shards": 24744,
-        "n_shards_to_sample": 500,
         "random_seed": 42,
         "target_variants": 1000000,
         "dated_exports": true

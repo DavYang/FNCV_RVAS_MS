@@ -16,12 +16,12 @@ def load_ancestry_data(config, logger):
     ancestry_ht = hl.import_table(
         config['inputs']['ancestry_pred'],
         impute=True,
-        types={'sample_id': hl.tstr, 'predicted_ancestry': hl.tstr}
+        types={'research_id': hl.tstr, 'ancestry_pred': hl.tstr}
     )
     
     # Filter to European ancestry samples
-    eur_samples = ancestry_ht.filter(ancestry_ht.predicted_ancestry == 'EUR')
-    eur_sample_ids = eur_samples.aggregate(hl.agg.collect(eur_samples.sample_id))
+    eur_samples = ancestry_ht.filter(ancestry_ht.ancestry_pred == 'eur')
+    eur_sample_ids = eur_samples.aggregate(hl.agg.collect(eur_samples.research_id))
     
     logger.info(f"Found {len(eur_sample_ids)} European ancestry samples")
     return eur_sample_ids
@@ -40,15 +40,10 @@ def sample_background_snps(config, logger):
         
         # Load pre-filtered ACAF MatrixTable
         logger.info("Loading ACAF MatrixTable...")
-        mt_path = config['inputs']['wgs_vcf_base']
+        mt_path = config['inputs']['wgs_matrix_table']
         
-        # Since this is VCF data, we need to import it
-        # For now, assuming we have a MatrixTable path or need to import VCFs
-        # This will need adjustment based on actual data structure
-        
-        # Get list of VCF files (assuming sharded structure)
-        # This is a placeholder - actual implementation may vary
-        mt = hl.import_vcf(f"{mt_path}/*.vcf.bgz", force_bgz=True, min_partitions=100)
+        # Read the existing MatrixTable directly
+        mt = hl.read_matrix_table(mt_path)
         
         logger.info(f"Loaded MatrixTable with {mt.count_rows()} variants and {mt.count_cols()} samples")
         
