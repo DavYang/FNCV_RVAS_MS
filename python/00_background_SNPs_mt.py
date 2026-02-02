@@ -27,12 +27,140 @@ def load_ancestry_data(config, logger):
     return eur_sample_ids
 
 
+def calculate_chromosome_sample_targets(target_variants=1000000):
+    """Calculate variant targets per chromosome based on GRCh38 lengths."""
+    
+    chr_lengths = {
+        '1': 248956422, '2': 242193529, '3': 198295559, '4': 190214555,
+        '5': 181538259, '6': 170805979, '7': 159345973, '8': 145138636,
+        '9': 138394717, '10': 133797422, '11': 135086622, '12': 133275309,
+        '13': 114364328, '14': 107043718, '15': 101991189, '16': 90338345,
+        '17': 83257441, '18': 80373285, '19': 58617616, '20': 64444167,
+        '21': 46709983, '22': 50818468
+    }
+    
+    total_autosome_length = sum(chr_lengths.values())
+    targets_per_chr = {}
+    
+    for chrom, length in chr_lengths.items():
+        proportion = length / total_autosome_length
+        targets_per_chr[chrom] = int(target_variants * proportion)
+    
+    return targets_per_chr
+
+
+def process_chromosome(mt, chrom, eur_sample_ids, target_variants_chr, logger):
+    """Process a single chromosome: filter → sample → save."""
+    
+    logger.info(f"Processing chromosome {chrom}...")
+    
+    # Step 1: Filter to chromosome
+    mt_chrom = mt.filter_rows(mt.locus.contig == chrom)
+    total_variants = mt_chrom.count_rows()
+    logger.info(f"Chr {chrom}: {total_variants:,} total variants")
+    
+    # Step 2: Filter to EUR samples
+    mt_chrom_eur = mt_chrom.filter_cols(
+        hl.literal(eur_sample_ids).contains(mt_chrom.s)
+    )
+    filtered_variants = mt_chrom_eur.count_rows()
+    filtered_samples = mt_chrom_eur.count_cols()
+    logger.info(f"Chr {chrom}: {filtered_variants:,} variants, {filtered_samples:,} samples")
+    
+    # Step 3: Calculate sampling fraction
+    if filtered_variants > 0:
+        sampling_fraction = target_variants_chr / filtered_variants
+        logger.info(f"Chr {chrom}: sampling fraction = {sampling_fraction:.6f}")
+        
+        # Step 4: Sample variants
+        mt_sampled = mt_chrom_eur.sample_rows(sampling_fraction, seed=42)
+        actual_variants = mt_sampled.count_rows()
+        logger.info(f"Chr {chrom}: sampled {actual_variants:,} variants")
+        
+        return mt_sampled
+    else:
+        logger.warning(f"Chr {chrom}: No variants after filtering")
+        return None
+
+
+def process_all_chromosomes(mt, eur_sample_ids, config, logger):
+    """Process all chromosomes sequentially."""
+    
+    # Calculate targets per chromosome
+    targets_per_chr = calculate_chromosome_sample_targets(
+        config['params']['target_variants']
+    )
+    
+    logger.info(f"Chromosome targets: {targets_per_chr}")
+    
+    processed_chromosomes = []
+    temp_dir = os.path.join(
+        config['outputs']['base_dir'],
+        config['outputs']['data_dir_suffix'],
+        "temp"
+    )
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Process each chromosome
+    for chrom in range(1, 23):
+        chrom_str = str(chrom)
+        
+        try:
+            mt_chrom_sampled = process_chromosome(
+                mt, chrom_str, eur_sample_ids, 
+                targets_per_chr[chrom_str], logger
+            )
+            
+            if mt_chrom_sampled is not None:
+                processed_chromosomes.append(mt_chrom_sampled)
+                
+                # Checkpoint after each chromosome
+                checkpoint_path = os.path.join(temp_dir, f"chr_{chrom_str}_sampled.mt")
+                mt_chrom_sampled.write(checkpoint_path, overwrite=True)
+                logger.info(f"Checkpoint saved: {checkpoint_path}")
+        
+        except Exception as e:
+            logger.error(f"Error processing chromosome {chrom}: {e}")
+            continue
+    
+    return processed_chromosomes
+
+
+def combine_chromosome_results(processed_chromosomes, config, logger):
+    """Combine all chromosome results into final dataset."""
+    
+    logger.info("Combining chromosome results...")
+    
+    if not processed_chromosomes:
+        raise ValueError("No chromosomes processed successfully")
+    
+    # Combine all chromosome MatrixTables
+    final_mt = hl.MatrixTable.union_rows(*processed_chromosomes)
+    
+    # Final counts
+    total_variants = final_mt.count_rows()
+    total_samples = final_mt.count_cols()
+    
+    logger.info(f"Final dataset: {total_variants:,} variants, {total_samples:,} samples")
+    
+    return final_mt
+
+
 def sample_background_snps(config, logger):
     """Main function to sample 1M random common SNPs from EUR ancestry samples."""
     logger.info("Starting background SNP sampling...")
     
-    # Initialize Hail
-    init_hail(log_prefix="background_snps", driver_mem="8g", reference="GRCh38")
+    # Initialize Hail with increased memory
+    hl.init(
+        log='/tmp/hail_background_snps.log',
+        spark_conf={
+            'spark.driver.memory': '10g',
+            'spark.executor.memory': '10g',
+            'spark.network.timeout': '800s',
+            'spark.executor.heartbeatInterval': '60s'
+        }
+    )
+    hl.default_reference('GRCh38')
     
     try:
         # Load ancestry data
@@ -45,42 +173,27 @@ def sample_background_snps(config, logger):
         # Read the existing MatrixTable directly
         mt = hl.read_matrix_table(mt_path)
         
-        logger.info(f"Loaded MatrixTable with {mt.count_rows()} variants and {mt.count_cols()} samples")
+        logger.info(f"Loaded MatrixTable with {mt.count_rows():,} variants and {mt.count_cols():,} samples")
         
-        # Filter to EUR ancestry samples
-        logger.info("Filtering to European ancestry samples...")
-        mt = mt.filter_cols(hl.literal(eur_sample_ids).contains(mt.s))
+        # Process chromosomes sequentially
+        processed_chromosomes = process_all_chromosomes(mt, eur_sample_ids, config, logger)
         
-        logger.info(f"After ancestry filtering: {mt.count_rows()} variants, {mt.count_cols()} samples")
-        
-        # Calculate sampling fraction for 1M variants
-        total_variants = mt.count_rows()
-        target_variants = config['params']['target_variants']
-        sampling_fraction = target_variants / total_variants
-        
-        logger.info(f"Total variants: {total_variants}, Target: {target_variants}")
-        logger.info(f"Sampling fraction: {sampling_fraction:.6f}")
-        
-        # Random sampling of variants
-        logger.info("Sampling random variants...")
-        mt_sampled = mt.sample_rows(sampling_fraction, seed=config['params']['random_seed'])
-        
-        actual_variants = mt_sampled.count_rows()
-        logger.info(f"Sampled {actual_variants} variants")
+        # Combine all chromosome results
+        final_mt = combine_chromosome_results(processed_chromosomes, config, logger)
         
         # Quality checks
         logger.info("Performing quality checks...")
         
         # Check allele frequency distribution
-        mt_sampled = mt_sampled.annotate_rows(
-            af = hl.agg.mean(mt_sampled.GT.n_alt_alleles()) / (2 * mt_sampled.count_cols())
+        final_mt = final_mt.annotate_rows(
+            af = hl.agg.mean(final_mt.GT.n_alt_alleles()) / (2 * final_mt.count_cols())
         )
         
-        af_stats = mt_sampled.aggregate_rows(hl.struct(
-            mean_af = hl.agg.mean(mt_sampled.af),
-            median_af = hl.agg.approx_median(mt_sampled.af),
-            min_af = hl.agg.min(mt_sampled.af),
-            max_af = hl.agg.max(mt_sampled.af)
+        af_stats = final_mt.aggregate_rows(hl.struct(
+            mean_af = hl.agg.mean(final_mt.af),
+            median_af = hl.agg.approx_median(final_mt.af),
+            min_af = hl.agg.min(final_mt.af),
+            max_af = hl.agg.max(final_mt.af)
         ))
         
         logger.info(f"AF stats - Mean: {af_stats.mean_af:.4f}, Median: {af_stats.median_af:.4f}")
@@ -99,22 +212,23 @@ def sample_background_snps(config, logger):
         
         # Export filtered MatrixTable
         mt_output_path = os.path.join(output_dir, "background_1M_snps.mt")
-        mt_sampled.write(mt_output_path, overwrite=True)
+        final_mt.write(mt_output_path, overwrite=True)
         logger.info(f"Filtered MatrixTable exported to {mt_output_path}")
         
         # Also export as Hail Table for easier querying
         ht_output_path = os.path.join(output_dir, "background_1M_snps.ht")
-        mt_sampled.rows().write(ht_output_path, overwrite=True)
+        final_mt.rows().write(ht_output_path, overwrite=True)
         logger.info(f"Variant table exported to {ht_output_path}")
         
         # Generate summary report
         summary = {
             'timestamp': datetime.now().isoformat(),
-            'total_samples': mt_sampled.count_cols(),
-            'total_variants': actual_variants,
-            'target_variants': target_variants,
-            'sampling_fraction': sampling_fraction,
+            'total_samples': final_mt.count_cols(),
+            'total_variants': final_mt.count_rows(),
+            'target_variants': config['params']['target_variants'],
             'ancestry': 'EUR',
+            'processing_method': 'chromosome_sequential',
+            'chromosomes_processed': len(processed_chromosomes),
             'af_stats': {
                 'mean': af_stats.mean_af,
                 'median': af_stats.median_af,
@@ -134,6 +248,18 @@ def sample_background_snps(config, logger):
             json.dump(summary, f, indent=2)
         
         logger.info(f"Summary report saved to {summary_path}")
+        
+        # Cleanup temporary files
+        temp_dir = os.path.join(
+            config['outputs']['base_dir'],
+            config['outputs']['data_dir_suffix'],
+            "temp"
+        )
+        if os.path.exists(temp_dir):
+            import shutil
+            shutil.rmtree(temp_dir)
+            logger.info("Temporary files cleaned up")
+        
         logger.info("Background SNP sampling completed successfully!")
         
         return summary
