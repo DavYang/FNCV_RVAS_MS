@@ -31,12 +31,12 @@ def calculate_chromosome_sample_targets(target_variants=1000000):
     """Calculate variant targets per chromosome based on GRCh38 lengths."""
     
     chr_lengths = {
-        '1': 248956422, '2': 242193529, '3': 198295559, '4': 190214555,
-        '5': 181538259, '6': 170805979, '7': 159345973, '8': 145138636,
-        '9': 138394717, '10': 133797422, '11': 135086622, '12': 133275309,
-        '13': 114364328, '14': 107043718, '15': 101991189, '16': 90338345,
-        '17': 83257441, '18': 80373285, '19': 58617616, '20': 64444167,
-        '21': 46709983, '22': 50818468
+        'chr1': 248956422, 'chr2': 242193529, 'chr3': 198295559, 'chr4': 190214555,
+        'chr5': 181538259, 'chr6': 170805979, 'chr7': 159345973, 'chr8': 145138636,
+        'chr9': 138394717, 'chr10': 133797422, 'chr11': 135086622, 'chr12': 133275309,
+        'chr13': 114364328, 'chr14': 107043718, 'chr15': 101991189, 'chr16': 90338345,
+        'chr17': 83257441, 'chr18': 80373285, 'chr19': 58617616, 'chr20': 64444167,
+        'chr21': 46709983, 'chr22': 50818468
     }
     
     total_autosome_length = sum(chr_lengths.values())
@@ -103,7 +103,7 @@ def process_all_chromosomes(mt, eur_sample_ids, config, logger):
     
     # Process each chromosome
     for chrom in range(1, 23):
-        chrom_str = str(chrom)
+        chrom_str = f"chr{chrom}"
         
         try:
             mt_chrom_sampled = process_chromosome(
