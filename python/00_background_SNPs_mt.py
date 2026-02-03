@@ -56,8 +56,13 @@ def calculate_chromosome_intervals_and_targets(target_variants=1000000):
         
         for start in range(1, length, interval_size):
             end = min(start + interval_size, length)
-            interval_str = f"{chrom}:{start}-{end}"
-            intervals.append(hl.Interval.parse(interval_str))
+            interval = hl.Interval(
+                start=hl.Locus(chrom, start, reference_genome='GRCh38'),
+                end=hl.Locus(chrom, end, reference_genome='GRCh38'),
+                includes_start=True,
+                includes_end=False
+            )
+            intervals.append(interval)
         
         intervals_per_chr[chrom] = intervals
     
