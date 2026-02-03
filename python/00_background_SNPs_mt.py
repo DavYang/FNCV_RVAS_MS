@@ -122,7 +122,7 @@ def cleanup_resources(logger):
         logger.warning(f"Resource cleanup failed: {e}")
 
 
-def initialize_fresh_session(logger, timeout_seconds=300):
+def initialize_fresh_session(logger, timeout_seconds=600):
     """Initialize a fresh Hail session with conservative settings and timeout."""
     logger.info(f"Initializing fresh Hail session (timeout: {timeout_seconds}s)...")
     
@@ -138,11 +138,11 @@ def initialize_fresh_session(logger, timeout_seconds=300):
         spark_conf = {
             'spark.driver.memory': '4g',   # Very conservative for stability
             'spark.executor.memory': '4g', # Very conservative for stability
-            'spark.network.timeout': '600s',
-            'spark.executor.heartbeatInterval': '30s',
-            'spark.yarn.am.waitTime': '300s',
-            'spark.yarn.applicationMaster.waitTime': '300s',
-            'spark.yarn.maxAppAttempts': '2',
+            'spark.network.timeout': '1200s',
+            'spark.executor.heartbeatInterval': '60s',
+            'spark.yarn.am.waitTime': '600s',
+            'spark.yarn.applicationMaster.waitTime': '600s',
+            'spark.yarn.maxAppAttempts': '3',
             'spark.driver.extraJavaOptions': '-XX:+UseG1GC -XX:MaxGCPauseMillis=200',
             'spark.executor.extraJavaOptions': '-XX:+UseG1GC -XX:MaxGCPauseMillis=200'
         }
@@ -367,12 +367,19 @@ def process_all_chromosomes_with_sessions(config, logger):
     output_dir = f"{workspace_bucket}/results/FNCV_RVAS_MS/background_snps"
     logger.info(f"Output directory: {output_dir}")
     
-    # Sort chromosomes by size (smallest first) for stability
-    chromosome_order = sorted(targets_per_chr.keys(), 
-                            key=lambda x: targets_per_chr[x], 
-                            reverse=False)
+    # Check for test mode
+    test_mode = config['params'].get('test_mode', False)
+    if test_mode:
+        test_chromosome = config['params'].get('test_chromosome', 'chr22')
+        chromosome_order = [test_chromosome]
+        logger.info(f"TEST MODE: Processing only {test_chromosome}")
+    else:
+        # Sort chromosomes by size (smallest first) for stability
+        chromosome_order = sorted(targets_per_chr.keys(), 
+                                key=lambda x: targets_per_chr[x], 
+                                reverse=False)
     
-    logger.info(f"Processing order (smallest to largest): {chromosome_order}")
+    logger.info(f"Processing order: {chromosome_order}")
     logger.info("Per-chromosome session processing with EUR reloading!")
     
     # Process each chromosome with fresh session
@@ -392,7 +399,11 @@ def process_all_chromosomes_with_sessions(config, logger):
             logger.info(f"Chr {chrom}: Initializing session...")
             session_start_time = time.time()
             
-            if not initialize_fresh_session(logger, timeout_seconds=300):
+            # Use longer timeout for test mode
+            timeout_seconds = 900 if test_mode else 600
+            logger.info(f"Chr {chrom}: Using {timeout_seconds}s timeout for session initialization")
+            
+            if not initialize_fresh_session(logger, timeout_seconds=timeout_seconds):
                 raise Exception("Failed to initialize Hail session")
             
             session_time = time.time() - session_start_time
