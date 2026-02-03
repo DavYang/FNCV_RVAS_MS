@@ -12,7 +12,7 @@ from utils import load_config, setup_logger
 
 
 def calculate_chromosome_intervals_and_targets(target_variants=1000000):
-    """Calculate intervals and variant targets per chromosome based on GRCh38 lengths."""
+    """Calculate random reproducible intervals and variant targets per chromosome."""
     
     chr_lengths = {
         'chr1': 248956422, 'chr2': 242193529, 'chr3': 198295559, 'chr4': 190214555,
@@ -31,15 +31,26 @@ def calculate_chromosome_intervals_and_targets(target_variants=1000000):
         proportion = length / total_autosome_length
         targets_per_chr[chrom] = int(target_variants * proportion)
     
-    # Generate intervals for each chromosome (10Mb intervals for manageable chunks)
+    # Generate random reproducible intervals for each chromosome
+    random.seed(42)  # For reproducibility
     intervals_per_chr = {}
+    
     for chrom, length in chr_lengths.items():
         intervals = []
-        # Use 10Mb intervals to reduce memory load
+        # Use 10Mb intervals for manageable chunks
         interval_size = 10000000  # 10Mb
         
-        for start in range(1, length, interval_size):
+        # Calculate number of possible intervals
+        num_intervals = max(1, (length - 1) // interval_size + 1)
+        
+        # Randomly select intervals to process (sample 10% of possible intervals)
+        num_to_process = max(1, num_intervals // 10)
+        selected_indices = sorted(random.sample(range(num_intervals), num_to_process))
+        
+        for idx in selected_indices:
+            start = 1 + idx * interval_size
             end = min(start + interval_size, length)
+            
             interval = hl.Interval(
                 start=hl.Locus(chrom, start, reference_genome='GRCh38'),
                 end=hl.Locus(chrom, end, reference_genome='GRCh38'),
@@ -147,14 +158,19 @@ def load_eur_data(config, logger):
 
 
 def process_chromosome(mt_eur, chrom, intervals, target_variants_chr, output_dir, logger):
-    """Process a single chromosome with its intervals."""
+    """Process a single chromosome with early stopping when target is reached."""
     logger.info(f"Processing {chrom} ({len(intervals)} intervals)...")
     
     chrom_start_time = time.time()
     processed_intervals = []
     total_filtered_variants_chr = 0
+    target_reached = False
     
     for interval_idx, interval in enumerate(intervals):
+        if target_reached:
+            logger.info(f"  {chrom}: Target of {target_variants_chr:,} variants reached, stopping early")
+            break
+            
         interval_start_time = time.time()
         logger.info(f"  {chrom} interval {interval_idx + 1}/{len(intervals)} (pos: {interval.start.position}-{interval.end.position})")
         
@@ -175,7 +191,12 @@ def process_chromosome(mt_eur, chrom, intervals, target_variants_chr, output_dir
             total_filtered_variants_chr += interval_variants
             processed_intervals.append(mt_interval)
             
-            logger.info(f"    {interval_variants:,} variants ({time.time() - interval_start_time:.1f}s)")
+            logger.info(f"    {interval_variants:,} variants (total: {total_filtered_variants_chr:,}/{target_variants_chr:,}) ({time.time() - interval_start_time:.1f}s)")
+            
+            # Check if target reached
+            if total_filtered_variants_chr >= target_variants_chr:
+                target_reached = True
+                logger.info(f"  {chrom}: Target reached with {total_filtered_variants_chr:,} variants")
             
             # Cleanup interval
             del mt_interval
@@ -220,6 +241,9 @@ def process_chromosome(mt_eur, chrom, intervals, target_variants_chr, output_dir
                 'chromosome': chrom,
                 'target_variants': target_variants_chr,
                 'actual_variants': actual_variants,
+                'total_filtered_variants': total_filtered_variants_chr,
+                'intervals_processed': len(processed_intervals),
+                'target_reached_early': target_reached,
                 'output_path': chromosome_output_path,
                 'processing_time_seconds': round(chrom_time, 1),
                 'export_time_seconds': round(export_time, 1),
