@@ -73,6 +73,12 @@ def process_single_interval(mt, interval, eur_sample_ids, chrom, interval_idx, l
     """Process a single interval with its own Hail session."""
     
     try:
+        # Stop any existing session first
+        try:
+            hl.stop()
+        except:
+            pass
+        
         # Fresh session for each interval
         hl.init(
             log=f'/tmp/hail_interval_{chrom}_{interval_idx}.log',
@@ -154,6 +160,12 @@ def process_chromosome_with_recovery(mt, chrom, intervals, eur_sample_ids, targe
     # Combine intervals for this chromosome (need fresh session)
     if processed_intervals:
         try:
+            # Stop any existing session first
+            try:
+                hl.stop()
+            except:
+                pass
+            
             # Fresh session for combination
             hl.init(
                 log=f'/tmp/hail_combine_{chrom}.log',
@@ -297,6 +309,10 @@ def sample_background_snps(config, logger):
         
         logger.info(f"Loaded MatrixTable with {mt.count_rows():,} variants and {mt.count_cols():,} samples")
         
+        # Stop main session before per-interval processing
+        logger.info("Stopping main session to prepare for per-interval processing...")
+        hl.stop()
+        
         # Process chromosomes with per-interval sessions
         processed_chromosomes = process_all_chromosomes_ultra_resilient(mt, eur_sample_ids, config, logger)
         
@@ -337,9 +353,12 @@ def sample_background_snps(config, logger):
         logger.error(f"Analysis failed: {e}")
         raise
     finally:
-        # Always stop Hail session
-        logger.info("Stopping Hail session...")
-        hl.stop()
+        # Always stop Hail session (if still running)
+        try:
+            logger.info("Stopping Hail session...")
+            hl.stop()
+        except:
+            pass
 
 
 def main():
