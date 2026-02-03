@@ -83,7 +83,11 @@ def process_chromosome_intervals(mt, chrom, intervals, eur_sample_ids, target_va
             logger.info(f"Chr {chrom}: Processing interval {interval_idx + 1}/{len(intervals)}")
             
             # Load only the specific interval (much more memory efficient!)
-            mt_interval = mt.filter_intervals([interval])
+            mt_interval = mt.filter_rows(
+                (mt.locus.contig == chrom) & 
+                (mt.locus.position >= interval.start.position) & 
+                (mt.locus.position < interval.end.position)
+            )
             
             # Quick count
             interval_variants = mt_interval.count_rows()
