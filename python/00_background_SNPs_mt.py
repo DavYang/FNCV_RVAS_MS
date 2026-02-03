@@ -234,8 +234,8 @@ def sample_background_snps(config, logger):
     hl.init(
         log='/tmp/hail_background_snps.log',
         spark_conf={
-            'spark.driver.memory': '12g',  # More memory for single session
-            'spark.executor.memory': '12g',
+            'spark.driver.memory': '8g',  # Reduced to fit cluster limits
+            'spark.executor.memory': '8g',  # Reduced to fit cluster limits
             'spark.network.timeout': '800s',
             'spark.executor.heartbeatInterval': '60s'
         }
