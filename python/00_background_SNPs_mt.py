@@ -178,7 +178,13 @@ def process_all_chromosomes(mt, eur_sample_ids, config, logger):
         try:
             # Re-initialize Hail session for each chromosome to ensure clean state
             logger.info(f"Re-initializing Hail session for {chrom}...")
-            hl.stop()  # Stop any existing session
+            
+            # Only stop if there's an active session
+            try:
+                hl.stop()
+            except:
+                logger.info(f"No active session to stop for {chrom}")
+            
             hl.init(
                 log=f'/tmp/hail_background_snps_{chrom}.log',
                 spark_conf={
