@@ -136,15 +136,19 @@ def initialize_fresh_session(logger, timeout_seconds=600):
         
         logger.debug("Step 2: Configuring Spark settings...")
         spark_conf = {
-            'spark.driver.memory': '4g',   # Very conservative for stability
-            'spark.executor.memory': '4g', # Very conservative for stability
-            'spark.network.timeout': '1200s',
-            'spark.executor.heartbeatInterval': '60s',
-            'spark.yarn.am.waitTime': '600s',
-            'spark.yarn.applicationMaster.waitTime': '600s',
-            'spark.yarn.maxAppAttempts': '3',
-            'spark.driver.extraJavaOptions': '-XX:+UseG1GC -XX:MaxGCPauseMillis=200',
-            'spark.executor.extraJavaOptions': '-XX:+UseG1GC -XX:MaxGCPauseMillis=200'
+            'spark.driver.memory': '6g',   # Increased from 4g for AM stability
+            'spark.executor.memory': '6g', # Increased from 4g for AM stability
+            'spark.driver.cores': '1',      # Reduced cores to reduce resource pressure
+            'spark.executor.cores': '1',    # Reduced cores to reduce resource pressure
+            'spark.network.timeout': '2400s', # Increased from 1200s
+            'spark.executor.heartbeatInterval': '120s', # Increased from 60s
+            'spark.yarn.am.waitTime': '1800s', # Increased from 600s (30 minutes)
+            'spark.yarn.applicationMaster.waitTime': '1800s', # Increased from 600s
+            'spark.yarn.maxAppAttempts': '1', # Reduced to prevent retry loops
+            'spark.yarn.am.memory': '2g',    # Explicit AM memory
+            'spark.yarn.am.cores': '1',     # Reduced AM cores
+            'spark.driver.extraJavaOptions': '-XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+UseCGroupMemoryLimitForHeap',
+            'spark.executor.extraJavaOptions': '-XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+UseCGroupMemoryLimitForHeap'
         }
         logger.debug(f"Spark configuration: {spark_conf}")
         
