@@ -14,7 +14,8 @@
         "target_variants": 1000000,
         "dated_exports": true,
         "test_mode": true,
-        "test_chromosome": "chr22"
+        "test_chromosome": "chr22",
+        "single_session_mode": true
     },
     "tools": {
         "gcta": "tools/gcta64"
