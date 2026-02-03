@@ -44,7 +44,7 @@ def merge_chromosome_mts(output_dir, processed_chromosomes, logger):
     missing_chromosomes = []
     
     for chrom in processed_chromosomes:
-        mt_path = os.path.join(output_dir, f"chr_{chrom}_sampled.mt")
+        mt_path = f"{output_dir}/chr{chrom}_background_snps.mt"  # Updated path format
         
         if os.path.exists(mt_path):
             logger.info(f"Loading {chrom} from {mt_path}")
@@ -164,12 +164,9 @@ def main():
         # Load configuration
         config = load_config()
         
-        # Define output directory
-        output_dir = os.path.join(
-            config['outputs']['base_dir'],
-            config['outputs']['data_dir_suffix'],
-            "background_snps"
-        )
+        # Define output directory using WORKSPACE_BUCKET
+        workspace_bucket = os.environ.get('WORKSPACE_BUCKET', 'gs://default-bucket')
+        output_dir = f"{workspace_bucket}/results/FNCV_RVAS_MS/background_snps"
         
         logger.info(f"Starting chromosome MatrixTable merge...")
         logger.info(f"Output directory: {output_dir}")
