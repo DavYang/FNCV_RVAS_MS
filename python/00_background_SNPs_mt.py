@@ -142,7 +142,7 @@ def process_chromosome_intervals(mt, chrom, intervals, eur_sample_ids, target_va
 
 
 def process_all_chromosomes(mt, eur_sample_ids, config, logger):
-    """Process all chromosomes using interval-based loading with session recovery."""
+    """Process all chromosomes using interval-based loading with single session."""
     
     # Calculate targets and intervals per chromosome
     targets_per_chr, intervals_per_chr = calculate_chromosome_intervals_and_targets(
@@ -155,13 +155,13 @@ def process_all_chromosomes(mt, eur_sample_ids, config, logger):
     total_intervals = sum(len(intervals) for intervals in intervals_per_chr.values())
     logger.info(f"Total intervals to process: {total_intervals}")
     
-    processed_chromosomes = []
-    temp_dir = os.path.join(
+    # Create output directory for individual chromosome MTs
+    output_dir = os.path.join(
         config['outputs']['base_dir'],
         config['outputs']['data_dir_suffix'],
-        "temp"
+        "background_snps"
     )
-    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     # Sort chromosomes by size (smallest first) to test stability
     chromosome_order = sorted(targets_per_chr.keys(), 
@@ -170,56 +170,39 @@ def process_all_chromosomes(mt, eur_sample_ids, config, logger):
     
     logger.info(f"Processing order (smallest to largest): {chromosome_order}")
     
-    # Process each chromosome with interval-based loading
+    # Process each chromosome with single session
+    processed_chromosomes = []
+    
     for chrom in chromosome_order:
         intervals = intervals_per_chr[chrom]
         logger.info(f"Starting chromosome {chrom} ({len(intervals)} intervals)...")
         
         try:
-            # Re-initialize Hail session for each chromosome to ensure clean state
-            logger.info(f"Re-initializing Hail session for {chrom}...")
-            
-            # Only stop if there's an active session
-            try:
-                hl.stop()
-            except:
-                logger.info(f"No active session to stop for {chrom}")
-            
-            hl.init(
-                log=f'/tmp/hail_background_snps_{chrom}.log',
-                spark_conf={
-                    'spark.driver.memory': '6g',  # Further reduced for interval processing
-                    'spark.executor.memory': '6g',
-                    'spark.network.timeout': '600s',
-                    'spark.executor.heartbeatInterval': '30s'
-                }
-            )
-            hl.default_reference('GRCh38')
-            
             mt_chrom_sampled = process_chromosome_intervals(
                 mt, chrom, intervals, eur_sample_ids, 
                 targets_per_chr[chrom], logger
             )
             
             if mt_chrom_sampled is not None:
-                processed_chromosomes.append(mt_chrom_sampled)
+                processed_chromosomes.append(chrom)
                 
-                # Checkpoint after each chromosome
-                checkpoint_path = os.path.join(temp_dir, f"chr_{chrom}_sampled.mt")
-                mt_chrom_sampled.write(checkpoint_path, overwrite=True)
-                logger.info(f"Checkpoint saved: {checkpoint_path}")
+                # Export individual chromosome MT
+                chromosome_output_path = os.path.join(output_dir, f"chr_{chrom}_sampled.mt")
+                mt_chrom_sampled.write(chromosome_output_path, overwrite=True)
+                logger.info(f"✅ Exported {chrom} to {chromosome_output_path}")
                 
                 # Clear memory
                 del mt_chrom_sampled
                 logger.info(f"Chr {chrom}: Memory cleared")
             else:
-                logger.warning(f"Chr {chrom}: No data processed")
+                logger.warning(f"❌ Chr {chrom}: No data processed")
         
         except Exception as e:
-            logger.error(f"Error processing chromosome {chrom}: {e}")
+            logger.error(f"❌ Error processing chromosome {chrom}: {e}")
             # Continue to next chromosome instead of stopping
             continue
     
+    logger.info(f"✅ Successfully processed {len(processed_chromosomes)} chromosomes: {processed_chromosomes}")
     return processed_chromosomes
 
 
@@ -247,14 +230,14 @@ def sample_background_snps(config, logger):
     """Main function to sample 1M random common SNPs from EUR ancestry samples."""
     logger.info("Starting background SNP sampling...")
     
-    # Initialize Hail for initial data loading only
+    # Initialize Hail once for the entire processing
     hl.init(
-        log='/tmp/hail_background_snps_initial.log',
+        log='/tmp/hail_background_snps.log',
         spark_conf={
-            'spark.driver.memory': '8g',
-            'spark.executor.memory': '8g',
-            'spark.network.timeout': '600s',
-            'spark.executor.heartbeatInterval': '30s'
+            'spark.driver.memory': '12g',  # More memory for single session
+            'spark.executor.memory': '12g',
+            'spark.network.timeout': '800s',
+            'spark.executor.heartbeatInterval': '60s'
         }
     )
     hl.default_reference('GRCh38')
@@ -272,117 +255,48 @@ def sample_background_snps(config, logger):
         
         logger.info(f"Loaded MatrixTable with {mt.count_rows():,} variants and {mt.count_cols():,} samples")
         
-        # Stop initial session to free memory
-        hl.stop()
-        logger.info("Initial Hail session stopped, freeing memory")
-        
-        # Process chromosomes with individual sessions
+        # Process chromosomes with single session
         processed_chromosomes = process_all_chromosomes(mt, eur_sample_ids, config, logger)
         
-        # Re-initialize for final combination
-        logger.info("Re-initializing Hail for final combination...")
-        hl.init(
-            log='/tmp/hail_background_snps_final.log',
-            spark_conf={
-                'spark.driver.memory': '12g',  # More memory for combination
-                'spark.executor.memory': '12g',
-                'spark.network.timeout': '800s',
-                'spark.executor.heartbeatInterval': '60s'
-            }
-        )
-        hl.default_reference('GRCh38')
-        
-        # Combine all chromosome results
-        final_mt = combine_chromosome_results(processed_chromosomes, config, logger)
-        
-        # Quality checks
-        logger.info("Performing quality checks...")
-        
-        # Check allele frequency distribution
-        final_mt = final_mt.annotate_rows(
-            af = hl.agg.mean(final_mt.GT.n_alt_alleles()) / (2 * final_mt.count_cols())
-        )
-        
-        af_stats = final_mt.aggregate_rows(hl.struct(
-            mean_af = hl.agg.mean(final_mt.af),
-            median_af = hl.agg.approx_median(final_mt.af),
-            min_af = hl.agg.min(final_mt.af),
-            max_af = hl.agg.max(final_mt.af)
-        ))
-        
-        logger.info(f"AF stats - Mean: {af_stats.mean_af:.4f}, Median: {af_stats.median_af:.4f}")
-        logger.info(f"AF range - Min: {af_stats.min_af:.4f}, Max: {af_stats.max_af:.4f}")
-        
-        # Export results
-        logger.info("Exporting results...")
-        
-        # Create output directory
+        # Generate summary report
         output_dir = os.path.join(
             config['outputs']['base_dir'],
             config['outputs']['data_dir_suffix'],
             "background_snps"
         )
-        os.makedirs(output_dir, exist_ok=True)
         
-        # Export filtered MatrixTable
-        mt_output_path = os.path.join(output_dir, "background_1M_snps.mt")
-        final_mt.write(mt_output_path, overwrite=True)
-        logger.info(f"Filtered MatrixTable exported to {mt_output_path}")
-        
-        # Also export as Hail Table for easier querying
-        ht_output_path = os.path.join(output_dir, "background_1M_snps.ht")
-        final_mt.rows().write(ht_output_path, overwrite=True)
-        logger.info(f"Variant table exported to {ht_output_path}")
-        
-        # Generate summary report
         summary = {
             'timestamp': datetime.now().isoformat(),
-            'total_samples': final_mt.count_cols(),
-            'total_variants': final_mt.count_rows(),
+            'total_samples': len(eur_sample_ids),
             'target_variants': config['params']['target_variants'],
             'ancestry': 'EUR',
-            'processing_method': 'interval_based_sequential_with_recovery',
-            'chromosomes_processed': len(processed_chromosomes),
-            'af_stats': {
-                'mean': af_stats.mean_af,
-                'median': af_stats.median_af,
-                'min': af_stats.min_af,
-                'max': af_stats.max_af
-            },
-            'outputs': {
-                'matrix_table': mt_output_path,
-                'variant_table': ht_output_path
-            }
+            'processing_method': 'single_session_individual_exports',
+            'chromosomes_processed': processed_chromosomes,
+            'chromosome_count': len(processed_chromosomes),
+            'output_directory': output_dir,
+            'individual_chromosome_mts': [f"chr_{chrom}_sampled.mt" for chrom in processed_chromosomes],
+            'next_step': 'Run merge_chromosome_mts.py to combine results'
         }
         
         # Save summary report
-        summary_path = os.path.join(output_dir, "sampling_summary.json")
+        summary_path = os.path.join(output_dir, "chromosome_processing_summary.json")
         import json
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
         
-        logger.info(f"Summary report saved to {summary_path}")
-        
-        # Cleanup temporary files
-        temp_dir = os.path.join(
-            config['outputs']['base_dir'],
-            config['outputs']['data_dir_suffix'],
-            "temp"
-        )
-        if os.path.exists(temp_dir):
-            import shutil
-            shutil.rmtree(temp_dir)
-            logger.info("Temporary files cleaned up")
-        
-        logger.info("Background SNP sampling completed successfully!")
+        logger.info(f"✅ Chromosome processing completed!")
+        logger.info(f"📊 Summary saved to {summary_path}")
+        logger.info(f"📁 Individual chromosome MTs saved to {output_dir}")
+        logger.info(f"🔄 Next step: Run 'python python/merge_chromosome_mts.py' to combine results")
         
         return summary
         
     except Exception as e:
-        logger.error(f"Error during background SNP sampling: {str(e)}")
+        logger.error(f"❌ Analysis failed: {e}")
         raise
     finally:
-        # Stop Hail session
+        # Always stop Hail session
+        logger.info("🔄 Stopping Hail session...")
         hl.stop()
 
 
