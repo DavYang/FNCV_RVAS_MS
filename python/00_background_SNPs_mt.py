@@ -27,8 +27,8 @@ def load_ancestry_data(config, logger):
     return eur_sample_ids
 
 
-def calculate_chromosome_sample_targets(target_variants=1000000):
-    """Calculate variant targets per chromosome based on GRCh38 lengths."""
+def calculate_chromosome_intervals_and_targets(target_variants=1000000):
+    """Calculate intervals and variant targets per chromosome based on GRCh38 lengths."""
     
     chr_lengths = {
         'chr1': 248956422, 'chr2': 242193529, 'chr3': 198295559, 'chr4': 190214555,
@@ -42,56 +42,113 @@ def calculate_chromosome_sample_targets(target_variants=1000000):
     total_autosome_length = sum(chr_lengths.values())
     targets_per_chr = {}
     
+    # Calculate targets per chromosome
     for chrom, length in chr_lengths.items():
         proportion = length / total_autosome_length
         targets_per_chr[chrom] = int(target_variants * proportion)
     
-    return targets_per_chr
+    # Generate intervals for each chromosome (10Mb intervals for manageable chunks)
+    intervals_per_chr = {}
+    for chrom, length in chr_lengths.items():
+        intervals = []
+        # Use 10Mb intervals to reduce memory load
+        interval_size = 10000000  # 10Mb
+        
+        for start in range(1, length, interval_size):
+            end = min(start + interval_size, length)
+            interval_str = f"{chrom}:{start}-{end}"
+            intervals.append(hl.Interval.parse(interval_str))
+        
+        intervals_per_chr[chrom] = intervals
+    
+    return targets_per_chr, intervals_per_chr
 
 
-def process_chromosome(mt, chrom, eur_sample_ids, target_variants_chr, logger):
-    """Process a single chromosome: filter → sample → save."""
+def process_chromosome_intervals(mt, chrom, intervals, eur_sample_ids, target_variants_chr, logger):
+    """Process chromosome using interval-based loading for memory efficiency."""
     
-    logger.info(f"Processing chromosome {chrom}...")
+    logger.info(f"Processing chromosome {chrom} with {len(intervals)} intervals...")
     
-    # Step 1: Filter to chromosome
-    mt_chrom = mt.filter_rows(mt.locus.contig == chrom)
-    total_variants = mt_chrom.count_rows()
-    logger.info(f"Chr {chrom}: {total_variants:,} total variants")
+    processed_intervals = []
+    total_variants_chr = 0
+    total_filtered_variants_chr = 0
     
-    # Step 2: Filter to EUR samples
-    mt_chrom_eur = mt_chrom.filter_cols(
-        hl.literal(eur_sample_ids).contains(mt_chrom.s)
-    )
-    filtered_variants = mt_chrom_eur.count_rows()
-    filtered_samples = mt_chrom_eur.count_cols()
-    logger.info(f"Chr {chrom}: {filtered_variants:,} variants, {filtered_samples:,} samples")
-    
-    # Step 3: Calculate sampling fraction
-    if filtered_variants > 0:
-        sampling_fraction = target_variants_chr / filtered_variants
-        logger.info(f"Chr {chrom}: sampling fraction = {sampling_fraction:.6f}")
+    try:
+        for interval_idx, interval in enumerate(intervals):
+            logger.info(f"Chr {chrom}: Processing interval {interval_idx + 1}/{len(intervals)}")
+            
+            # Load only the specific interval (much more memory efficient!)
+            mt_interval = mt.filter_intervals([interval])
+            
+            # Quick count
+            interval_variants = mt_interval.count_rows()
+            total_variants_chr += interval_variants
+            
+            if interval_variants == 0:
+                logger.info(f"Chr {chrom} interval {interval_idx + 1}: No variants")
+                continue
+            
+            # Filter to EUR samples for this interval
+            mt_interval_eur = mt_interval.filter_cols(
+                hl.literal(eur_sample_ids).contains(mt_interval.s)
+            )
+            
+            filtered_variants = mt_interval_eur.count_rows()
+            total_filtered_variants_chr += filtered_variants
+            
+            logger.info(f"Chr {chrom} interval {interval_idx + 1}: {filtered_variants:,} filtered variants")
+            
+            if filtered_variants > 0:
+                processed_intervals.append(mt_interval_eur)
+            
+            # Clear memory for this interval
+            del mt_interval, mt_interval_eur
         
-        # Step 4: Sample variants
-        mt_sampled = mt_chrom_eur.sample_rows(sampling_fraction, seed=42)
-        actual_variants = mt_sampled.count_rows()
-        logger.info(f"Chr {chrom}: sampled {actual_variants:,} variants")
+        logger.info(f"Chr {chrom}: Total {total_variants_chr:,} variants, {total_filtered_variants_chr:,} filtered")
         
-        return mt_sampled
-    else:
-        logger.warning(f"Chr {chrom}: No variants after filtering")
+        # Combine all intervals for this chromosome
+        if processed_intervals:
+            mt_chrom_combined = hl.MatrixTable.union_rows(*processed_intervals)
+            
+            # Calculate final sampling for this chromosome
+            if total_filtered_variants_chr > 0:
+                sampling_fraction = target_variants_chr / total_filtered_variants_chr
+                logger.info(f"Chr {chrom}: Final sampling fraction = {sampling_fraction:.6f}")
+                
+                # Sample variants from combined chromosome data
+                mt_sampled = mt_chrom_combined.sample_rows(sampling_fraction, seed=42)
+                actual_variants = mt_sampled.count_rows()
+                logger.info(f"Chr {chrom}: Sampled {actual_variants:,} variants")
+                
+                # Clear memory
+                del mt_chrom_combined, processed_intervals
+                
+                return mt_sampled
+            else:
+                logger.warning(f"Chr {chrom}: No filtered variants for sampling")
+                return None
+        else:
+            logger.warning(f"Chr {chrom}: No intervals with data")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error processing chromosome {chrom}: {str(e)}")
         return None
 
 
 def process_all_chromosomes(mt, eur_sample_ids, config, logger):
-    """Process all chromosomes sequentially."""
+    """Process all chromosomes using interval-based loading with session recovery."""
     
-    # Calculate targets per chromosome
-    targets_per_chr = calculate_chromosome_sample_targets(
+    # Calculate targets and intervals per chromosome
+    targets_per_chr, intervals_per_chr = calculate_chromosome_intervals_and_targets(
         config['params']['target_variants']
     )
     
     logger.info(f"Chromosome targets: {targets_per_chr}")
+    
+    # Count total intervals for progress tracking
+    total_intervals = sum(len(intervals) for intervals in intervals_per_chr.values())
+    logger.info(f"Total intervals to process: {total_intervals}")
     
     processed_chromosomes = []
     temp_dir = os.path.join(
@@ -101,26 +158,55 @@ def process_all_chromosomes(mt, eur_sample_ids, config, logger):
     )
     os.makedirs(temp_dir, exist_ok=True)
     
-    # Process each chromosome
-    for chrom in range(1, 23):
-        chrom_str = f"chr{chrom}"
+    # Sort chromosomes by size (smallest first) to test stability
+    chromosome_order = sorted(targets_per_chr.keys(), 
+                            key=lambda x: targets_per_chr[x], 
+                            reverse=False)
+    
+    logger.info(f"Processing order (smallest to largest): {chromosome_order}")
+    
+    # Process each chromosome with interval-based loading
+    for chrom in chromosome_order:
+        intervals = intervals_per_chr[chrom]
+        logger.info(f"Starting chromosome {chrom} ({len(intervals)} intervals)...")
         
         try:
-            mt_chrom_sampled = process_chromosome(
-                mt, chrom_str, eur_sample_ids, 
-                targets_per_chr[chrom_str], logger
+            # Re-initialize Hail session for each chromosome to ensure clean state
+            logger.info(f"Re-initializing Hail session for {chrom}...")
+            hl.stop()  # Stop any existing session
+            hl.init(
+                log=f'/tmp/hail_background_snps_{chrom}.log',
+                spark_conf={
+                    'spark.driver.memory': '6g',  # Further reduced for interval processing
+                    'spark.executor.memory': '6g',
+                    'spark.network.timeout': '600s',
+                    'spark.executor.heartbeatInterval': '30s'
+                }
+            )
+            hl.default_reference('GRCh38')
+            
+            mt_chrom_sampled = process_chromosome_intervals(
+                mt, chrom, intervals, eur_sample_ids, 
+                targets_per_chr[chrom], logger
             )
             
             if mt_chrom_sampled is not None:
                 processed_chromosomes.append(mt_chrom_sampled)
                 
                 # Checkpoint after each chromosome
-                checkpoint_path = os.path.join(temp_dir, f"chr_{chrom_str}_sampled.mt")
+                checkpoint_path = os.path.join(temp_dir, f"chr_{chrom}_sampled.mt")
                 mt_chrom_sampled.write(checkpoint_path, overwrite=True)
                 logger.info(f"Checkpoint saved: {checkpoint_path}")
+                
+                # Clear memory
+                del mt_chrom_sampled
+                logger.info(f"Chr {chrom}: Memory cleared")
+            else:
+                logger.warning(f"Chr {chrom}: No data processed")
         
         except Exception as e:
             logger.error(f"Error processing chromosome {chrom}: {e}")
+            # Continue to next chromosome instead of stopping
             continue
     
     return processed_chromosomes
@@ -150,14 +236,14 @@ def sample_background_snps(config, logger):
     """Main function to sample 1M random common SNPs from EUR ancestry samples."""
     logger.info("Starting background SNP sampling...")
     
-    # Initialize Hail with increased memory
+    # Initialize Hail for initial data loading only
     hl.init(
-        log='/tmp/hail_background_snps.log',
+        log='/tmp/hail_background_snps_initial.log',
         spark_conf={
-            'spark.driver.memory': '10g',
-            'spark.executor.memory': '10g',
-            'spark.network.timeout': '800s',
-            'spark.executor.heartbeatInterval': '60s'
+            'spark.driver.memory': '8g',
+            'spark.executor.memory': '8g',
+            'spark.network.timeout': '600s',
+            'spark.executor.heartbeatInterval': '30s'
         }
     )
     hl.default_reference('GRCh38')
@@ -175,8 +261,25 @@ def sample_background_snps(config, logger):
         
         logger.info(f"Loaded MatrixTable with {mt.count_rows():,} variants and {mt.count_cols():,} samples")
         
-        # Process chromosomes sequentially
+        # Stop initial session to free memory
+        hl.stop()
+        logger.info("Initial Hail session stopped, freeing memory")
+        
+        # Process chromosomes with individual sessions
         processed_chromosomes = process_all_chromosomes(mt, eur_sample_ids, config, logger)
+        
+        # Re-initialize for final combination
+        logger.info("Re-initializing Hail for final combination...")
+        hl.init(
+            log='/tmp/hail_background_snps_final.log',
+            spark_conf={
+                'spark.driver.memory': '12g',  # More memory for combination
+                'spark.executor.memory': '12g',
+                'spark.network.timeout': '800s',
+                'spark.executor.heartbeatInterval': '60s'
+            }
+        )
+        hl.default_reference('GRCh38')
         
         # Combine all chromosome results
         final_mt = combine_chromosome_results(processed_chromosomes, config, logger)
@@ -227,7 +330,7 @@ def sample_background_snps(config, logger):
             'total_variants': final_mt.count_rows(),
             'target_variants': config['params']['target_variants'],
             'ancestry': 'EUR',
-            'processing_method': 'chromosome_sequential',
+            'processing_method': 'interval_based_sequential_with_recovery',
             'chromosomes_processed': len(processed_chromosomes),
             'af_stats': {
                 'mean': af_stats.mean_af,
