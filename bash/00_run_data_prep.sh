@@ -3,7 +3,6 @@ set -e
 
 # --- Configuration ---
 SCRIPT_NAME="00_background_SNPs_mt"
-MERGE_SCRIPT_NAME="merge_chromosome_mts"
 BASE_DIR=$(pwd)
 PYTHON_DIR="${BASE_DIR}/python"
 LOG_DIR="${BASE_DIR}/logs"
@@ -18,16 +17,13 @@ mkdir -p "$CONFIG_DIR"
 # Generate a timestamp for the log file
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${LOG_DIR}/${SCRIPT_NAME}_${TIMESTAMP}.log"
-MERGE_LOG_FILE="${LOG_DIR}/${MERGE_SCRIPT_NAME}_${TIMESTAMP}.log"
 
 echo "==========================================="
 echo "   Starting Background SNP Sampling Pipeline"
 echo "==========================================="
 echo "Date: ${TIMESTAMP}"
-echo "Step 1 Script: ${PYTHON_DIR}/${SCRIPT_NAME}.py"
-echo "Step 1 Log: ${LOG_FILE}"
-echo "Step 2 Script: ${PYTHON_DIR}/${MERGE_SCRIPT_NAME}.py"
-echo "Step 2 Log: ${MERGE_LOG_FILE}"
+echo "Script: ${PYTHON_DIR}/${SCRIPT_NAME}.py"
+echo "Log File: ${LOG_FILE}"
 echo "Config: ${CONFIG_DIR}/config.json"
 echo "==========================================="
 
@@ -46,12 +42,6 @@ if [ ! -f "${CONFIG_DIR}/config.json" ]; then
     exit 1
 fi
 
-# Check if merge script exists
-if [ ! -f "${PYTHON_DIR}/${MERGE_SCRIPT_NAME}.py" ]; then
-    echo "Error: Merge script not found at ${PYTHON_DIR}/${MERGE_SCRIPT_NAME}.py"
-    exit 1
-fi
-
 # Run chromosome processing in background
 echo "Starting chromosome processing..."
 nohup python3 "${PYTHON_DIR}/${SCRIPT_NAME}.py" > "${LOG_FILE}" 2>&1 &
@@ -59,62 +49,13 @@ CHROMOSOME_PID=$!
 
 echo "Chromosome processing job submitted!"
 echo "PID: ${CHROMOSOME_PID}"
-echo "To monitor progress: tail -f ${LOG_FILE}"
-echo "Waiting for chromosome processing to complete..."
-
-# Wait for chromosome processing to complete
-wait $CHROMOSOME_PID
-CHROMOSOME_EXIT_CODE=$?
-
-if [ $CHROMOSOME_EXIT_CODE -ne 0 ]; then
-    echo "Step 1 failed! Check log: ${LOG_FILE}"
-    echo "Last 20 lines of error:"
-    tail -20 "${LOG_FILE}"
-    exit 1
-fi
-
-echo "Step 1 completed successfully!"
-echo "Chromosome processing summary:"
-grep "Successfully processed" "${LOG_FILE}" || echo "Check log for details"
-
-# --- Step 2: Merge Chromosome Results ---
 echo ""
-echo "Step 2: Merging chromosome results..."
-
-# Run merge script in background
-nohup python3 "${PYTHON_DIR}/${MERGE_SCRIPT_NAME}.py" > "${MERGE_LOG_FILE}" 2>&1 &
-MERGE_PID=$!
-
-echo "Merge job submitted!"
-echo "PID: ${MERGE_PID}"
-echo "To monitor progress: tail -f ${MERGE_LOG_FILE}"
-echo "Waiting for merge to complete..."
-
-# Wait for merge to complete
-wait $MERGE_PID
-MERGE_EXIT_CODE=$?
-
-if [ $MERGE_EXIT_CODE -ne 0 ]; then
-    echo "Step 2 failed! Check log: ${MERGE_LOG_FILE}"
-    echo "Last 20 lines of error:"
-    tail -20 "${MERGE_LOG_FILE}"
-    exit 1
-fi
-
-echo "Step 2 completed successfully!"
-echo "Merge summary:"
-grep "Final dataset:" "${MERGE_LOG_FILE}" || echo "Check log for details"
-
-# --- Completion ---
+echo "To monitor progress, run:"
+echo "  tail -f ${LOG_FILE}"
 echo ""
-echo "==========================================="
-echo "Pipeline completed successfully!"
-echo "==========================================="
-echo "Step 1 Log: ${LOG_FILE}"
-echo "Step 2 Log: ${MERGE_LOG_FILE}"
+echo "To check job status, run:"
+echo "  ps -p ${CHROMOSOME_PID}"
 echo ""
-echo "To review results:"
-echo "  - Check chromosome processing: tail -50 ${LOG_FILE}"
-echo "  - Check merge results: tail -50 ${MERGE_LOG_FILE}"
-echo "  - Find output files in: results/FNCV_RVAS_MS/background_snps/"
+echo "After chromosome processing completes, run:"
+echo "  bash bash/01_merge_chromosome_mts.sh"
 echo "==========================================="
