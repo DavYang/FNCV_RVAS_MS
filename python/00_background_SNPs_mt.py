@@ -69,115 +69,67 @@ def calculate_chromosome_intervals_and_targets(target_variants=1000000):
     return targets_per_chr, intervals_per_chr
 
 
-def process_single_interval(mt, interval, eur_sample_ids, chrom, interval_idx, logger):
-    """Process a single interval with its own Hail session."""
+def process_chromosome_single_session(mt, chrom, intervals, eur_sample_ids, target_variants_chr, logger):
+    """Process chromosome with single session for all intervals."""
     
     try:
-        # Stop any existing session first
-        try:
-            hl.stop()
-        except:
-            pass
-        
-        # Fresh session for each interval
+        # Single session for entire chromosome
         hl.init(
-            log=f'/tmp/hail_interval_{chrom}_{interval_idx}.log',
+            log=f'/tmp/hail_chromosome_{chrom}.log',
             spark_conf={
-                'spark.driver.memory': '4g',    # Conservative
-                'spark.executor.memory': '4g',  # Conservative
-                'spark.network.timeout': '600s',
-                'spark.executor.heartbeatInterval': '30s'
+                'spark.driver.memory': '8g',    # Moderate memory for chromosome
+                'spark.executor.memory': '8g',  # Moderate memory for chromosome
+                'spark.network.timeout': '1200s',
+                'spark.executor.heartbeatInterval': '60s',
+                'spark.yarn.am.waitTime': '600s',
+                'spark.yarn.applicationMaster.waitTime': '600s',
+                'spark.yarn.maxAppAttempts': '3'
             }
         )
         hl.default_reference('GRCh38')
         
-        logger.info(f"Chr {chrom} interval {interval_idx + 1}: Processing with fresh session...")
+        logger.info(f"Chr {chrom}: Processing {len(intervals)} intervals with single session...")
         
-        # Load only the specific interval
-        mt_interval = mt.filter_rows(
-            (mt.locus.contig == chrom) & 
-            (mt.locus.position >= interval.start.position) & 
-            (mt.locus.position < interval.end.position)
-        )
+        processed_intervals = []
+        total_filtered_variants_chr = 0
         
-        # Quick count
-        interval_variants = mt_interval.count_rows()
-        
-        if interval_variants == 0:
-            logger.info(f"Chr {chrom} interval {interval_idx + 1}: No variants")
-            return None
-        
-        # Filter to EUR samples for this interval
-        mt_interval_eur = mt_interval.filter_cols(
-            hl.literal(eur_sample_ids).contains(mt_interval.s)
-        )
-        
-        filtered_variants = mt_interval_eur.count_rows()
-        logger.info(f"Chr {chrom} interval {interval_idx + 1}: {filtered_variants:,} filtered variants")
-        
-        return mt_interval_eur
-        
-    except Exception as e:
-        logger.error(f"Chr {chrom} interval {interval_idx + 1}: Failed - {str(e)}")
-        return None
-    finally:
-        # Always cleanup session
-        try:
-            hl.stop()
-            logger.info(f"Chr {chrom} interval {interval_idx + 1}: Session stopped")
-        except:
-            pass
-
-
-def process_chromosome_with_recovery(mt, chrom, intervals, eur_sample_ids, target_variants_chr, logger):
-    """Process chromosome with per-interval sessions and recovery."""
-    
-    import time
-    
-    logger.info(f"Processing chromosome {chrom} with {len(intervals)} intervals...")
-    
-    processed_intervals = []
-    total_filtered_variants_chr = 0
-    
-    for interval_idx, interval in enumerate(intervals):
-        logger.info(f"Chr {chrom}: Processing interval {interval_idx + 1}/{len(intervals)}")
-        
-        # Process with fresh session
-        mt_interval_result = process_single_interval(
-            mt, interval, eur_sample_ids, chrom, interval_idx, logger
-        )
-        
-        if mt_interval_result is not None:
-            processed_intervals.append(mt_interval_result)
-            filtered_variants = mt_interval_result.count_rows()
-            total_filtered_variants_chr += filtered_variants
-        
-        # Small delay between intervals to prevent resource exhaustion
-        time.sleep(2)
-    
-    logger.info(f"Chr {chrom}: Total {total_filtered_variants_chr:,} filtered variants from {len(processed_intervals)} intervals")
-    
-    # Combine intervals for this chromosome (need fresh session)
-    if processed_intervals:
-        try:
-            # Stop any existing session first
-            try:
-                hl.stop()
-            except:
-                pass
+        for interval_idx, interval in enumerate(intervals):
+            logger.info(f"Chr {chrom}: Processing interval {interval_idx + 1}/{len(intervals)}")
             
-            # Fresh session for combination
-            hl.init(
-                log=f'/tmp/hail_combine_{chrom}.log',
-                spark_conf={
-                    'spark.driver.memory': '6g',    # More memory for combination
-                    'spark.executor.memory': '6g',  # More memory for combination
-                    'spark.network.timeout': '800s',
-                    'spark.executor.heartbeatInterval': '60s'
-                }
+            # Load only the specific interval (no new session)
+            mt_interval = mt.filter_rows(
+                (mt.locus.contig == chrom) & 
+                (mt.locus.position >= interval.start.position) & 
+                (mt.locus.position < interval.end.position)
             )
-            hl.default_reference('GRCh38')
             
+            # Quick count
+            interval_variants = mt_interval.count_rows()
+            
+            if interval_variants == 0:
+                logger.info(f"Chr {chrom} interval {interval_idx + 1}: No variants")
+                continue
+            
+            # Filter to EUR samples for this interval
+            mt_interval_eur = mt_interval.filter_cols(
+                hl.literal(eur_sample_ids).contains(mt_interval.s)
+            )
+            
+            filtered_variants = mt_interval_eur.count_rows()
+            total_filtered_variants_chr += filtered_variants
+            
+            logger.info(f"Chr {chrom} interval {interval_idx + 1}: {filtered_variants:,} filtered variants")
+            
+            if filtered_variants > 0:
+                processed_intervals.append(mt_interval_eur)
+            
+            # Small delay between intervals (no session restart)
+            time.sleep(1)
+        
+        logger.info(f"Chr {chrom}: Total {total_filtered_variants_chr:,} filtered variants from {len(processed_intervals)} intervals")
+        
+        # Combine all intervals for this chromosome (same session)
+        if processed_intervals:
             logger.info(f"Chr {chrom}: Combining {len(processed_intervals)} intervals...")
             mt_chrom_combined = hl.MatrixTable.union_rows(*processed_intervals)
             
@@ -198,24 +150,28 @@ def process_chromosome_with_recovery(mt, chrom, intervals, eur_sample_ids, targe
             else:
                 logger.warning(f"Chr {chrom}: No filtered variants for sampling")
                 return None
-                
-        except Exception as e:
-            logger.error(f"Chr {chrom}: Failed to combine intervals - {str(e)}")
+        else:
+            logger.warning(f"Chr {chrom}: No intervals with data")
             return None
-        finally:
-            # Always cleanup combination session
-            try:
-                hl.stop()
-                logger.info(f"Chr {chrom}: Combination session stopped")
-            except:
-                pass
-    else:
-        logger.warning(f"Chr {chrom}: No intervals with data")
+            
+    except Exception as e:
+        logger.error(f"Chr {chrom}: Failed to process - {str(e)}")
         return None
+    finally:
+        # Always cleanup session
+        try:
+            hl.stop()
+            logger.info(f"Chr {chrom}: Session stopped")
+        except:
+            pass
 
 
-def process_all_chromosomes_ultra_resilient(mt, eur_sample_ids, config, logger):
-    """Process chromosomes with maximum resilience using per-interval sessions."""
+def process_all_chromosomes_chromosome_sessions(mt, eur_sample_ids, config, logger, max_concurrent=2):
+    """Process chromosomes with one session per chromosome (resource-efficient)."""
+    
+    import time
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     
     # Calculate targets and intervals per chromosome
     targets_per_chr, intervals_per_chr = calculate_chromosome_intervals_and_targets(
@@ -242,41 +198,75 @@ def process_all_chromosomes_ultra_resilient(mt, eur_sample_ids, config, logger):
                             reverse=False)
     
     logger.info(f"Processing order (smallest to largest): {chromosome_order}")
+    logger.info(f"Max concurrent chromosomes: {max_concurrent}")
     
-    # Process each chromosome with per-interval recovery
-    processed_chromosomes = []
-    
-    for chrom in chromosome_order:
+    def process_chromosome_worker(chrom):
+        """Worker function for processing a single chromosome."""
         intervals = intervals_per_chr[chrom]
-        logger.info(f"Starting chromosome {chrom} ({len(intervals)} intervals)...")
+        logger.info(f"[Worker] Starting chromosome {chrom} ({len(intervals)} intervals)...")
         
         try:
-            # Process with per-interval recovery
-            mt_chrom_sampled = process_chromosome_with_recovery(
+            # Process chromosome with single session
+            mt_chrom_sampled = process_chromosome_single_session(
                 mt, chrom, intervals, eur_sample_ids, 
                 targets_per_chr[chrom], logger
             )
             
             if mt_chrom_sampled is not None:
-                processed_chromosomes.append(chrom)
-                
                 # Export individual chromosome MT
                 chromosome_output_path = os.path.join(output_dir, f"chr_{chrom}_sampled.mt")
                 mt_chrom_sampled.write(chromosome_output_path, overwrite=True)
-                logger.info(f"Exported {chrom} to {chromosome_output_path}")
+                logger.info(f"[Worker] Exported {chrom} to {chromosome_output_path}")
                 
                 # Clear memory
                 del mt_chrom_sampled
-                logger.info(f"Chr {chrom}: Memory cleared")
+                logger.info(f"[Worker] Chr {chrom}: Memory cleared")
+                
+                return chrom, True, None
             else:
-                logger.warning(f"Chr {chrom}: No data processed")
+                logger.warning(f"[Worker] Chr {chrom}: No data processed")
+                return chrom, False, "No data processed"
         
         except Exception as e:
-            logger.error(f"Chromosome {chrom} failed completely: {e}")
-            # Continue to next chromosome instead of stopping
-            continue
+            logger.error(f"[Worker] Chromosome {chrom} failed: {e}")
+            return chrom, False, str(e)
+    
+    # Process chromosomes with limited concurrency
+    processed_chromosomes = []
+    failed_chromosomes = {}
+    
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        # Submit all chromosome jobs
+        future_to_chrom = {
+            executor.submit(process_chromosome_worker, chrom): chrom 
+            for chrom in chromosome_order
+        }
+        
+        # Process completed jobs
+        for future in as_completed(future_to_chrom):
+            chrom = future_to_chrom[future]
+            try:
+                result_chrom, success, error = future.result()
+                if success:
+                    processed_chromosomes.append(result_chrom)
+                    logger.info(f"[Main] Chromosome {result_chrom} completed successfully")
+                else:
+                    failed_chromosomes[result_chrom] = error
+                    logger.error(f"[Main] Chromosome {result_chrom} failed: {error}")
+                
+                # Small delay between completions to let resources stabilize
+                time.sleep(5)
+                
+            except Exception as e:
+                logger.error(f"[Main] Unexpected error for chromosome {chrom}: {e}")
+                failed_chromosomes[chrom] = str(e)
     
     logger.info(f"Successfully processed {len(processed_chromosomes)} chromosomes: {processed_chromosomes}")
+    if failed_chromosomes:
+        logger.info(f"Failed chromosomes: {list(failed_chromosomes.keys())}")
+        for chrom, error in failed_chromosomes.items():
+            logger.error(f"  {chrom}: {error}")
+    
     return processed_chromosomes
 
 
@@ -313,8 +303,8 @@ def sample_background_snps(config, logger):
         logger.info("Stopping main session to prepare for per-interval processing...")
         hl.stop()
         
-        # Process chromosomes with per-interval sessions
-        processed_chromosomes = process_all_chromosomes_ultra_resilient(mt, eur_sample_ids, config, logger)
+        # Process chromosomes with chromosome-level sessions
+        processed_chromosomes = process_all_chromosomes_chromosome_sessions(mt, eur_sample_ids, config, logger)
         
         # Generate summary report
         output_dir = os.path.join(
@@ -328,7 +318,7 @@ def sample_background_snps(config, logger):
             'total_samples': len(eur_sample_ids),
             'target_variants': config['params']['target_variants'],
             'ancestry': 'EUR',
-            'processing_method': 'per_interval_sessions_with_recovery',
+            'processing_method': 'chromosome_level_sessions',
             'chromosomes_processed': processed_chromosomes,
             'chromosome_count': len(processed_chromosomes),
             'output_directory': output_dir,
