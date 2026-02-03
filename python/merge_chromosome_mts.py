@@ -57,7 +57,7 @@ def merge_chromosome_mts(output_dir, processed_chromosomes, logger):
             
             chromosome_mts.append(mt_chrom)
         else:
-            logger.warning(f"❌ Chromosome MT not found: {mt_path}")
+            logger.warning(f"Chromosome MT not found: {mt_path}")
             missing_chromosomes.append(chrom)
     
     if not chromosome_mts:
@@ -66,7 +66,7 @@ def merge_chromosome_mts(output_dir, processed_chromosomes, logger):
     if missing_chromosomes:
         logger.warning(f"Missing chromosomes: {missing_chromosomes}")
     
-    logger.info(f"✅ Loaded {len(chromosome_mts)} chromosome MatrixTables")
+    logger.info(f"Loaded {len(chromosome_mts)} chromosome MatrixTables")
     
     # Merge all chromosome MatrixTables
     logger.info("Merging all chromosome MatrixTables...")
@@ -76,7 +76,7 @@ def merge_chromosome_mts(output_dir, processed_chromosomes, logger):
     total_variants = final_mt.count_rows()
     total_samples = final_mt.count_cols()
     
-    logger.info(f"✅ Merged dataset: {total_variants:,} variants, {total_samples:,} samples")
+    logger.info(f"Merged dataset: {total_variants:,} variants, {total_samples:,} samples")
     
     return final_mt
 
@@ -116,12 +116,12 @@ def export_final_results(final_mt, output_dir, af_stats, chr_counts, logger):
     # Export final MatrixTable
     mt_output_path = os.path.join(output_dir, "background_1M_snps.mt")
     final_mt.write(mt_output_path, overwrite=True)
-    logger.info(f"✅ Final MatrixTable exported to {mt_output_path}")
+    logger.info(f"Final MatrixTable exported to {mt_output_path}")
     
     # Export as Hail Table for easier querying
     ht_output_path = os.path.join(output_dir, "background_1M_snps.ht")
     final_mt.rows().write(ht_output_path, overwrite=True)
-    logger.info(f"✅ Variant table exported to {ht_output_path}")
+    logger.info(f"Variant table exported to {ht_output_path}")
     
     # Generate final summary report
     final_summary = {
@@ -150,7 +150,7 @@ def export_final_results(final_mt, output_dir, af_stats, chr_counts, logger):
     with open(final_summary_path, 'w') as f:
         json.dump(final_summary, f, indent=2)
     
-    logger.info(f"✅ Final summary saved to {final_summary_path}")
+    logger.info(f"Final summary saved to {final_summary_path}")
     
     return final_summary
 
@@ -200,18 +200,18 @@ def main():
         # Export final results
         final_summary = export_final_results(final_mt, output_dir, af_stats, chr_counts, logger)
         
-        logger.info("🎉 Chromosome merge completed successfully!")
-        logger.info(f"📊 Final dataset: {final_summary['total_variants']:,} variants, {final_summary['total_samples']:,} samples")
-        logger.info(f"📁 Final outputs in: {output_dir}")
+        logger.info("Chromosome merge completed successfully!")
+        logger.info(f"Final dataset: {final_summary['total_variants']:,} variants, {final_summary['total_samples']:,} samples")
+        logger.info(f"Final outputs in: {output_dir}")
         
         return final_summary
         
     except Exception as e:
-        logger.error(f"❌ Merge failed: {e}")
+        logger.error(f"Merge failed: {e}")
         raise
     finally:
         # Always stop Hail session
-        logger.info("🔄 Stopping Hail session...")
+        logger.info("Stopping Hail session...")
         hl.stop()
 
 

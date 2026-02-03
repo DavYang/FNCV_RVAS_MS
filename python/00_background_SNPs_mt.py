@@ -189,20 +189,20 @@ def process_all_chromosomes(mt, eur_sample_ids, config, logger):
                 # Export individual chromosome MT
                 chromosome_output_path = os.path.join(output_dir, f"chr_{chrom}_sampled.mt")
                 mt_chrom_sampled.write(chromosome_output_path, overwrite=True)
-                logger.info(f"✅ Exported {chrom} to {chromosome_output_path}")
+                logger.info(f"Exported {chrom} to {chromosome_output_path}")
                 
                 # Clear memory
                 del mt_chrom_sampled
                 logger.info(f"Chr {chrom}: Memory cleared")
             else:
-                logger.warning(f"❌ Chr {chrom}: No data processed")
+                logger.warning(f"Chr {chrom}: No data processed")
         
         except Exception as e:
-            logger.error(f"❌ Error processing chromosome {chrom}: {e}")
+            logger.error(f"Error processing chromosome {chrom}: {e}")
             # Continue to next chromosome instead of stopping
             continue
     
-    logger.info(f"✅ Successfully processed {len(processed_chromosomes)} chromosomes: {processed_chromosomes}")
+    logger.info(f"Successfully processed {len(processed_chromosomes)} chromosomes: {processed_chromosomes}")
     return processed_chromosomes
 
 
@@ -284,19 +284,19 @@ def sample_background_snps(config, logger):
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
         
-        logger.info(f"✅ Chromosome processing completed!")
-        logger.info(f"📊 Summary saved to {summary_path}")
-        logger.info(f"📁 Individual chromosome MTs saved to {output_dir}")
-        logger.info(f"🔄 Next step: Run 'python python/merge_chromosome_mts.py' to combine results")
+        logger.info(f"Chromosome processing completed!")
+        logger.info(f"Summary saved to {summary_path}")
+        logger.info(f"Individual chromosome MTs saved to {output_dir}")
+        logger.info(f"Next step: Run 'python python/merge_chromosome_mts.py' to combine results")
         
         return summary
         
     except Exception as e:
-        logger.error(f"❌ Analysis failed: {e}")
+        logger.error(f"Analysis failed: {e}")
         raise
     finally:
         # Always stop Hail session
-        logger.info("🔄 Stopping Hail session...")
+        logger.info("Stopping Hail session...")
         hl.stop()
 
 

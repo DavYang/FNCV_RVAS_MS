@@ -32,7 +32,7 @@ echo "Config: ${CONFIG_DIR}/config.json"
 echo "==========================================="
 
 # --- Step 1: Process Individual Chromosomes ---
-echo "🧬 Step 1: Processing individual chromosomes..."
+echo "Step 1: Processing individual chromosomes..."
 
 # Check if the python script exists
 if [ ! -f "${PYTHON_DIR}/${SCRIPT_NAME}.py" ]; then
@@ -52,45 +52,63 @@ if [ ! -f "${PYTHON_DIR}/${MERGE_SCRIPT_NAME}.py" ]; then
     exit 1
 fi
 
-# Run chromosome processing
+# Run chromosome processing in background
 echo "Starting chromosome processing..."
-python3 "${PYTHON_DIR}/${SCRIPT_NAME}.py" > "${LOG_FILE}" 2>&1
+nohup python3 "${PYTHON_DIR}/${SCRIPT_NAME}.py" > "${LOG_FILE}" 2>&1 &
+CHROMOSOME_PID=$!
+
+echo "Chromosome processing job submitted!"
+echo "PID: ${CHROMOSOME_PID}"
+echo "To monitor progress: tail -f ${LOG_FILE}"
+echo "Waiting for chromosome processing to complete..."
+
+# Wait for chromosome processing to complete
+wait $CHROMOSOME_PID
 CHROMOSOME_EXIT_CODE=$?
 
 if [ $CHROMOSOME_EXIT_CODE -ne 0 ]; then
-    echo "❌ Step 1 failed! Check log: ${LOG_FILE}"
+    echo "Step 1 failed! Check log: ${LOG_FILE}"
     echo "Last 20 lines of error:"
     tail -20 "${LOG_FILE}"
     exit 1
 fi
 
-echo "✅ Step 1 completed successfully!"
-echo "📊 Chromosome processing summary:"
+echo "Step 1 completed successfully!"
+echo "Chromosome processing summary:"
 grep "Successfully processed" "${LOG_FILE}" || echo "Check log for details"
 
 # --- Step 2: Merge Chromosome Results ---
 echo ""
-echo "🔗 Step 2: Merging chromosome results..."
+echo "Step 2: Merging chromosome results..."
 
-# Run merge script
-python3 "${PYTHON_DIR}/${MERGE_SCRIPT_NAME}.py" > "${MERGE_LOG_FILE}" 2>&1
+# Run merge script in background
+nohup python3 "${PYTHON_DIR}/${MERGE_SCRIPT_NAME}.py" > "${MERGE_LOG_FILE}" 2>&1 &
+MERGE_PID=$!
+
+echo "Merge job submitted!"
+echo "PID: ${MERGE_PID}"
+echo "To monitor progress: tail -f ${MERGE_LOG_FILE}"
+echo "Waiting for merge to complete..."
+
+# Wait for merge to complete
+wait $MERGE_PID
 MERGE_EXIT_CODE=$?
 
 if [ $MERGE_EXIT_CODE -ne 0 ]; then
-    echo "❌ Step 2 failed! Check log: ${MERGE_LOG_FILE}"
+    echo "Step 2 failed! Check log: ${MERGE_LOG_FILE}"
     echo "Last 20 lines of error:"
     tail -20 "${MERGE_LOG_FILE}"
     exit 1
 fi
 
-echo "✅ Step 2 completed successfully!"
-echo "📊 Merge summary:"
+echo "Step 2 completed successfully!"
+echo "Merge summary:"
 grep "Final dataset:" "${MERGE_LOG_FILE}" || echo "Check log for details"
 
 # --- Completion ---
 echo ""
 echo "==========================================="
-echo "🎉 Pipeline completed successfully!"
+echo "Pipeline completed successfully!"
 echo "==========================================="
 echo "Step 1 Log: ${LOG_FILE}"
 echo "Step 2 Log: ${MERGE_LOG_FILE}"
