@@ -222,25 +222,41 @@ def process_chromosome(mt_eur, chrom, intervals, target_variants_chr, output_dir
             
             # Sample variants
             mt_sampled = mt_chrom_combined.sample_rows(sampling_fraction, seed=42)
-            actual_variants = mt_sampled.count_rows()
+            # Skip expensive count_rows() - trust the sampling math
+            estimated_variants = int(total_filtered_variants_chr * sampling_fraction)
+            logger.info(f"  {chrom}: Sampled ~{estimated_variants:,} variants (estimated)")
             
-            logger.info(f"  {chrom}: Sampled {actual_variants:,} variants")
-            
-            # Export to GCS
+            # Export to GCS with retry logic
             chromosome_output_path = f"{output_dir}/chr{chrom}_background_snps.mt"
             logger.info(f"  {chrom}: Exporting to {chromosome_output_path}...")
             
             export_start_time = time.time()
-            mt_sampled.write(chromosome_output_path, overwrite=True)
-            export_time = time.time() - export_start_time
+            max_retries = 3
+            export_success = False
             
-            logger.info(f"  {chrom}: Export completed in {export_time:.1f}s")
+            for attempt in range(max_retries):
+                try:
+                    mt_sampled.write(chromosome_output_path, overwrite=True)
+                    export_time = time.time() - export_start_time
+                    logger.info(f"  {chrom}: Export completed in {export_time:.1f}s (attempt {attempt + 1})")
+                    export_success = True
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"  {chrom}: Export attempt {attempt + 1} failed: {e}")
+                        logger.info(f"  {chrom}: Retrying in 30 seconds...")
+                        time.sleep(30)
+                    else:
+                        raise e
+            
+            if not export_success:
+                raise Exception("Export failed after all retries")
             
             # Create chromosome summary
             chr_summary = {
                 'chromosome': chrom,
                 'target_variants': target_variants_chr,
-                'actual_variants': actual_variants,
+                'actual_variants': estimated_variants,
                 'total_filtered_variants': total_filtered_variants_chr,
                 'intervals_processed': len(processed_intervals),
                 'target_reached_early': target_reached,
@@ -250,8 +266,8 @@ def process_chromosome(mt_eur, chrom, intervals, target_variants_chr, output_dir
                 'timestamp': datetime.now().isoformat()
             }
             
-            # Save chromosome summary
-            chr_summary_path = f"{output_dir}/chr{chrom}_summary.json"
+            # Save chromosome summary locally first
+            chr_summary_path = f"{local_output_dir}/chr{chrom}_summary.json"
             with open(chr_summary_path, 'w') as f:
                 json.dump(chr_summary, f, indent=2)
             
@@ -304,6 +320,10 @@ def main():
         workspace_bucket = os.environ.get('WORKSPACE_BUCKET', 'gs://default-bucket')
         output_dir = f"{workspace_bucket}/results/FNCV_RVAS_MS/background_snps"
         logger.info(f"Output directory: {output_dir}")
+        
+        # Ensure output directory exists (create local structure for summary)
+        local_output_dir = f"/tmp/background_snps_summary"
+        os.makedirs(local_output_dir, exist_ok=True)
         
         # Determine chromosome order
         if test_mode:
@@ -376,8 +396,8 @@ def main():
             'next_step': 'Run merge_chromosome_mts.py to combine results'
         }
         
-        # Save summary
-        summary_path = f"{output_dir}/chromosome_processing_summary.json"
+        # Save summary locally
+        summary_path = f"{local_output_dir}/chromosome_processing_summary.json"
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
         

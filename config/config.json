@@ -11,11 +11,25 @@
     },
     "params": {
         "random_seed": 42,
-        "target_variants": 1000000,
+        "target_total_snps": 100000,
         "dated_exports": true,
-        "test_mode": true,
-        "test_chromosome": "chr22",
+        "test_mode": false,
         "single_session_mode": true
+    },
+    "sampling": {
+        "target_total_snps": 100000,
+        "random_seed": 42,
+        "avoid_hla": true,
+        "hla_region": {
+            "chrom": "6",
+            "start": 28510120,
+            "end": 33480577
+        }
+    },
+    "vcf_processing": {
+        "sharded_vcf_base": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/sharded/",
+        "interval_list_base": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/vcf/",
+        "total_shards": 24744
     },
     "tools": {
         "gcta": "tools/gcta64"
