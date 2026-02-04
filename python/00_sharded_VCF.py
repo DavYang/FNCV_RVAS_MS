@@ -48,12 +48,12 @@ def parse_interval_list(interval_list_path, config, logger):
             # Parse interval format: chr:start-end
             parts = line.split('\t')
             if len(parts) >= 3:
-                chrom = parts[0].replace('chr', '')
+                chrom = parts[0]  # Keep as-is (should include 'chr' prefix)
                 start = int(parts[1])
                 end = int(parts[2])
                 
                 # Skip HLA region
-                if chrom == hla_region['chrom'] and start >= hla_region['start'] and end <= hla_region['end']:
+                if chrom == f"chr{hla_region['chrom']}" and start >= hla_region['start'] and end <= hla_region['end']:
                     continue
                 
                 intervals.append({
