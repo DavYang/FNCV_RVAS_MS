@@ -27,9 +27,9 @@
         }
     },
     "vcf_processing": {
-        "sharded_vcf_base": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/sharded/",
+        "sharded_vcf_base": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/vcf/",
         "interval_list_base": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/vcf/",
-        "total_shards": 24744
+        "total_shards": 5000
     },
     "tools": {
         "gcta": "tools/gcta64"

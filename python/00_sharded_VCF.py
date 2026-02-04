@@ -76,13 +76,12 @@ def select_genome_intervals(config, logger):
     # Set random seed for reproducibility
     random.seed(config['sampling']['random_seed'])
     
-    # For simplicity, we'll sample from a subset of interval files
-    # In practice, you might want to process all interval files
     interval_list_base = config['vcf_processing']['interval_list_base']
     
     # Sample a subset of interval files to process
-    total_interval_files = 100  # Approximate number
-    n_files_to_sample = min(20, total_interval_files)  # Sample 20 files
+    # Based on the actual file structure, we have files like 0000000000.interval_list
+    total_interval_files = config['vcf_processing']['total_shards']
+    n_files_to_sample = min(100, total_interval_files)  # Sample 100 files
     
     sampled_files = random.sample(range(total_interval_files), n_files_to_sample)
     all_intervals = []
@@ -106,74 +105,31 @@ def find_shards_for_intervals(intervals, config, logger):
     sharded_vcf_base = config['vcf_processing']['sharded_vcf_base']
     total_shards = config['vcf_processing']['total_shards']
     
-    # For simplicity, we'll use a heuristic to select shards
-    # In practice, you might want to use interval mapping logic
-    # For now, we'll sample shards proportionally to interval distribution
+    # Since we're using the actual VCF files (not sharded by chromosome),
+    # we'll sample shards directly from the total pool
+    # Each shard corresponds to a VCF file like 0000000000.vcf.bgz
     
-    chrom_counts = {}
-    for interval in intervals:
-        chrom = interval['chrom']
-        chrom_counts[chrom] = chrom_counts.get(chrom, 0) + 1
+    # Calculate how many shards we need based on interval distribution
+    # Aim for ~50-100 shards to get good coverage while keeping data manageable
+    n_shards_to_sample = min(100, max(50, len(intervals) // 10))
     
-    # Calculate shards per chromosome (proportional to interval count)
-    total_intervals = sum(chrom_counts.values())
-    shards_per_chrom = {}
+    # Set random seed for reproducibility
+    random.seed(config['sampling']['random_seed'])
     
-    for chrom, count in chrom_counts.items():
-        # Approximate shards per chromosome
-        if chrom in ['1', '2', '3', '4', '5']:
-            chrom_shards = int(count / total_intervals * 2000)  # Large chromosomes
-        elif chrom in ['6', '7', '8', '9', '10', '11', '12']:
-            chrom_shards = int(count / total_intervals * 1500)  # Medium chromosomes
-        else:
-            chrom_shards = int(count / total_intervals * 1000)  # Small chromosomes
-        
-        shards_per_chrom[chrom] = max(10, min(chrom_shards, 500))  # Min 10, max 500 shards
+    # Sample shard indices from the total pool
+    sampled_shard_indices = random.sample(range(total_shards), n_shards_to_sample)
     
-    # Generate shard paths
+    # Generate VCF paths
     vcf_paths = []
-    for chrom, n_shards in shards_per_chrom.items():
-        # Sample shard indices for this chromosome
-        chrom_shard_start = get_chrom_shard_start(chrom, total_shards)
-        chrom_shard_end = get_chrom_shard_end(chrom, total_shards)
-        
-        available_shards = list(range(chrom_shard_start, chrom_shard_end))
-        selected_shards = random.sample(available_shards, min(n_shards, len(available_shards)))
-        
-        for shard_idx in selected_shards:
-            vcf_paths.append(f"{sharded_vcf_base}/{shard_idx:010d}.vcf.bgz")
+    for shard_idx in sampled_shard_indices:
+        vcf_path = f"{sharded_vcf_base}/{shard_idx:010d}.vcf.bgz"
+        vcf_paths.append(vcf_path)
     
-    # Remove duplicates
-    vcf_paths = list(set(vcf_paths))
+    logger.info(f"Selected {len(vcf_paths)} VCF shards from {total_shards} total shards")
+    logger.info(f"Shard range: {min(sampled_shard_indices):010d} to {max(sampled_shard_indices):010d}")
     
-    logger.info(f"Selected {len(vcf_paths)} VCF shards across {len(shards_per_chrom)} chromosomes")
     return vcf_paths
 
-def get_chrom_shard_start(chrom, total_shards):
-    """Get approximate starting shard for a chromosome."""
-    chrom_starts = {
-        '1': 0, '2': 1600, '3': 3200, '4': 4800, '5': 6400,
-        '6': 8000, '7': 9600, '8': 11200, '9': 12800, '10': 14400,
-        '11': 16000, '12': 17600, '13': 19200, '14': 20800, '15': 22400,
-        '16': 24000, '17': 25600, '18': 27200, '19': 28800, '20': 30400,
-        '21': 32000, '22': 33600, 'X': 35200, 'Y': 36800
-    }
-    return chrom_starts.get(chrom, 0)
-
-def get_chrom_shard_end(chrom, total_shards):
-    """Get approximate ending shard for a chromosome."""
-    chrom_starts = {
-        '1': 0, '2': 1600, '3': 3200, '4': 4800, '5': 6400,
-        '6': 8000, '7': 9600, '8': 11200, '9': 12800, '10': 14400,
-        '11': 16000, '12': 17600, '13': 19200, '14': 20800, '15': 22400,
-        '16': 24000, '17': 25600, '18': 27200, '19': 28800, '20': 30400,
-        '21': 32000, '22': 33600, 'X': 35200, 'Y': 36800
-    }
-    start = chrom_starts.get(chrom, 0)
-    if chrom in ['1', '2', '3', '4', '5']:
-        return min(start + 1600, total_shards)
-    else:
-        return min(start + 800, total_shards)
 
 def export_100k_snps(mt, output_dir, config, logger):
     """Sample exactly 100K SNPs and export as VCF."""
