@@ -81,7 +81,7 @@ def select_genome_intervals(config, logger):
     # Sample a subset of interval files to process
     # Based on the actual file structure, we have files like 0000000000.interval_list
     total_interval_files = config['vcf_processing']['total_shards']
-    n_files_to_sample = min(100, total_interval_files)  # Sample 100 files
+    n_files_to_sample = min(500, total_interval_files)  # Sample 500 files (increased from 100)
     
     sampled_files = random.sample(range(total_interval_files), n_files_to_sample)
     all_intervals = []
@@ -92,7 +92,7 @@ def select_genome_intervals(config, logger):
         all_intervals.extend(intervals)
     
     # Sample intervals from the collected set
-    n_intervals_to_sample = min(1000, len(all_intervals))  # Target 1000 intervals
+    n_intervals_to_sample = min(5000, len(all_intervals))  # Target 5000 intervals (increased from 1000)
     selected_intervals = random.sample(all_intervals, n_intervals_to_sample)
     
     logger.info(f"Selected {len(selected_intervals)} intervals across {n_files_to_sample} interval files")
@@ -132,11 +132,12 @@ def find_shards_for_intervals(intervals, config, logger):
 
 
 def export_100k_snps(mt, output_dir, config, logger):
-    """Sample exactly 100K SNPs and export as VCF."""
+    """Sample exactly 100K SNPs with iterative approach and export as VCF."""
     target_snps = config['sampling']['target_total_snps']
     random_seed = config['sampling']['random_seed']
+    max_iterations = 10  # Prevent infinite loops
     
-    logger.info(f"Sampling exactly {target_snps:,} SNPs...")
+    logger.info(f"Target: {target_snps:,} SNPs")
     
     # Count total variants first
     logger.info("Counting total variants in filtered data...")
@@ -145,26 +146,59 @@ def export_100k_snps(mt, output_dir, config, logger):
     
     if total_variants <= target_snps:
         logger.warning(f"Only {total_variants:,} variants available, less than target {target_snps:,}")
-        sampling_fraction = 1.0
+        mt_sampled = mt
+        estimated_sampled = total_variants
+        iteration = 1
     else:
-        # Calculate sampling fraction
-        sampling_fraction = target_snps / total_variants
-        logger.info(f"Sampling fraction: {sampling_fraction:.6f}")
-    
-    # Sample variants
-    logger.info("Performing variant sampling...")
-    mt_sampled = mt.sample_rows(sampling_fraction, seed=random_seed)
-    
-    # Estimate sampled variants (skip expensive count)
-    estimated_sampled = int(total_variants * sampling_fraction)
-    logger.info(f"Estimated sampled variants: {estimated_sampled:,}")
+        # Iterative sampling approach
+        mt_sampled = None
+        estimated_sampled = 0
+        iteration = 0
+        
+        while estimated_sampled < target_snps and iteration < max_iterations:
+            iteration += 1
+            logger.info(f"Sampling iteration {iteration}/{max_iterations}")
+            
+            # Calculate sampling fraction for this iteration
+            remaining_needed = target_snps - estimated_sampled
+            remaining_variants = total_variants - estimated_sampled
+            
+            if remaining_variants <= 0:
+                break
+                
+            # Sample a bit more than needed to account for sampling variance
+            sampling_fraction = min(1.0, (remaining_needed * 1.1) / remaining_variants)
+            logger.info(f"Sampling fraction: {sampling_fraction:.6f}")
+            
+            # Sample variants
+            logger.info("Performing variant sampling...")
+            mt_current = mt.sample_rows(sampling_fraction, seed=random_seed + iteration)
+            
+            # If first iteration, use as base
+            if mt_sampled is None:
+                mt_sampled = mt_current
+            else:
+                # Union with previously sampled variants
+                mt_sampled = mt_sampled.union_rows(mt_current)
+            
+            # Update counts
+            estimated_sampled = mt_sampled.count_rows()
+            logger.info(f"Total sampled variants so far: {estimated_sampled:,}")
+            
+            if estimated_sampled >= target_snps:
+                logger.info(f"Target reached! {estimated_sampled:,} variants sampled")
+                break
+        
+        if estimated_sampled < target_snps:
+            logger.warning(f"Could not reach target after {max_iterations} iterations. Final count: {estimated_sampled:,}")
     
     # Export as compressed VCF
     output_vcf = f"{output_dir}/100k_background_snps.vcf.bgz"
     logger.info(f"Exporting to compressed VCF: {output_vcf}")
     
     export_start = time.time()
-    mt_sampled.export_vcf(
+    hl.export_vcf(
+        mt_sampled,
         output_vcf,
         parallel='header_per_shard',
         include_star=False,
@@ -178,8 +212,8 @@ def export_100k_snps(mt, output_dir, config, logger):
     summary = {
         'target_snps': target_snps,
         'total_variants_before_sampling': total_variants,
-        'sampling_fraction': sampling_fraction,
-        'estimated_sampled_variants': estimated_sampled,
+        'final_sampled_variants': estimated_sampled,
+        'iterations_used': iteration,
         'export_path': output_vcf,
         'export_time_seconds': export_time,
         'timestamp': datetime.now().isoformat()
