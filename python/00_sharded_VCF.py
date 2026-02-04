@@ -69,34 +69,119 @@ def parse_interval_list(interval_list_path, config, logger):
         logger.error(f"Failed to parse interval list {interval_list_path}: {e}")
         return []
 
-def select_genome_intervals(config, logger):
-    """Select random intervals across the genome."""
-    logger.info("Selecting genome-wide intervals...")
+def sample_intervals_iteratively(config, logger):
+    """Sample intervals iteratively until target variant count is reached."""
+    target_variants = config['sampling']['target_total_snps']
+    intervals_per_iteration = 1000  # Start with 1000 intervals
+    max_iterations = 10
     
     # Set random seed for reproducibility
     random.seed(config['sampling']['random_seed'])
     
     interval_list_base = config['vcf_processing']['interval_list_base']
-    
-    # Sample a subset of interval files to process
-    # Based on the actual file structure, we have files like 0000000000.interval_list
     total_interval_files = config['vcf_processing']['total_shards']
-    n_files_to_sample = min(500, total_interval_files)  # Sample 500 files (increased from 100)
     
-    sampled_files = random.sample(range(total_interval_files), n_files_to_sample)
+    # Track all collected intervals and VCF paths
     all_intervals = []
+    all_vcf_paths = []
+    processed_files = set()  # Avoid reprocessing same files
     
-    for file_idx in sampled_files:
+    iteration = 0
+    current_variants = 0
+    
+    while current_variants < target_variants and iteration < max_iterations:
+        iteration += 1
+        logger.info(f"\n=== Interval Sampling Iteration {iteration}/{max_iterations} ===")
+        logger.info(f"Current variants: {current_variants:,}, Target: {target_variants:,}")
+        
+        # Sample new intervals
+        new_intervals = _sample_new_intervals(
+            interval_list_base, total_interval_files, intervals_per_iteration, 
+            processed_files, config, logger
+        )
+        
+        if not new_intervals:
+            logger.warning("No more intervals available to sample")
+            break
+            
+        all_intervals.extend(new_intervals)
+        logger.info(f"Added {len(new_intervals)} intervals (total: {len(all_intervals)})")
+        
+        # Find VCF shards for new intervals
+        new_vcf_paths = find_shards_for_intervals(new_intervals, config, logger)
+        all_vcf_paths.extend(new_vcf_paths)
+        logger.info(f"Added {len(new_vcf_paths)} VCF shards (total: {len(all_vcf_paths)})")
+        
+        # Import all VCFs and count variants
+        logger.info("Importing and filtering VCFs...")
+        mt = _import_and_filter_vcfs(all_vcf_paths, config, logger)
+        current_variants = mt.count_rows()
+        logger.info(f"Total variants after filtering: {current_variants:,}")
+        
+        # Adjust next iteration size based on variant density
+        if iteration == 1:
+            variants_per_interval = current_variants / len(all_intervals)
+            estimated_needed = (target_variants - current_variants) / variants_per_interval
+            intervals_per_iteration = min(5000, max(500, int(estimated_needed * 1.2)))  # 20% buffer
+            logger.info(f"Adjusted intervals per iteration to {intervals_per_iteration} based on variant density")
+        
+        if current_variants >= target_variants:
+            logger.info(f"Target reached! {current_variants:,} variants collected")
+            break
+    
+    if current_variants < target_variants:
+        logger.warning(f"Could not reach target after {max_iterations} iterations. Final: {current_variants:,} variants")
+    
+    return all_vcf_paths, mt
+
+def _sample_new_intervals(interval_list_base, total_files, target_count, processed_files, config, logger):
+    """Sample new intervals from unprocessed files."""
+    # Get unprocessed files
+    available_files = [f for f in range(total_files) if f not in processed_files]
+    random.shuffle(available_files)
+    
+    new_intervals = []
+    
+    for file_idx in available_files:
+        if len(new_intervals) >= target_count:
+            break
+            
         interval_list_path = f"{interval_list_base}/{file_idx:010d}.interval_list"
         intervals = parse_interval_list(interval_list_path, config, logger)
-        all_intervals.extend(intervals)
+        
+        # Take intervals from this file
+        remaining_needed = target_count - len(new_intervals)
+        if len(intervals) <= remaining_needed:
+            new_intervals.extend(intervals)
+        else:
+            sampled_from_file = random.sample(intervals, remaining_needed)
+            new_intervals.extend(sampled_from_file)
+        
+        processed_files.add(file_idx)
     
-    # Sample intervals from the collected set
-    n_intervals_to_sample = min(5000, len(all_intervals))  # Target 5000 intervals (increased from 1000)
-    selected_intervals = random.sample(all_intervals, n_intervals_to_sample)
+    return new_intervals
+
+def _import_and_filter_vcfs(vcf_paths, config, logger):
+    """Import VCFs and apply standard filters."""
+    # Import VCFs
+    mt = hl.import_vcf(
+        vcf_paths,
+        reference_genome='GRCh38',
+        force_bgz=True,
+        array_elements_required=False
+    )
     
-    logger.info(f"Selected {len(selected_intervals)} intervals across {n_files_to_sample} interval files")
-    return selected_intervals
+    # Load EUR samples (cached if possible)
+    if not hasattr(_import_and_filter_vcfs, 'eur_samples'):
+        _import_and_filter_vcfs.eur_samples = load_ancestry_data(config, logger)
+    
+    # Filter to EUR samples
+    mt = mt.filter_cols(hl.literal(_import_and_filter_vcfs.eur_samples).contains(mt.s))
+    
+    # Split multi-allelic variants
+    mt = hl.split_multi_hts(mt)
+    
+    return mt
 
 def find_shards_for_intervals(intervals, config, logger):
     """Find VCF shards that contain the selected intervals."""
@@ -257,46 +342,10 @@ def main():
     logger.info(f"Output Directory: {output_dir}")
     
     try:
-        # Step 1: Load EUR sample IDs
-        eur_samples = load_ancestry_data(config, logger)
+        # Step 1: Use variant-driven interval sampling
+        vcf_paths, mt = sample_intervals_iteratively(config, logger)
         
-        # Step 2: Select genome-wide intervals
-        selected_intervals = select_genome_intervals(config, logger)
-        
-        # Step 3: Find VCF shards for selected intervals
-        vcf_paths = find_shards_for_intervals(selected_intervals, config, logger)
-        
-        # Step 4: Import VCFs with EUR sample filtering
-        logger.info(f"Importing {len(vcf_paths)} VCF shards...")
-        mt = hl.import_vcf(
-            vcf_paths,
-            reference_genome='GRCh38',
-            force_bgz=True,
-            array_elements_required=False
-        )
-        
-        # Filter to EUR samples during import
-        logger.info("Filtering to EUR samples...")
-        mt = mt.filter_cols(hl.literal(eur_samples).contains(mt.s))
-        
-        # Step 5: Split multi-allelic variants
-        logger.info("Splitting multi-allelic variants...")
-        mt = hl.split_multi_hts(mt)
-        
-        # Step 6: Filter to selected intervals
-        logger.info("Filtering to selected genomic intervals...")
-        interval_literals = [hl.locus_interval(
-            interval['chrom'], 
-            interval['start'], 
-            interval['end'], 
-            reference_genome='GRCh38'
-        ) for interval in selected_intervals]
-        
-        mt = mt.filter_rows(
-            hl.any([interval_literals[i].contains(mt.locus) for i in range(len(interval_literals))])
-        )
-        
-        # Step 7: Repartition for efficiency
+        # Step 2: Repartition for efficient processing
         logger.info("Repartitioning to 200 partitions...")
         mt = mt.naive_coalesce(200)
         
