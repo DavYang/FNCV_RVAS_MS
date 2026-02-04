@@ -286,7 +286,6 @@ def export_100k_snps(mt, output_dir, config, logger):
         mt_sampled,
         output_vcf,
         parallel='header_per_shard',
-        include_star=False,
         tabix=True
     )
     export_time = time.time() - export_start
