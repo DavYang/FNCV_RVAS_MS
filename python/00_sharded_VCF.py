@@ -278,7 +278,8 @@ def export_100k_snps(mt, output_dir, config, logger):
             logger.warning(f"Could not reach target after {max_iterations} iterations. Final count: {estimated_sampled:,}")
     
     # Export as compressed VCF
-    output_vcf = f"{output_dir}/100k_background_snps.vcf.bgz"
+    target_snps_k = target_snps // 1000  # Convert to thousands for filename
+    output_vcf = f"{output_dir}/{target_snps_k}k_background_snps.vcf.bgz"
     logger.info(f"Exporting to compressed VCF: {output_vcf}")
     
     export_start = time.time()
@@ -303,8 +304,8 @@ def export_100k_snps(mt, output_dir, config, logger):
         'timestamp': datetime.now().isoformat()
     }
     
-    summary_path = f"{output_dir}/100k_sampling_summary.json"
-    with open(summary_path, 'w') as f:
+    summary_path = f"{output_dir}/{target_snps_k}k_sampling_summary.json"
+    with hl.hadoop_open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     
     logger.info(f"Sampling summary saved to: {summary_path}")
@@ -337,7 +338,8 @@ def main():
     logger.info(f"Detected AoU Workspace Bucket: {base_data_dir}")
     
     # Create output directory
-    output_dir = f"{base_data_dir}/results/FNCV_RVAS_MS/100k_background_snps_{timestamp}"
+    target_snps_k = config['sampling']['target_total_snps'] // 1000
+    output_dir = f"{base_data_dir}/results/FNCV_RVAS_MS/{target_snps_k}k_background_snps_{timestamp}"
     logger.info(f"Output Directory: {output_dir}")
     
     try:
