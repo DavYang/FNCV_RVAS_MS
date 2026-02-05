@@ -18,7 +18,7 @@ mkdir -p "$LOCAL_OUTPUT_DIR"
 
 # Generate a timestamp for the log file and export
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="${LOG_DIR}/100k_snp_sampling_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/snp_sampling_${TIMESTAMP}.log"
 
 echo "Date: ${TIMESTAMP}"
 echo "Script: ${PYTHON_DIR}/${SCRIPT_NAME}.py"

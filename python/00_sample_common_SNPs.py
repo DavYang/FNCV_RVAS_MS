@@ -277,6 +277,10 @@ def export_100k_snps(mt, output_dir, config, logger):
             logger.warning(f"Could not reach target after {max_iterations} iterations. Final count: {estimated_sampled:,}")
     
     # Export as compressed VCF
+    # Force single partition for single VCF output
+    logger.info("Coalescing to single partition for VCF export...")
+    mt_sampled = mt_sampled.naive_coalesce(1)
+    
     output_vcf = f"{output_dir}/100k_background_snps.vcf.bgz"
     logger.info(f"Exporting to compressed VCF: {output_vcf}")
     
@@ -303,6 +307,14 @@ def export_100k_snps(mt, output_dir, config, logger):
     }
     
     summary_path = f"{output_dir}/100k_sampling_summary.json"
+    
+    # Create output directory if it doesn't exist
+    try:
+        hl.hadoop_mkdir(output_dir)
+        logger.info(f"Created output directory: {output_dir}")
+    except Exception as e:
+        logger.debug(f"Directory may already exist or creation failed: {e}")
+    
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     
