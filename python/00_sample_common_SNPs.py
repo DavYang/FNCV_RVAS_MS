@@ -277,9 +277,10 @@ def export_100k_snps(mt, output_dir, config, logger):
             logger.warning(f"Could not reach target after {max_iterations} iterations. Final count: {estimated_sampled:,}")
     
     # Export as compressed VCF
-    # Force single partition for single VCF output
-    logger.info("Coalescing to single partition for VCF export...")
-    mt_sampled = mt_sampled.naive_coalesce(1)
+    # Smart partitioning based on variant count
+    optimal_partitions = max(10, min(100, estimated_sampled // 1000))  # 1000 variants per partition
+    logger.info(f"Coalescing to {optimal_partitions} partitions for VCF export...")
+    mt_sampled = mt_sampled.naive_coalesce(optimal_partitions)
     
     output_vcf = f"{output_dir}/100k_background_snps.vcf.bgz"
     logger.info(f"Exporting to compressed VCF: {output_vcf}")
@@ -292,6 +293,64 @@ def export_100k_snps(mt, output_dir, config, logger):
         tabix=True
     )
     export_time = time.time() - export_start
+    
+    # Post-process to create single VCF if needed
+    if optimal_partitions > 1:
+        logger.info("Multiple partitions detected, copying shards locally for consolidation...")
+        
+        # Create local temp directory
+        import tempfile
+        import os
+        local_temp_dir = tempfile.mkdtemp(prefix="vcf_parts_")
+        logger.info(f"Created temp directory: {local_temp_dir}")
+        
+        # Copy all part files locally
+        import subprocess
+        try:
+            # List part files in GS
+            list_cmd = ["gsutil", "ls", f"{output_vcf}/part-*.bgz"]
+            result = subprocess.run(list_cmd, capture_output=True, text=True, check=True)
+            part_files = result.stdout.strip().split('\n')
+            
+            logger.info(f"Found {len(part_files)} part files to copy")
+            
+            # Copy each part file locally
+            for gs_file in part_files:
+                if gs_file.strip():
+                    filename = os.path.basename(gs_file)
+                    local_file = os.path.join(local_temp_dir, filename)
+                    copy_cmd = ["gsutil", "cp", gs_file, local_file]
+                    subprocess.run(copy_cmd, check=True)
+                    logger.debug(f"Copied {filename} locally")
+            
+            # Consolidate locally
+            logger.info("Consolidating VCF parts locally...")
+            consolidated_vcf = f"{output_dir}/100k_background_snps_consolidated.vcf.bgz"
+            
+            concat_cmd = [
+                "bcftools", "concat", 
+                "-Oz", "-o", consolidated_vcf,
+                f"{local_temp_dir}/part-*.bgz"
+            ]
+            subprocess.run(concat_cmd, check=True)
+            
+            # Create index
+            subprocess.run(["tabix", "-p", "vcf", consolidated_vcf], check=True)
+            
+            logger.info(f"Consolidated VCF created: {consolidated_vcf}")
+            summary['export_path'] = consolidated_vcf
+            
+            # Clean up temp directory
+            import shutil
+            shutil.rmtree(local_temp_dir)
+            logger.info("Cleaned up temporary files")
+            
+        except (subprocess.CalledProcessError, Exception) as e:
+            logger.warning(f"Could not consolidate VCF: {e}")
+            logger.info("Keeping multi-part VCF structure")
+            # Clean up temp directory on error
+            if 'local_temp_dir' in locals() and os.path.exists(local_temp_dir):
+                shutil.rmtree(local_temp_dir)
     
     logger.info(f"VCF export completed in {export_time:.1f} seconds")
     
