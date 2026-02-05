@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from utils import load_config, init_hail, setup_logger
 
-logger = setup_logger("100k_snp_sampling")
+logger = setup_logger("SNP_sampling")
 
 def load_ancestry_data(config, logger):
     """Load ancestry predictions and filter to European ancestry samples."""
