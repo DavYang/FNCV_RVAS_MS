@@ -2,7 +2,7 @@
 set -e
 
 # --- Configuration ---
-SCRIPT_NAME="00_sharded_VCF"
+SCRIPT_NAME="00_sample_common_SNPs"
 BASE_DIR=$(pwd)
 PYTHON_DIR="${BASE_DIR}/python"
 LOG_DIR="${BASE_DIR}/logs"

@@ -17,7 +17,7 @@
         "single_session_mode": true
     },
     "sampling": {
-        "target_total_snps": 500000,
+        "target_total_snps": 100000,
         "random_seed": 42,
         "avoid_hla": true,
         "hla_region": {
