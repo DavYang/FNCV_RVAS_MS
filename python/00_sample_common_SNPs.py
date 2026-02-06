@@ -215,7 +215,7 @@ def find_shards_for_intervals(intervals, config, logger):
     return vcf_paths
 
 
-def export_100k_snps(mt, output_dir, config, logger, base_dir):
+def export_snps(mt, output_dir, config, logger, base_dir):
     """Sample exactly target SNPs with iterative approach and export as VCF."""
     target_snps = config['sampling']['target_total_snps']
     random_seed = config['sampling']['random_seed']
@@ -404,7 +404,10 @@ def main():
     config = load_config("config/config.json")
     
     # Initialize Hail with optimized settings
-    init_hail("100k_snp_sampling", driver_mem="32g", reference="GRCh38")
+    init_hail("snp_sampling", driver_mem="32g", reference="GRCh38")
+    
+    # Get base directory
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     
     # Get timestamp for output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -450,10 +453,10 @@ def main():
         
         logger.info(f"Filtered data - Rows: {mt.count_rows():,}, Cols: {mt.count_cols():,}")
         
-        # Step 8: Sample exactly 100K SNPs and export
-        summary = export_100k_snps(mt, output_dir, config, logger, BASE_DIR)
+        # Step 8: Sample exactly target SNPs and export
+        summary = export_snps(mt, output_dir, config, logger, base_dir)
         
-        logger.info("100K SNP sampling completed successfully!")
+        logger.info("SNP sampling completed successfully!")
         logger.info(f"Results saved to: {output_dir}")
         logger.info(f"VCF file: {summary['export_path']}")
         
