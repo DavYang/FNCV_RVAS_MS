@@ -94,7 +94,7 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
         
         # Sample one file
         file_idx = available_files[0]
-        interval_list_path = f"{interval_list_base}/{file_idx:010d}.interval_list"
+        interval_list_path = f"{interval_list_base.rstrip('/')}/{file_idx:010d}.interval_list"
         logger.info(f"{chrom}: Checking file {file_idx}: {interval_list_path}")
         
         # Parse intervals and stop early when we find a matching chromosome interval
