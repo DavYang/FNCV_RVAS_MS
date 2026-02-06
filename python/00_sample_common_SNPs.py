@@ -669,7 +669,12 @@ def main():
         if test_mode and test_chromosome:
             logger.info(f"=== TEST MODE: Processing only {test_chromosome} ===")
             # Test mode: process single chromosome with proportional target
-            chr_targets = {test_chromosome: int(target_snps * chr_sizes[test_chromosome] / sum(chr_sizes.values()))}
+            chr_targets = calculate_chromosome_targets(target_snps, logger)
+            test_chr_target = chr_targets.get(test_chromosome, 0)
+            if test_chr_target == 0:
+                logger.error(f"Test chromosome {test_chromosome} not found in targets!")
+                sys.exit(1)
+            chr_targets = {test_chromosome: test_chr_target}
             logger.info(f"Target for {test_chromosome}: {chr_targets[test_chromosome]} SNPs (based on chromosome size)")
             
             # Process single chromosome
