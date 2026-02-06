@@ -270,13 +270,16 @@ def parse_interval_list_and_sample(interval_list_path, target_chrom, config, log
         for line in lines:
             total_lines += 1
             line = line.strip()
+            
+            # Skip header lines (SAM/BAM format starts with @)
             if line.startswith('@') or not line:
                 continue
             
-            # Parse interval format: chr:start-end
-            parts = line.split('\t')
+            # Parse interval format: chr    start    end    strand    .
+            # Handle both tab and space separation
+            parts = line.split()
             if len(parts) >= 3:
-                chrom = parts[0]  # Keep as-is (should include 'chr' prefix)
+                chrom = parts[0]  # Should be chr1, chr2, etc.
                 start = int(parts[1])
                 end = int(parts[2])
                 
@@ -321,13 +324,16 @@ def parse_interval_list(interval_list_path, config, logger):
         
         for line in lines:
             line = line.strip()
+            
+            # Skip header lines (SAM/BAM format starts with @)
             if line.startswith('@') or not line:
                 continue
             
-            # Parse interval format: chr:start-end
-            parts = line.split('\t')
+            # Parse interval format: chr    start    end    strand    .
+            # Handle both tab and space separation
+            parts = line.split()
             if len(parts) >= 3:
-                chrom = parts[0]  # Keep as-is (should include 'chr' prefix)
+                chrom = parts[0]  # Should be chr1, chr2, etc.
                 start = int(parts[1])
                 end = int(parts[2])
                 
