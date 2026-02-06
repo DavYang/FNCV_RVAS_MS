@@ -72,6 +72,10 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
     logger.info(f"{chrom}: Interval list base: {interval_list_base}")
     logger.info(f"{chrom}: Total interval files: {total_interval_files}")
     
+    # Check for test mode with specific interval file
+    test_mode = config['params'].get('test_mode', False)
+    test_interval_file = config['params'].get('test_interval_file', None)
+    
     # Get intervals for this chromosome
     all_intervals = []
     processed_files = set()
@@ -81,21 +85,11 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
     intervals_sampled = 0
     max_intervals = 100  # Safety limit
     
-    while current_variants < target_snps and intervals_sampled < max_intervals:
-        logger.info(f"{chrom}: Iteration {intervals_sampled + 1}/{max_intervals} - Current variants: {current_variants}/{target_snps}")
-        
-        # Sample one interval for this chromosome
-        available_files = [f for f in range(total_interval_files) if f not in processed_files]
-        random.shuffle(available_files)
-        
-        if not available_files:
-            logger.warning(f"No more interval files available for {chrom}")
-            break
-        
-        # Sample one file
-        file_idx = available_files[0]
-        interval_list_path = f"{interval_list_base.rstrip('/')}/{file_idx:010d}.interval_list"
-        logger.info(f"{chrom}: Checking file {file_idx}: {interval_list_path}")
+    if test_mode and test_interval_file:
+        # Test mode: Use specific interval file
+        logger.info(f"{chrom}: TEST MODE - Using specific interval file: {test_interval_file}")
+        interval_list_path = f"{interval_list_base.rstrip('/')}/{test_interval_file}.interval_list"
+        logger.info(f"{chrom}: Checking test file: {interval_list_path}")
         
         # Parse intervals and stop early when we find a matching chromosome interval
         sampled_interval = parse_interval_list_and_sample(interval_list_path, chrom, config, logger)
@@ -103,22 +97,60 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
         if sampled_interval:
             all_intervals.append(sampled_interval)
             intervals_sampled += 1
-            logger.info(f"{chrom:} Found interval {intervals_sampled}: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
+            logger.info(f"{chrom}: Found test interval {intervals_sampled}: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
             
             # Import VCF for this interval and count variants
             vcf_paths = find_shards_for_intervals([sampled_interval], config, logger)
             if vcf_paths:
-                logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled}...")
+                logger.info(f"{chrom}: Importing VCF for test interval...")
                 mt = _import_and_filter_vcfs(vcf_paths, config, logger)
                 interval_variants = mt.count_rows()
                 current_variants += interval_variants
-                logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
+                logger.info(f"{chrom}: Test interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
             else:
-                logger.warning(f"{chrom}: No VCF paths found for interval {intervals_sampled}")
+                logger.warning(f"{chrom}: No VCF paths found for test interval {intervals_sampled}")
         else:
-            logger.info(f"{chrom}: No {chrom} intervals found in file {file_idx}")
-        
-        processed_files.add(file_idx)
+            logger.error(f"{chrom}: Test file {test_interval_file} has no {chrom} intervals!")
+    else:
+        # Normal mode: Sample random interval files
+        while current_variants < target_snps and intervals_sampled < max_intervals:
+            logger.info(f"{chrom}: Iteration {intervals_sampled + 1}/{max_intervals} - Current variants: {current_variants}/{target_snps}")
+            
+            # Sample one interval for this chromosome
+            available_files = [f for f in range(total_interval_files) if f not in processed_files]
+            random.shuffle(available_files)
+            
+            if not available_files:
+                logger.warning(f"No more interval files available for {chrom}")
+                break
+            
+            # Sample one file
+            file_idx = available_files[0]
+            interval_list_path = f"{interval_list_base.rstrip('/')}/{file_idx:010d}.interval_list"
+            logger.info(f"{chrom}: Checking file {file_idx}: {interval_list_path}")
+            
+            # Parse intervals and stop early when we find a matching chromosome interval
+            sampled_interval = parse_interval_list_and_sample(interval_list_path, chrom, config, logger)
+            
+            if sampled_interval:
+                all_intervals.append(sampled_interval)
+                intervals_sampled += 1
+                logger.info(f"{chrom}: Found interval {intervals_sampled}: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
+                
+                # Import VCF for this interval and count variants
+                vcf_paths = find_shards_for_intervals([sampled_interval], config, logger)
+                if vcf_paths:
+                    logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled}...")
+                    mt = _import_and_filter_vcfs(vcf_paths, config, logger)
+                    interval_variants = mt.count_rows()
+                    current_variants += interval_variants
+                    logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
+                else:
+                    logger.warning(f"{chrom}: No VCF paths found for interval {intervals_sampled}")
+            else:
+                logger.info(f"{chrom}: No {chrom} intervals found in file {file_idx}")
+            
+            processed_files.add(file_idx)
     
     logger.info(f"{chrom}: Sampled {len(all_intervals)} intervals, collected {current_variants} variants")
     return all_intervals, current_variants

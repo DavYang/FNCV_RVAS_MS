@@ -14,6 +14,7 @@
         "dated_exports": true,
         "test_mode": true,
         "test_chromosome": "chr21",
+        "test_interval_file": "0000021371",
         "single_session_mode": true
     },
     "sampling": {
