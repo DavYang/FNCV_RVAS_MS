@@ -2,7 +2,6 @@ import os
 import sys
 import random
 import hail as hl
-import pandas as pd
 import json
 import time
 from datetime import datetime
@@ -10,17 +9,27 @@ from utils import load_config, init_hail, setup_logger
 
 logger = setup_logger("SNP_sampling")
 
-# Global cache for EUR samples
+# Global cache for EUR sample IDs and Hail Set
 eur_samples_cache = None
+eur_samples_set_cache = None
 
 def get_eur_samples(config, logger):
-    """Load EUR samples with caching to avoid repeated loading."""
+    """Load EUR sample IDs with caching to avoid repeated loading."""
     global eur_samples_cache
     if eur_samples_cache is None:
         logger.info("Loading EUR ancestry samples (first time only)...")
         eur_samples_cache = load_ancestry_data(config, logger)
         logger.info(f"Cached {len(eur_samples_cache)} EUR samples for reuse")
     return eur_samples_cache
+
+def get_eur_samples_set(config, logger):
+    """Get EUR samples as a Hail Set for efficient filtering."""
+    global eur_samples_set_cache
+    if eur_samples_set_cache is None:
+        eur_ids = get_eur_samples(config, logger)
+        eur_samples_set_cache = hl.literal(set(eur_ids))
+        logger.info("Created Hail Set for EUR sample filtering")
+    return eur_samples_set_cache
 
 def calculate_chromosome_targets(target_snps, logger):
     """Calculate proportional SNP targets per chromosome based on GRCh38 sizes."""
@@ -62,233 +71,131 @@ def calculate_chromosome_targets(target_snps, logger):
     return chr_targets
 
 def sample_chromosome_intervals(chrom, target_snps, config, logger):
-    """Sample intervals for a specific chromosome until target SNP count is reached."""
+    """Sample shard files for a specific chromosome.
+    
+    Returns a list of shard numbers that contain intervals for this chromosome.
+    Does NOT import VCFs - that is done once in process_chromosome.
+    """
     random.seed(config['sampling']['random_seed'])
     
     interval_list_base = config['vcf_processing']['interval_list_base']
-    vcf_base = config['vcf_processing']['sharded_vcf_base']
     total_interval_files = config['vcf_processing']['total_shards']
     
-    logger.info(f"{chrom}: Starting interval sampling (target: {target_snps} variants)")
-    logger.info(f"{chrom}: Interval list base: {interval_list_base}")
-    logger.info(f"{chrom}: VCF base: {vcf_base}")
-    logger.info(f"{chrom}: Total interval files: {total_interval_files}")
+    logger.info(f"{chrom}: Starting interval/shard discovery (target: {target_snps} variants)")
     
     # Check for test mode with specific interval file
     test_mode = config['params'].get('test_mode', False)
     test_interval_file = config['params'].get('test_interval_file', None)
     
     if test_mode and test_interval_file:
-        logger.info(f"{chrom}: TEST MODE - Using specific interval file: {test_interval_file}")
-        
-        # Extract shard number from test interval file
         shard_num = int(test_interval_file.split('.')[0])
-        interval_list_path = f"{interval_list_base.rstrip('/')}/{test_interval_file}"
-        vcf_path = f"{vcf_base.rstrip('/')}/{shard_num:010d}.vcf.bgz"
+        logger.info(f"{chrom}: TEST MODE - Using specific shard: {shard_num:010d}")
+        return [shard_num]
+    
+    # Production mode: find shards that contain this chromosome
+    matched_shards = []
+    processed_files = set()
+    max_shards = 50  # Safety limit per chromosome
+    
+    # Shuffle shard indices for random sampling
+    all_shard_indices = list(range(total_interval_files))
+    random.shuffle(all_shard_indices)
+    
+    for file_idx in all_shard_indices:
+        if len(matched_shards) >= max_shards:
+            break
         
-        logger.info(f"{chrom}: Using shard {shard_num:010d} - VCF: {vcf_path}")
+        interval_list_path = f"{interval_list_base.rstrip('/')}/{file_idx:010d}.interval_list"
         
-        # Parse the specific test file and collect all chr21 intervals
-        all_intervals = []
-        target_intervals = []
-        hla_region = config['sampling']['hla_region']
-        
+        # Quick check: read first data line to determine file chromosome
         try:
             with hl.hadoop_open(interval_list_path, 'r') as f:
-                lines = f.readlines()
-            
-            for line in lines:
-                line = line.strip()
-                
-                # Skip header lines
-                if line.startswith('@') or not line:
-                    continue
-                
-                # Parse interval format
-                parts = line.split()
-                if len(parts) >= 3:
-                    interval_chrom = parts[0]
-                    start = int(parts[1])
-                    end = int(parts[2])
-                    
-                    # Skip HLA region
-                    if interval_chrom == f"chr{hla_region['chrom']}" and start >= hla_region['start'] and end <= hla_region['end']:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('@') or not line:
                         continue
-                    
-                    # Only collect intervals for target chromosome
-                    if interval_chrom == chrom:
-                        target_intervals.append({
-                            'chrom': interval_chrom,
-                            'start': start,
-                            'end': end
-                        })
-            
-            logger.info(f"{chrom}: Found {len(target_intervals)} intervals in test file")
-            
-            # Sample intervals from the test file until we have enough variants
-            current_variants = 0
-            intervals_sampled = 0
-            max_intervals = min(100, len(target_intervals))  # Don't exceed available intervals
-            
-            while current_variants < target_snps and intervals_sampled < max_intervals and target_intervals:
-                # Take one random interval from remaining intervals
-                sampled_interval = random.choice(target_intervals)
-                all_intervals.append(sampled_interval)
-                intervals_sampled += 1
-                target_intervals.remove(sampled_interval)  # Remove to avoid duplicates
-                
-                logger.info(f"{chrom}: Sampled interval {intervals_sampled}: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
-                
-                # Import VCF directly using shard mapping (no search needed!)
-                logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled} from shard {shard_num:010d}...")
-                mt = _import_and_filter_vcfs([vcf_path], config, logger)
-                interval_variants = mt.count_rows()
-                current_variants += interval_variants
-                logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
-            
-            logger.info(f"{chrom}: Sampled {len(all_intervals)} intervals, collected {current_variants} variants")
-            return all_intervals, current_variants
-            
+                    # First data line determines file chromosome
+                    parts = line.split()
+                    if len(parts) >= 1 and parts[0] == chrom:
+                        matched_shards.append(file_idx)
+                        logger.info(f"{chrom}: Found matching shard {file_idx:010d} ({len(matched_shards)}/{max_shards})")
+                    break  # Only need to check first data line
         except Exception as e:
-            logger.error(f"{chrom}: Failed to process test interval file: {e}")
-            return [], 0
+            logger.debug(f"{chrom}: Error reading shard {file_idx:010d}: {e}")
+            continue
     
-    # Original logic for production mode with optimized shard mapping
-    # Get intervals for this chromosome
-    all_intervals = []
-    processed_files = set()
-    
-    # Sample intervals until we have enough variants
-    current_variants = 0
-    intervals_sampled = 0
-    max_intervals = 100  # Safety limit
-    
-    while current_variants < target_snps and intervals_sampled < max_intervals:
-        logger.info(f"{chrom}: Iteration {intervals_sampled + 1}/{max_intervals} - Current variants: {current_variants}/{target_snps}")
-        
-        # Sample one interval for this chromosome
-        available_files = [f for f in range(total_interval_files) if f not in processed_files]
-        random.shuffle(available_files)
-        
-        if not available_files:
-            logger.warning(f"No more interval files available for {chrom}")
-            break
-        
-        # Sample one file
-        file_idx = available_files[0]
-        interval_list_path = f"{interval_list_base.rstrip('/')}/{file_idx:010d}.interval_list"
-        vcf_path = f"{vcf_base.rstrip('/')}/{file_idx:010d}.vcf.bgz"
-        logger.info(f"{chrom}: Checking shard {file_idx:010d}: {interval_list_path}")
-        
-        # Parse intervals and stop early when we find a matching chromosome interval
-        sampled_interval = parse_interval_list_and_sample(interval_list_path, chrom, config, logger)
-        
-        if sampled_interval:
-            all_intervals.append(sampled_interval)
-            intervals_sampled += 1
-            logger.info(f"{chrom:} Found interval {intervals_sampled}: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
-            
-            # Import VCF directly using shard mapping (no search needed!)
-            logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled} from shard {file_idx:010d}...")
-            mt = _import_and_filter_vcfs([vcf_path], config, logger)
-            interval_variants = mt.count_rows()
-            current_variants += interval_variants
-            logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
-        else:
-            logger.info(f"{chrom}: No {chrom} intervals found in shard {file_idx:010d}")
-        
-        processed_files.add(file_idx)
-    
-    logger.info(f"{chrom}: Sampled {len(all_intervals)} intervals, collected {current_variants} variants")
-    return all_intervals, current_variants
+    logger.info(f"{chrom}: Found {len(matched_shards)} shards containing {chrom} intervals")
+    return matched_shards
 
 def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir):
-    """Process a single chromosome: sample intervals, filter, sample SNPs, and export."""
+    """Process a single chromosome: find shards, import VCF, sample SNPs, export."""
     logger.info(f"\n=== Processing {chrom} (target: {target_snps} SNPs) ===")
     
-    # Step 1: Sample intervals for this chromosome
-    intervals, available_variants = sample_chromosome_intervals(chrom, target_snps, config, logger)
+    # Step 1: Find shards containing this chromosome
+    shard_numbers = sample_chromosome_intervals(chrom, target_snps, config, logger)
     
-    if available_variants == 0:
-        logger.warning(f"No variants found for {chrom}")
+    if not shard_numbers:
+        logger.warning(f"No shards found for {chrom}")
         return None
     
-    # Step 2: Import all VCFs for this chromosome
-    logger.info(f"{chrom}: Importing VCFs for {len(intervals)} intervals...")
-    vcf_paths = find_shards_for_intervals(intervals, config, logger)
+    # Step 2: Build VCF paths from shard numbers (direct 1:1 mapping)
+    vcf_base = config['vcf_processing']['sharded_vcf_base'].rstrip('/')
+    vcf_paths = [f"{vcf_base}/{shard:010d}.vcf.bgz" for shard in shard_numbers]
+    logger.info(f"{chrom}: Importing {len(vcf_paths)} VCF shard(s)...")
+    for vp in vcf_paths:
+        logger.info(f"{chrom}:   {vp}")
+    
+    # Step 3: Import VCFs once, filter to EUR, filter to this chromosome
     mt = _import_and_filter_vcfs(vcf_paths, config, logger)
     
-    # Step 3: Sample target SNPs for this chromosome
-    logger.info(f"{chrom}: Sampling {target_snps} SNPs from {mt.count_rows()} available variants...")
-    mt_sampled = sample_snps_from_matrix(mt, target_snps, config, logger)
+    # Filter to target chromosome only
+    mt = mt.filter_rows(mt.locus.contig == chrom)
+    total_variants = mt.count_rows()
+    logger.info(f"{chrom}: {total_variants:,} variants available after filtering")
     
-    # Step 4: Export chromosome VCF
+    if total_variants == 0:
+        logger.warning(f"{chrom}: No variants found after filtering")
+        return None
+    
+    # Step 4: Sample target SNPs
+    if total_variants > target_snps:
+        sampling_fraction = target_snps / total_variants
+        logger.info(f"{chrom}: Sampling {target_snps:,} from {total_variants:,} (fraction: {sampling_fraction:.6f})")
+        mt_sampled = mt.sample_rows(sampling_fraction, seed=config['sampling']['random_seed'])
+        sampled_count = mt_sampled.count_rows()
+        
+        # If we overshot, trim; if we undershot, accept (close enough)
+        if sampled_count > target_snps:
+            logger.info(f"{chrom}: Trimming {sampled_count:,} -> {target_snps:,}")
+            mt_sampled = mt_sampled.head(target_snps)
+            sampled_count = target_snps
+        
+        logger.info(f"{chrom}: Sampled {sampled_count:,} variants")
+    else:
+        logger.info(f"{chrom}: Using all {total_variants:,} available variants (fewer than target {target_snps:,})")
+        mt_sampled = mt
+        sampled_count = total_variants
+    
+    # Step 5: Export chromosome VCF
     chr_output_dir = f"{output_dir}/{chrom}"
+    chr_summary = export_chromosome_vcf(mt_sampled, chr_output_dir, chrom, target_snps,
+                                        config, logger, base_dir)
     
-    # Create chromosome-specific output directory by creating a marker file
-    logger.info(f"{chrom}: Creating output directory: {chr_output_dir}")
-    marker_file = f"{chr_output_dir}/.created"
-    with hl.hadoop_open(marker_file, 'w') as f:
-        f.write('created')
-    
-    chr_summary = export_chromosome_vcf(mt_sampled, chr_output_dir, chrom, target_snps, config, logger, base_dir)
-    
-    logger.info(f"{chrom}: Completed - exported {chr_summary['final_sampled_variants']} SNPs")
-    
+    logger.info(f"{chrom}: Completed - exported {chr_summary['final_sampled_variants']:,} SNPs")
     return chr_summary
 
-def sample_snps_from_matrix(mt, target_snps, config, logger):
-    """Sample exact number of SNPs from a MatrixTable."""
-    random_seed = config['sampling']['random_seed']
-    max_iterations = 10
-    
-    total_variants = mt.count_rows()
-    logger.info(f"Available variants: {total_variants}, Target: {target_snps}")
-    
-    if total_variants <= target_snps:
-        logger.warning(f"Only {total_variants} variants available, using all")
-        return mt
-    
-    # Iterative sampling
-    mt_sampled = None
-    estimated_sampled = 0
-    iteration = 0
-    
-    while estimated_sampled < target_snps and iteration < max_iterations:
-        iteration += 1
-        remaining_needed = target_snps - estimated_sampled
-        remaining_variants = total_variants - estimated_sampled
-        
-        if remaining_variants <= 0:
-            break
-        
-        sampling_fraction = min(1.0, (remaining_needed * 1.1) / remaining_variants)
-        logger.info(f"Sampling iteration {iteration}: fraction={sampling_fraction:.6f}")
-        
-        mt_current = mt.sample_rows(sampling_fraction, seed=random_seed + iteration)
-        
-        if mt_sampled is None:
-            mt_sampled = mt_current
-        else:
-            mt_sampled = mt_sampled.union_rows(mt_current)
-        
-        estimated_sampled = mt_sampled.count_rows()
-        logger.info(f"Sampled {estimated_sampled} variants so far")
-        
-        if estimated_sampled >= target_snps:
-            break
-    
-    logger.info(f"Final sampled variants: {estimated_sampled}")
-    return mt_sampled
 
 def export_chromosome_vcf(mt, output_dir, chrom, target_snps, config, logger, base_dir):
-    """Export a single chromosome VCF with smart partitioning."""
-    # Smart partitioning based on variant count
+    """Export a single chromosome VCF."""
+    # Count once and reuse
     total_variants = mt.count_rows()
-    optimal_partitions = max(5, min(50, total_variants // 1000))
+    logger.info(f"{chrom}: Exporting {total_variants:,} variants")
     
-    logger.info(f"{chrom}: Coalescing to {optimal_partitions} partitions...")
-    mt = mt.naive_coalesce(optimal_partitions)
+    # Repartition for reasonable output file size
+    optimal_partitions = max(1, min(50, total_variants // 5000))
+    if optimal_partitions > 1:
+        logger.info(f"{chrom}: Coalescing to {optimal_partitions} partitions...")
+        mt = mt.naive_coalesce(optimal_partitions)
     
     output_vcf = f"{output_dir}/{chrom}_background_snps.vcf.bgz"
     logger.info(f"{chrom}: Exporting to {output_vcf}")
@@ -306,15 +213,15 @@ def export_chromosome_vcf(mt, output_dir, chrom, target_snps, config, logger, ba
     summary = {
         'chromosome': chrom,
         'target_snps': target_snps,
-        'total_variants_before_sampling': total_variants,
-        'final_sampled_variants': mt.count_rows(),
+        'final_sampled_variants': total_variants,
         'export_path': output_vcf,
-        'export_time_seconds': export_time,
+        'export_time_seconds': round(export_time, 1),
         'timestamp': datetime.now().isoformat()
     }
     
+    # Write summary to cloud storage
     summary_path = f"{output_dir}/{chrom}_sampling_summary.json"
-    with open(summary_path, 'w') as f:
+    with hl.hadoop_open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     
     logger.info(f"{chrom}: Export completed in {export_time:.1f} seconds")
@@ -338,212 +245,11 @@ def load_ancestry_data(config, logger):
     logger.info(f"Found {len(eur_sample_ids)} European ancestry samples")
     return eur_sample_ids
 
-def parse_interval_list_and_sample(interval_list_path, target_chrom, config, logger):
-    """Parse interval list and return one random interval for target chromosome, or None if not found."""
-    logger.info(f"Parsing interval list for {target_chrom}: {interval_list_path}")
-    
-    target_intervals = []
-    hla_region = config['sampling']['hla_region']
-    total_lines = 0
-    target_lines = 0
-    file_chromosome = None
-    
-    try:
-        with hl.hadoop_open(interval_list_path, 'r') as f:
-            lines = f.readlines()
-        
-        for line in lines:
-            total_lines += 1
-            line = line.strip()
-            
-            # Skip header lines (SAM/BAM format starts with @)
-            if line.startswith('@') or not line:
-                continue
-            
-            # Parse interval format: chr    start    end    strand    .
-            # Handle both tab and space separation
-            parts = line.split()
-            if len(parts) >= 3:
-                chrom = parts[0]  # Should be chr1, chr2, etc.
-                start = int(parts[1])
-                end = int(parts[2])
-                
-                # First data line determines the file's chromosome
-                if file_chromosome is None:
-                    file_chromosome = chrom
-                    logger.info(f"File chromosome: {file_chromosome} (target: {target_chrom})")
-                
-                # If this file doesn't match our target chromosome, stop early
-                if file_chromosome != target_chrom:
-                    logger.info(f"File contains {file_chromosome}, skipping (looking for {target_chrom})")
-                    return None
-                
-                # Skip HLA region
-                if chrom == f"chr{hla_region['chrom']}" and start >= hla_region['start'] and end <= hla_region['end']:
-                    continue
-                
-                # Only collect intervals for target chromosome
-                if chrom == target_chrom:
-                    target_lines += 1
-                    target_intervals.append({
-                        'chrom': chrom,
-                        'start': start,
-                        'end': end
-                    })
-        
-        logger.info(f"Processed {total_lines} lines, found {target_lines} {target_chrom} intervals")
-        
-        if target_intervals:
-            # Return one random interval from this file
-            sampled_interval = random.choice(target_intervals)
-            logger.info(f"Selected {target_chrom} interval: {sampled_interval['start']:,}-{sampled_interval['end']:,}")
-            return sampled_interval
-        else:
-            logger.info(f"No {target_chrom} intervals found in {interval_list_path}")
-            return None
-        
-    except Exception as e:
-        logger.error(f"Failed to parse interval list {interval_list_path}: {e}")
-        return None
-
-def parse_interval_list(interval_list_path, config, logger):
-    """Parse interval list file and extract genomic intervals."""
-    logger.info(f"Parsing interval list: {interval_list_path}")
-    
-    intervals = []
-    hla_region = config['sampling']['hla_region']
-    
-    try:
-        with hl.hadoop_open(interval_list_path, 'r') as f:
-            lines = f.readlines()
-        
-        for line in lines:
-            line = line.strip()
-            
-            # Skip header lines (SAM/BAM format starts with @)
-            if line.startswith('@') or not line:
-                continue
-            
-            # Parse interval format: chr    start    end    strand    .
-            # Handle both tab and space separation
-            parts = line.split()
-            if len(parts) >= 3:
-                chrom = parts[0]  # Should be chr1, chr2, etc.
-                start = int(parts[1])
-                end = int(parts[2])
-                
-                # Skip HLA region
-                if chrom == f"chr{hla_region['chrom']}" and start >= hla_region['start'] and end <= hla_region['end']:
-                    continue
-                
-                intervals.append({
-                    'chrom': chrom,
-                    'start': start,
-                    'end': end
-                })
-        
-        logger.info(f"Parsed {len(intervals)} intervals from {interval_list_path}")
-        return intervals
-        
-    except Exception as e:
-        logger.error(f"Failed to parse interval list {interval_list_path}: {e}")
-        return []
-
-def sample_intervals_iteratively(config, logger):
-    """Sample intervals iteratively until target variant count is reached."""
-    target_variants = config['sampling']['target_total_snps']
-    intervals_per_iteration = 1000  # Start with 1000 intervals
-    max_iterations = 10
-    
-    # Set random seed for reproducibility
-    random.seed(config['sampling']['random_seed'])
-    
-    interval_list_base = config['vcf_processing']['interval_list_base']
-    total_interval_files = config['vcf_processing']['total_shards']
-    
-    # Track all collected intervals and VCF paths
-    all_intervals = []
-    all_vcf_paths = []
-    processed_files = set()  # Avoid reprocessing same files
-    
-    iteration = 0
-    current_variants = 0
-    
-    while current_variants < target_variants and iteration < max_iterations:
-        iteration += 1
-        logger.info(f"\n=== Interval Sampling Iteration {iteration}/{max_iterations} ===")
-        logger.info(f"Current variants: {current_variants:,}, Target: {target_variants:,}")
-        
-        # Sample new intervals
-        new_intervals = _sample_new_intervals(
-            interval_list_base, total_interval_files, intervals_per_iteration, 
-            processed_files, config, logger
-        )
-        
-        if not new_intervals:
-            logger.warning("No more intervals available to sample")
-            break
-            
-        all_intervals.extend(new_intervals)
-        logger.info(f"Added {len(new_intervals)} intervals (total: {len(all_intervals)})")
-        
-        # Find VCF shards for new intervals
-        new_vcf_paths = find_shards_for_intervals(new_intervals, config, logger)
-        all_vcf_paths.extend(new_vcf_paths)
-        logger.info(f"Added {len(new_vcf_paths)} VCF shards (total: {len(all_vcf_paths)})")
-        
-        # Import all VCFs and count variants
-        logger.info("Importing and filtering VCFs...")
-        mt = _import_and_filter_vcfs(all_vcf_paths, config, logger)
-        current_variants = mt.count_rows()
-        logger.info(f"Total variants after filtering: {current_variants:,}")
-        
-        # Adjust next iteration size based on variant density
-        if iteration == 1:
-            variants_per_interval = current_variants / len(all_intervals)
-            estimated_needed = (target_variants - current_variants) / variants_per_interval
-            intervals_per_iteration = min(5000, max(500, int(estimated_needed * 1.2)))  # 20% buffer
-            logger.info(f"Adjusted intervals per iteration to {intervals_per_iteration} based on variant density")
-        
-        if current_variants >= target_variants:
-            logger.info(f"Target reached! {current_variants:,} variants collected")
-            break
-    
-    if current_variants < target_variants:
-        logger.warning(f"Could not reach target after {max_iterations} iterations. Final: {current_variants:,} variants")
-    
-    return all_vcf_paths, mt
-
-def _sample_new_intervals(interval_list_base, total_files, target_count, processed_files, config, logger):
-    """Sample new intervals from unprocessed files."""
-    # Get unprocessed files
-    available_files = [f for f in range(total_files) if f not in processed_files]
-    random.shuffle(available_files)
-    
-    new_intervals = []
-    
-    for file_idx in available_files:
-        if len(new_intervals) >= target_count:
-            break
-            
-        interval_list_path = f"{interval_list_base}/{file_idx:010d}.interval_list"
-        intervals = parse_interval_list(interval_list_path, config, logger)
-        
-        # Take intervals from this file
-        remaining_needed = target_count - len(new_intervals)
-        if len(intervals) <= remaining_needed:
-            new_intervals.extend(intervals)
-        else:
-            sampled_from_file = random.sample(intervals, remaining_needed)
-            new_intervals.extend(sampled_from_file)
-        
-        processed_files.add(file_idx)
-    
-    return new_intervals
 
 def _import_and_filter_vcfs(vcf_paths, config, logger):
     """Import VCFs and apply standard filters."""
-    # Import VCFs
+    logger.info(f"Importing {len(vcf_paths)} VCF file(s)...")
+    
     mt = hl.import_vcf(
         vcf_paths,
         reference_genome='GRCh38',
@@ -551,199 +257,15 @@ def _import_and_filter_vcfs(vcf_paths, config, logger):
         array_elements_required=False
     )
     
-    # Get EUR samples (cached)
-    eur_samples = get_eur_samples(config, logger)
-    
-    # Filter to EUR samples
-    mt = mt.filter_cols(hl.literal(eur_samples).contains(mt.s))
+    # Filter to EUR samples using cached Hail Set
+    eur_set = get_eur_samples_set(config, logger)
+    mt = mt.filter_cols(eur_set.contains(mt.s))
     
     # Split multi-allelic variants
     mt = hl.split_multi_hts(mt)
     
     return mt
 
-def export_snps(mt, output_dir, config, logger, base_dir):
-    """Sample exactly target SNPs with iterative approach and export as VCF."""
-    target_snps = config['sampling']['target_total_snps']
-    random_seed = config['sampling']['random_seed']
-    max_iterations = 10  # Prevent infinite loops
-    
-    # Generate filename based on target SNP count
-    if target_snps >= 1000000:
-        snp_label = f"{target_snps//1000000}M"
-    elif target_snps >= 1000:
-        snp_label = f"{target_snps//1000}K"
-    else:
-        snp_label = f"{target_snps}"
-    
-    base_filename = f"{snp_label}_background_snps"
-    
-    logger.info(f"Target: {target_snps:,} SNPs ({snp_label})")
-    
-    # Count total variants first
-    logger.info("Counting total variants in filtered data...")
-    total_variants = mt.count_rows()
-    logger.info(f"Total variants available: {total_variants:,}")
-    
-    if total_variants <= target_snps:
-        logger.warning(f"Only {total_variants:,} variants available, less than target {target_snps:,}")
-        mt_sampled = mt
-        estimated_sampled = total_variants
-        iteration = 1
-    else:
-        # Iterative sampling approach
-        mt_sampled = None
-        estimated_sampled = 0
-        iteration = 0
-        
-        while estimated_sampled < target_snps and iteration < max_iterations:
-            iteration += 1
-            logger.info(f"Sampling iteration {iteration}/{max_iterations}")
-            
-            # Calculate sampling fraction for this iteration
-            remaining_needed = target_snps - estimated_sampled
-            remaining_variants = total_variants - estimated_sampled
-            
-            if remaining_variants <= 0:
-                break
-                
-            # Sample a bit more than needed to account for sampling variance
-            sampling_fraction = min(1.0, (remaining_needed * 1.1) / remaining_variants)
-            logger.info(f"Sampling fraction: {sampling_fraction:.6f}")
-            
-            # Sample variants
-            logger.info("Performing variant sampling...")
-            mt_current = mt.sample_rows(sampling_fraction, seed=random_seed + iteration)
-            
-            # If first iteration, use as base
-            if mt_sampled is None:
-                mt_sampled = mt_current
-            else:
-                # Union with previously sampled variants
-                mt_sampled = mt_sampled.union_rows(mt_current)
-            
-            # Update counts
-            estimated_sampled = mt_sampled.count_rows()
-            logger.info(f"Total sampled variants so far: {estimated_sampled:,}")
-            
-            if estimated_sampled >= target_snps:
-                logger.info(f"Target reached! {estimated_sampled:,} variants sampled")
-                break
-        
-        if estimated_sampled < target_snps:
-            logger.warning(f"Could not reach target after {max_iterations} iterations. Final count: {estimated_sampled:,}")
-    
-    # Export as compressed VCF
-    # Smart partitioning based on variant count
-    optimal_partitions = max(10, min(100, estimated_sampled // 1000))  # 1000 variants per partition
-    logger.info(f"Coalescing to {optimal_partitions} partitions for VCF export...")
-    mt_sampled = mt_sampled.naive_coalesce(optimal_partitions)
-    
-    output_vcf = f"{output_dir}/{base_filename}.vcf.bgz"
-    logger.info(f"Exporting to compressed VCF: {output_vcf}")
-    
-    export_start = time.time()
-    hl.export_vcf(
-        mt_sampled,
-        output_vcf,
-        parallel='separate_header',
-        tabix=True
-    )
-    export_time = time.time() - export_start
-    
-    # Post-process to create single VCF if needed
-    if optimal_partitions > 1:
-        logger.info("Multiple partitions detected, copying shards locally for consolidation...")
-        
-        # Create local directory in results folder
-        import os
-        local_parts_dir = f"{output_dir.replace('gs://', '/tmp/gs_')}/vcf_parts"
-        os.makedirs(local_parts_dir, exist_ok=True)
-        logger.info(f"Created local parts directory: {local_parts_dir}")
-        
-        # Copy all part files locally
-        import subprocess
-        try:
-            # List part files in GS
-            list_cmd = ["gsutil", "ls", f"{output_vcf}/part-*.bgz"]
-            result = subprocess.run(list_cmd, capture_output=True, text=True, check=True)
-            part_files = result.stdout.strip().split('\n')
-            
-            logger.info(f"Found {len(part_files)} part files to copy")
-            
-            # Copy each part file locally
-            for gs_file in part_files:
-                if gs_file.strip():
-                    filename = os.path.basename(gs_file)
-                    local_file = os.path.join(local_parts_dir, filename)
-                    copy_cmd = ["gsutil", "cp", gs_file, local_file]
-                    subprocess.run(copy_cmd, check=True)
-                    logger.debug(f"Copied {filename} locally")
-            
-            # Consolidate locally
-            logger.info("Consolidating VCF parts locally...")
-            consolidated_vcf = f"{output_dir}/{base_filename}_consolidated.vcf.bgz"
-            
-            concat_cmd = [
-                "bcftools", "concat", 
-                "-Oz", "-o", consolidated_vcf,
-                f"{local_parts_dir}/part-*.bgz"
-            ]
-            subprocess.run(concat_cmd, check=True)
-            
-            # Create index
-            subprocess.run(["tabix", "-p", "vcf", consolidated_vcf], check=True)
-            
-            logger.info(f"Consolidated VCF created: {consolidated_vcf}")
-            summary['export_path'] = consolidated_vcf
-            
-            # Copy consolidated VCF to local results directory
-            local_results_dir = f"{base_dir}/results"
-            os.makedirs(local_results_dir, exist_ok=True)
-            local_consolidated_vcf = f"{local_results_dir}/{base_filename}_consolidated.vcf.bgz"
-            
-            logger.info(f"Copying consolidated VCF to local results: {local_consolidated_vcf}")
-            subprocess.run(["gsutil", "cp", consolidated_vcf, local_consolidated_vcf], check=True)
-            subprocess.run(["gsutil", "cp", f"{consolidated_vcf}.tbi", f"{local_consolidated_vcf}.tbi"], check=True)
-            
-            # Clean up temp directory
-            import shutil
-            shutil.rmtree(local_parts_dir)
-            logger.info("Cleaned up temporary files")
-            
-        except (subprocess.CalledProcessError, Exception) as e:
-            logger.warning(f"Could not consolidate VCF: {e}")
-            logger.info("Keeping multi-part VCF structure")
-            # Clean up temp directory on error
-            if 'local_parts_dir' in locals() and os.path.exists(local_parts_dir):
-                shutil.rmtree(local_parts_dir)
-    
-    logger.info(f"VCF export completed in {export_time:.1f} seconds")
-    
-    # Create summary
-    summary = {
-        'target_snps': target_snps,
-        'total_variants_before_sampling': total_variants,
-        'final_sampled_variants': estimated_sampled,
-        'iterations_used': iteration,
-        'export_path': output_vcf,
-        'export_time_seconds': export_time,
-        'timestamp': datetime.now().isoformat()
-    }
-    
-    summary_path = f"{output_dir}/{base_filename}_sampling_summary.json"
-    
-    # Create output directory by creating a marker file
-    logger.info(f"Creating output directory: {output_dir}")
-    marker_file = f"{output_dir}/.created"
-    with hl.hadoop_open(marker_file, 'w') as f:
-        f.write('created')
-    
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    logger.info(f"Sampling summary saved to: {summary_path}")
-    return summary
 
 
 def main():
@@ -796,20 +318,18 @@ def main():
         
         if test_mode and test_chromosome:
             logger.info(f"=== TEST MODE: Processing only {test_chromosome} ===")
-            # Test mode: process single chromosome with proportional target
             chr_targets = calculate_chromosome_targets(target_snps, logger)
             test_chr_target = chr_targets.get(test_chromosome, 0)
             if test_chr_target == 0:
                 logger.error(f"Test chromosome {test_chromosome} not found in targets!")
                 sys.exit(1)
             chr_targets = {test_chromosome: test_chr_target}
-            logger.info(f"Target for {test_chromosome}: {chr_targets[test_chromosome]} SNPs (based on chromosome size)")
+            logger.info(f"Target for {test_chromosome}: {chr_targets[test_chromosome]:,} SNPs (based on chromosome size)")
             
-            # Process single chromosome
-            chr_summary = process_chromosome(test_chromosome, chr_targets[test_chromosome], output_dir, config, logger, base_dir)
+            chr_summary = process_chromosome(test_chromosome, chr_targets[test_chromosome],
+                                            output_dir, config, logger, base_dir)
             
             if chr_summary:
-                # Create test summary
                 test_summary = {
                     'test_mode': True,
                     'test_chromosome': test_chromosome,
@@ -820,21 +340,19 @@ def main():
                 }
                 
                 summary_path = f"{output_dir}/{base_filename}_test_summary.json"
-                with open(summary_path, 'w') as f:
+                with hl.hadoop_open(summary_path, 'w') as f:
                     json.dump(test_summary, f, indent=2)
                 
                 logger.info(f"=== TEST MODE COMPLETED: {test_chromosome} ===")
-                logger.info(f"Sampled {chr_summary['final_sampled_variants']} SNPs")
+                logger.info(f"Sampled {chr_summary['final_sampled_variants']:,} SNPs")
                 logger.info(f"Results saved to: {output_dir}")
             else:
                 logger.error(f"TEST MODE FAILED: No variants found for {test_chromosome}")
         
         else:
             # Full production mode: Process all chromosomes
-            # Step 1: Calculate chromosome targets
             chr_targets = calculate_chromosome_targets(target_snps, logger)
             
-            # Step 2: Process each chromosome sequentially
             all_summaries = []
             total_sampled = 0
             
@@ -844,7 +362,6 @@ def main():
                     all_summaries.append(chr_summary)
                     total_sampled += chr_summary['final_sampled_variants']
             
-            # Step 3: Create overall summary
             overall_summary = {
                 'target_snps': target_snps,
                 'chromosome_targets': chr_targets,
@@ -855,7 +372,7 @@ def main():
             }
             
             summary_path = f"{output_dir}/{base_filename}_overall_summary.json"
-            with open(summary_path, 'w') as f:
+            with hl.hadoop_open(summary_path, 'w') as f:
                 json.dump(overall_summary, f, indent=2)
             
             logger.info("=== Chromosome-based SNP sampling completed successfully! ===")
