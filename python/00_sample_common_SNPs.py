@@ -262,6 +262,7 @@ def parse_interval_list_and_sample(interval_list_path, target_chrom, config, log
     hla_region = config['sampling']['hla_region']
     total_lines = 0
     target_lines = 0
+    file_chromosome = None
     
     try:
         with hl.hadoop_open(interval_list_path, 'r') as f:
@@ -282,6 +283,16 @@ def parse_interval_list_and_sample(interval_list_path, target_chrom, config, log
                 chrom = parts[0]  # Should be chr1, chr2, etc.
                 start = int(parts[1])
                 end = int(parts[2])
+                
+                # First data line determines the file's chromosome
+                if file_chromosome is None:
+                    file_chromosome = chrom
+                    logger.info(f"File chromosome: {file_chromosome} (target: {target_chrom})")
+                
+                # If this file doesn't match our target chromosome, stop early
+                if file_chromosome != target_chrom:
+                    logger.info(f"File contains {file_chromosome}, skipping (looking for {target_chrom})")
+                    return None
                 
                 # Skip HLA region
                 if chrom == f"chr{hla_region['chrom']}" and start >= hla_region['start'] and end <= hla_region['end']:
