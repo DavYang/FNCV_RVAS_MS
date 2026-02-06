@@ -12,7 +12,8 @@
     "params": {
         "random_seed": 42,
         "dated_exports": true,
-        "test_mode": false,
+        "test_mode": true,
+        "test_chromosome": "chr21",
         "single_session_mode": true
     },
     "sampling": {

@@ -10,6 +10,225 @@ from utils import load_config, init_hail, setup_logger
 
 logger = setup_logger("SNP_sampling")
 
+# Global cache for EUR samples
+eur_samples_cache = None
+
+def get_eur_samples(config, logger):
+    """Load EUR samples with caching to avoid repeated loading."""
+    global eur_samples_cache
+    if eur_samples_cache is None:
+        logger.info("Loading EUR ancestry samples (first time only)...")
+        eur_samples_cache = load_ancestry_data(config, logger)
+        logger.info(f"Cached {len(eur_samples_cache)} EUR samples for reuse")
+    return eur_samples_cache
+
+def calculate_chromosome_targets(target_snps, logger):
+    """Calculate proportional SNP targets per chromosome based on GRCh38 sizes."""
+    # GRCh38 approximate chromosome sizes (in base pairs)
+    chr_sizes = {
+        'chr1': 248956422, 'chr2': 242193529, 'chr3': 198295559,
+        'chr4': 190214555, 'chr5': 181538259, 'chr6': 170805979,
+        'chr7': 159345973, 'chr8': 145138636, 'chr9': 138394717,
+        'chr10': 133797422, 'chr11': 135086622, 'chr12': 133275309,
+        'chr13': 114364328, 'chr14': 107043718, 'chr15': 101991189,
+        'chr16': 90338345, 'chr17': 83257441, 'chr18': 80373285,
+        'chr19': 58617616, 'chr20': 64444167, 'chr21': 46709983,
+        'chr22': 50818468, 'chrX': 156040895, 'chrY': 57227415
+    }
+    
+    total_genome_size = sum(chr_sizes.values())
+    chr_targets = {}
+    
+    for chrom, size in chr_sizes.items():
+        proportion = size / total_genome_size
+        target = int(target_snps * proportion)
+        chr_targets[chrom] = max(1, target)  # Ensure at least 1 SNP per chromosome
+    
+    # Adjust for rounding to match exact target
+    current_total = sum(chr_targets.values())
+    if current_total != target_snps:
+        # Add remaining SNPs to largest chromosomes
+        remaining = target_snps - current_total
+        sorted_chroms = sorted(chr_targets.items(), key=lambda item: item[1], reverse=True)
+        for i, (chrom, target) in enumerate(sorted_chroms):
+            if i < remaining:
+                chr_targets[chrom] += 1
+            else:
+                break
+    
+    logger.info(f"Chromosome SNP targets: {chr_targets}")
+    logger.info(f"Total target SNPs: {sum(chr_targets.values())}")
+    
+    return chr_targets
+
+def sample_chromosome_intervals(chrom, target_snps, config, logger):
+    """Sample intervals for a specific chromosome until target SNP count is reached."""
+    random.seed(config['sampling']['random_seed'])
+    
+    interval_list_base = config['vcf_processing']['interval_list_base']
+    total_interval_files = config['vcf_processing']['total_shards']
+    
+    # Get intervals for this chromosome
+    all_intervals = []
+    processed_files = set()
+    
+    # Sample intervals until we have enough variants
+    current_variants = 0
+    intervals_sampled = 0
+    max_intervals = 100  # Safety limit
+    
+    while current_variants < target_snps and intervals_sampled < max_intervals:
+        # Sample one interval for this chromosome
+        available_files = [f for f in range(total_interval_files) if f not in processed_files]
+        random.shuffle(available_files)
+        
+        if not available_files:
+            logger.warning(f"No more interval files available for {chrom}")
+            break
+        
+        # Sample one file
+        file_idx = available_files[0]
+        interval_list_path = f"{interval_list_base}/{file_idx:010d}.interval_list"
+        intervals = parse_interval_list(interval_list_path, config, logger)
+        
+        # Filter intervals for this chromosome
+        chrom_intervals = [interval for interval in intervals if interval['chrom'] == chrom]
+        
+        if not chrom_intervals:
+            processed_files.add(file_idx)
+            continue
+        
+        # Take one random interval from this file
+        sampled_interval = random.choice(chrom_intervals)
+        all_intervals.append(sampled_interval)
+        intervals_sampled += 1
+        
+        # Import VCF for this interval and count variants
+        vcf_paths = find_shards_for_intervals([sampled_interval], config, logger)
+        if vcf_paths:
+            mt = _import_and_filter_vcfs(vcf_paths, config, logger)
+            interval_variants = mt.count_rows()
+            current_variants += interval_variants
+            logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
+        
+        processed_files.add(file_idx)
+    
+    logger.info(f"{chrom}: Sampled {len(all_intervals)} intervals, collected {current_variants} variants")
+    return all_intervals, current_variants
+
+def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir):
+    """Process a single chromosome: sample intervals, filter, sample SNPs, and export."""
+    logger.info(f"\n=== Processing {chrom} (target: {target_snps} SNPs) ===")
+    
+    # Step 1: Sample intervals for this chromosome
+    intervals, available_variants = sample_chromosome_intervals(chrom, target_snps, config, logger)
+    
+    if available_variants == 0:
+        logger.warning(f"No variants found for {chrom}")
+        return None
+    
+    # Step 2: Import all VCFs for this chromosome
+    logger.info(f"{chrom}: Importing VCFs for {len(intervals)} intervals...")
+    vcf_paths = find_shards_for_intervals(intervals, config, logger)
+    mt = _import_and_filter_vcfs(vcf_paths, config, logger)
+    
+    # Step 3: Sample target SNPs for this chromosome
+    logger.info(f"{chrom}: Sampling {target_snps} SNPs from {mt.count_rows()} available variants...")
+    mt_sampled = sample_snps_from_matrix(mt, target_snps, config, logger)
+    
+    # Step 4: Export chromosome VCF
+    chr_output_dir = f"{output_dir}/{chrom}"
+    hl.hadoop_mkdir(chr_output_dir)
+    
+    chr_summary = export_chromosome_vcf(mt_sampled, chr_output_dir, chrom, target_snps, config, logger, base_dir)
+    
+    logger.info(f"{chrom}: Completed - exported {chr_summary['final_sampled_variants']} SNPs")
+    
+    return chr_summary
+
+def sample_snps_from_matrix(mt, target_snps, config, logger):
+    """Sample exact number of SNPs from a MatrixTable."""
+    random_seed = config['sampling']['random_seed']
+    max_iterations = 10
+    
+    total_variants = mt.count_rows()
+    logger.info(f"Available variants: {total_variants}, Target: {target_snps}")
+    
+    if total_variants <= target_snps:
+        logger.warning(f"Only {total_variants} variants available, using all")
+        return mt
+    
+    # Iterative sampling
+    mt_sampled = None
+    estimated_sampled = 0
+    iteration = 0
+    
+    while estimated_sampled < target_snps and iteration < max_iterations:
+        iteration += 1
+        remaining_needed = target_snps - estimated_sampled
+        remaining_variants = total_variants - estimated_sampled
+        
+        if remaining_variants <= 0:
+            break
+        
+        sampling_fraction = min(1.0, (remaining_needed * 1.1) / remaining_variants)
+        logger.info(f"Sampling iteration {iteration}: fraction={sampling_fraction:.6f}")
+        
+        mt_current = mt.sample_rows(sampling_fraction, seed=random_seed + iteration)
+        
+        if mt_sampled is None:
+            mt_sampled = mt_current
+        else:
+            mt_sampled = mt_sampled.union_rows(mt_current)
+        
+        estimated_sampled = mt_sampled.count_rows()
+        logger.info(f"Sampled {estimated_sampled} variants so far")
+        
+        if estimated_sampled >= target_snps:
+            break
+    
+    logger.info(f"Final sampled variants: {estimated_sampled}")
+    return mt_sampled
+
+def export_chromosome_vcf(mt, output_dir, chrom, target_snps, config, logger, base_dir):
+    """Export a single chromosome VCF with smart partitioning."""
+    # Smart partitioning based on variant count
+    total_variants = mt.count_rows()
+    optimal_partitions = max(5, min(50, total_variants // 1000))
+    
+    logger.info(f"{chrom}: Coalescing to {optimal_partitions} partitions...")
+    mt = mt.naive_coalesce(optimal_partitions)
+    
+    output_vcf = f"{output_dir}/{chrom}_background_snps.vcf.bgz"
+    logger.info(f"{chrom}: Exporting to {output_vcf}")
+    
+    export_start = time.time()
+    hl.export_vcf(
+        mt,
+        output_vcf,
+        parallel='separate_header',
+        tabix=True
+    )
+    export_time = time.time() - export_start
+    
+    # Create chromosome summary
+    summary = {
+        'chromosome': chrom,
+        'target_snps': target_snps,
+        'total_variants_before_sampling': total_variants,
+        'final_sampled_variants': mt.count_rows(),
+        'export_path': output_vcf,
+        'export_time_seconds': export_time,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    summary_path = f"{output_dir}/{chrom}_sampling_summary.json"
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    logger.info(f"{chrom}: Export completed in {export_time:.1f} seconds")
+    return summary
+
 def load_ancestry_data(config, logger):
     """Load ancestry predictions and filter to European ancestry samples."""
     logger.info("Loading ancestry data...")
@@ -170,12 +389,11 @@ def _import_and_filter_vcfs(vcf_paths, config, logger):
         array_elements_required=False
     )
     
-    # Load EUR samples (cached if possible)
-    if not hasattr(_import_and_filter_vcfs, 'eur_samples'):
-        _import_and_filter_vcfs.eur_samples = load_ancestry_data(config, logger)
+    # Get EUR samples (cached)
+    eur_samples = get_eur_samples(config, logger)
     
     # Filter to EUR samples
-    mt = mt.filter_cols(hl.literal(_import_and_filter_vcfs.eur_samples).contains(mt.s))
+    mt = mt.filter_cols(hl.literal(eur_samples).contains(mt.s))
     
     # Split multi-allelic variants
     mt = hl.split_multi_hts(mt)
@@ -444,21 +662,73 @@ def main():
     logger.info(f"Output Directory: {output_dir}")
     
     try:
-        # Step 1: Use variant-driven interval sampling
-        vcf_paths, mt = sample_intervals_iteratively(config, logger)
+        # Check for test mode
+        test_mode = config['params'].get('test_mode', False)
+        test_chromosome = config['params'].get('test_chromosome', None)
         
-        # Step 2: Repartition for efficient processing
-        logger.info("Repartitioning to 200 partitions...")
-        mt = mt.naive_coalesce(200)
+        if test_mode and test_chromosome:
+            logger.info(f"=== TEST MODE: Processing only {test_chromosome} ===")
+            # Test mode: process single chromosome with proportional target
+            chr_targets = {test_chromosome: int(target_snps * chr_sizes[test_chromosome] / sum(chr_sizes.values()))}
+            logger.info(f"Target for {test_chromosome}: {chr_targets[test_chromosome]} SNPs (based on chromosome size)")
+            
+            # Process single chromosome
+            chr_summary = process_chromosome(test_chromosome, chr_targets[test_chromosome], output_dir, config, logger, base_dir)
+            
+            if chr_summary:
+                # Create test summary
+                test_summary = {
+                    'test_mode': True,
+                    'test_chromosome': test_chromosome,
+                    'target_snps': chr_targets[test_chromosome],
+                    'final_sampled_variants': chr_summary['final_sampled_variants'],
+                    'output_directory': output_dir,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                summary_path = f"{output_dir}/{base_filename}_test_summary.json"
+                with open(summary_path, 'w') as f:
+                    json.dump(test_summary, f, indent=2)
+                
+                logger.info(f"=== TEST MODE COMPLETED: {test_chromosome} ===")
+                logger.info(f"Sampled {chr_summary['final_sampled_variants']} SNPs")
+                logger.info(f"Results saved to: {output_dir}")
+            else:
+                logger.error(f"TEST MODE FAILED: No variants found for {test_chromosome}")
         
-        logger.info(f"Filtered data - Rows: {mt.count_rows():,}, Cols: {mt.count_cols():,}")
-        
-        # Step 8: Sample exactly target SNPs and export
-        summary = export_snps(mt, output_dir, config, logger, base_dir)
-        
-        logger.info("SNP sampling completed successfully!")
-        logger.info(f"Results saved to: {output_dir}")
-        logger.info(f"VCF file: {summary['export_path']}")
+        else:
+            # Full production mode: Process all chromosomes
+            # Step 1: Calculate chromosome targets
+            chr_targets = calculate_chromosome_targets(target_snps, logger)
+            
+            # Step 2: Process each chromosome sequentially
+            all_summaries = []
+            total_sampled = 0
+            
+            for chrom, target in chr_targets.items():
+                chr_summary = process_chromosome(chrom, target, output_dir, config, logger, base_dir)
+                if chr_summary:
+                    all_summaries.append(chr_summary)
+                    total_sampled += chr_summary['final_sampled_variants']
+            
+            # Step 3: Create overall summary
+            overall_summary = {
+                'target_snps': target_snps,
+                'chromosome_targets': chr_targets,
+                'total_sampled_variants': total_sampled,
+                'chromosomes_processed': len(all_summaries),
+                'output_directory': output_dir,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            summary_path = f"{output_dir}/{base_filename}_overall_summary.json"
+            with open(summary_path, 'w') as f:
+                json.dump(overall_summary, f, indent=2)
+            
+            logger.info("=== Chromosome-based SNP sampling completed successfully! ===")
+            logger.info(f"Total chromosomes processed: {len(all_summaries)}")
+            logger.info(f"Total SNPs sampled: {total_sampled:,}")
+            logger.info(f"Results saved to: {output_dir}")
         
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")

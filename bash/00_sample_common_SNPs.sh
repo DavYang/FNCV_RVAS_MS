@@ -46,15 +46,36 @@ if [ ! -f "${PYTHON_DIR}/${SCRIPT_NAME}.py" ]; then
     exit 1
 fi
 
-echo "Starting SNP sampling from sharded VCFs..."
+echo "Starting chromosome-based SNP sampling from sharded VCFs..."
 echo "Target: ${TARGET_SNPS} SNPs (${BASE_FILENAME})"
+
+# Check for test mode
+if grep -q '"test_mode": true' "${CONFIG_DIR}/config.json"; then
+    TEST_CHR=$(grep '"test_chromosome"' "${CONFIG_DIR}/config.json" | cut -d'"' -f4 | cut -d'"' -f1)
+    echo "TEST MODE DETECTED: Processing only ${TEST_CHR}"
+    echo "Target for ${TEST_CHR}: Based on chromosome size proportion of total ${TARGET_SNPS}"
+else
+    echo "PRODUCTION MODE: Processing all chromosomes (chr1-22, chrX, chrY)"
+    echo "Each chromosome target: Based on proportional size distribution of total ${TARGET_SNPS}"
+fi
+
 echo "This will:"
-echo "  1. Load EUR sample IDs from ancestry data"
-echo "  2. Select random genome-wide intervals"
-echo "  3. Find corresponding VCF shards"
-echo "  4. Import and filter VCFs to EUR samples"
-echo "  5. Sample exactly ${TARGET_SNPS} SNPs"
-echo "  6. Export as compressed VCF with tabix index"
+if grep -q '"test_mode": true' "${CONFIG_DIR}/config.json"; then
+    echo "  2. Sample random intervals for ${TEST_CHR}"
+    echo "  3. Filter to EUR samples (cached)"
+    echo "  4. Sample ${TEST_CHR} SNPs for ${TEST_CHR} (proportional to chromosome size)"
+    echo "  5. Export ${TEST_CHR} VCF immediately"
+    echo "  6. Generate test summary"
+else
+    echo "  1. Calculate proportional SNP targets per chromosome"
+    echo "  2. Process each chromosome sequentially:"
+    echo "     - Sample random intervals per chromosome"
+    echo "     - Filter to EUR samples (cached after first chromosome)"
+    echo "     - Sample target SNPs per chromosome (proportional to chromosome size)"
+    echo "     - Export chromosome-specific VCF immediately"
+    echo "  3. Generate per-chromosome summaries"
+    echo "  4. Create overall summary"
+fi
 echo ""
 
 # Run in background with nohup
@@ -65,6 +86,32 @@ echo "PID: ${PID}"
 echo ""
 echo "To monitor progress, run:"
 echo "  tail -f ${LOG_FILE}"
+echo ""
+echo "To wait for completion and auto-copy results:"
+echo "  wait_for_job_and_copy() { wait $PID; echo 'Job completed, copying results...'; nohup gsutil -m cp -r gs://\${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${BASE_FILENAME}_${TIMESTAMP}/ ${LOCAL_OUTPUT_DIR}/ > ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log 2>&1 & echo 'Copy started in background, check ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log'; }"
+echo "  wait_for_job_and_copy"
+echo ""
+echo "Expected output structure:"
+if grep -q '"test_mode": true' "${CONFIG_DIR}/config.json"; then
+    echo "  ${BASE_FILENAME}_${TIMESTAMP}/"
+    echo "  ├── ${TEST_CHR}/"
+    echo "  │   ├── ${TEST_CHR}_background_snps.vcf.bgz"
+    echo "  │   ├── ${TEST_CHR}_background_snps.vcf.bgz.tbi"
+    echo "  │   └── ${TEST_CHR}_sampling_summary.json"
+    echo "  └── ${BASE_FILENAME}_test_summary.json"
+else
+    echo "  ${BASE_FILENAME}_${TIMESTAMP}/"
+    echo "  ├── chr1/"
+    echo "  │   ├── chr1_background_snps.vcf.bgz"
+    echo "  │   ├── chr1_background_snps.vcf.bgz.tbi"
+    echo "  │   └── chr1_sampling_summary.json"
+    echo "  ├── chr2/"
+    echo "  │   ├── chr2_background_snps.vcf.bgz"
+    echo "  │   ├── chr2_background_snps.vcf.bgz.tbi"
+    echo "  │   └── chr2_sampling_summary.json"
+    echo "  └── ... (chr1-22, chrX, chrY)"
+    echo "  └── ${BASE_FILENAME}_overall_summary.json"
+fi
 echo ""
 echo "To wait for completion and auto-copy results:"
 echo "  wait_for_job_and_copy() { wait $PID; echo 'Job completed, copying results...'; nohup gsutil -m cp -r gs://\${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${BASE_FILENAME}_${TIMESTAMP}/ ${LOCAL_OUTPUT_DIR}/ > ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log 2>&1 & echo 'Copy started in background, check ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log'; }"
