@@ -89,27 +89,23 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
         # Sample one file
         file_idx = available_files[0]
         interval_list_path = f"{interval_list_base}/{file_idx:010d}.interval_list"
-        intervals = parse_interval_list(interval_list_path, config, logger)
         
-        # Filter intervals for this chromosome
-        chrom_intervals = [interval for interval in intervals if interval['chrom'] == chrom]
+        # Parse intervals and stop early when we find a matching chromosome interval
+        sampled_interval = parse_interval_list_and_sample(interval_list_path, chrom, config, logger)
         
-        if not chrom_intervals:
-            processed_files.add(file_idx)
-            continue
-        
-        # Take one random interval from this file
-        sampled_interval = random.choice(chrom_intervals)
-        all_intervals.append(sampled_interval)
-        intervals_sampled += 1
-        
-        # Import VCF for this interval and count variants
-        vcf_paths = find_shards_for_intervals([sampled_interval], config, logger)
-        if vcf_paths:
-            mt = _import_and_filter_vcfs(vcf_paths, config, logger)
-            interval_variants = mt.count_rows()
-            current_variants += interval_variants
-            logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
+        if sampled_interval:
+            all_intervals.append(sampled_interval)
+            intervals_sampled += 1
+            
+            # Import VCF for this interval and count variants
+            vcf_paths = find_shards_for_intervals([sampled_interval], config, logger)
+            if vcf_paths:
+                mt = _import_and_filter_vcfs(vcf_paths, config, logger)
+                interval_variants = mt.count_rows()
+                current_variants += interval_variants
+                logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
+        else:
+            logger.debug(f"No {chrom} intervals found in file {file_idx}")
         
         processed_files.add(file_idx)
     
@@ -246,6 +242,54 @@ def load_ancestry_data(config, logger):
     
     logger.info(f"Found {len(eur_sample_ids)} European ancestry samples")
     return eur_sample_ids
+
+def parse_interval_list_and_sample(interval_list_path, target_chrom, config, logger):
+    """Parse interval list and return one random interval for target chromosome, or None if not found."""
+    logger.debug(f"Parsing interval list for {target_chrom}: {interval_list_path}")
+    
+    target_intervals = []
+    hla_region = config['sampling']['hla_region']
+    
+    try:
+        with hl.hadoop_open(interval_list_path, 'r') as f:
+            lines = f.readlines()
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('@') or not line:
+                continue
+            
+            # Parse interval format: chr:start-end
+            parts = line.split('\t')
+            if len(parts) >= 3:
+                chrom = parts[0]  # Keep as-is (should include 'chr' prefix)
+                start = int(parts[1])
+                end = int(parts[2])
+                
+                # Skip HLA region
+                if chrom == f"chr{hla_region['chrom']}" and start >= hla_region['start'] and end <= hla_region['end']:
+                    continue
+                
+                # Only collect intervals for target chromosome
+                if chrom == target_chrom:
+                    target_intervals.append({
+                        'chrom': chrom,
+                        'start': start,
+                        'end': end
+                    })
+        
+        if target_intervals:
+            # Return one random interval from this file
+            sampled_interval = random.choice(target_intervals)
+            logger.debug(f"Found {len(target_intervals)} {target_chrom} intervals, selected: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
+            return sampled_interval
+        else:
+            logger.debug(f"No {target_chrom} intervals found in {interval_list_path}")
+            return None
+        
+    except Exception as e:
+        logger.error(f"Failed to parse interval list {interval_list_path}: {e}")
+        return None
 
 def parse_interval_list(interval_list_path, config, logger):
     """Parse interval list file and extract genomic intervals."""
