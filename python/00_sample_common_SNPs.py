@@ -66,10 +66,12 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
     random.seed(config['sampling']['random_seed'])
     
     interval_list_base = config['vcf_processing']['interval_list_base']
+    vcf_base = config['vcf_processing']['sharded_vcf_base']
     total_interval_files = config['vcf_processing']['total_shards']
     
     logger.info(f"{chrom}: Starting interval sampling (target: {target_snps} variants)")
     logger.info(f"{chrom}: Interval list base: {interval_list_base}")
+    logger.info(f"{chrom}: VCF base: {vcf_base}")
     logger.info(f"{chrom}: Total interval files: {total_interval_files}")
     
     # Check for test mode with specific interval file
@@ -78,7 +80,13 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
     
     if test_mode and test_interval_file:
         logger.info(f"{chrom}: TEST MODE - Using specific interval file: {test_interval_file}")
+        
+        # Extract shard number from test interval file
+        shard_num = int(test_interval_file.split('.')[0])
         interval_list_path = f"{interval_list_base.rstrip('/')}/{test_interval_file}"
+        vcf_path = f"{vcf_base.rstrip('/')}/{shard_num:010d}.vcf.bgz"
+        
+        logger.info(f"{chrom}: Using shard {shard_num:010d} - VCF: {vcf_path}")
         
         # Parse the specific test file and collect all chr21 intervals
         all_intervals = []
@@ -131,16 +139,12 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
                 
                 logger.info(f"{chrom}: Sampled interval {intervals_sampled}: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
                 
-                # Import VCF for this interval and count variants
-                vcf_paths = find_shards_for_intervals([sampled_interval], config, logger)
-                if vcf_paths:
-                    logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled}...")
-                    mt = _import_and_filter_vcfs(vcf_paths, config, logger)
-                    interval_variants = mt.count_rows()
-                    current_variants += interval_variants
-                    logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
-                else:
-                    logger.warning(f"{chrom}: No VCF paths found for interval {intervals_sampled}")
+                # Import VCF directly using shard mapping (no search needed!)
+                logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled} from shard {shard_num:010d}...")
+                mt = _import_and_filter_vcfs([vcf_path], config, logger)
+                interval_variants = mt.count_rows()
+                current_variants += interval_variants
+                logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
             
             logger.info(f"{chrom}: Sampled {len(all_intervals)} intervals, collected {current_variants} variants")
             return all_intervals, current_variants
@@ -149,7 +153,7 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
             logger.error(f"{chrom}: Failed to process test interval file: {e}")
             return [], 0
     
-    # Original logic for production mode
+    # Original logic for production mode with optimized shard mapping
     # Get intervals for this chromosome
     all_intervals = []
     processed_files = set()
@@ -173,7 +177,8 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
         # Sample one file
         file_idx = available_files[0]
         interval_list_path = f"{interval_list_base.rstrip('/')}/{file_idx:010d}.interval_list"
-        logger.info(f"{chrom}: Checking file {file_idx}: {interval_list_path}")
+        vcf_path = f"{vcf_base.rstrip('/')}/{file_idx:010d}.vcf.bgz"
+        logger.info(f"{chrom}: Checking shard {file_idx:010d}: {interval_list_path}")
         
         # Parse intervals and stop early when we find a matching chromosome interval
         sampled_interval = parse_interval_list_and_sample(interval_list_path, chrom, config, logger)
@@ -183,18 +188,14 @@ def sample_chromosome_intervals(chrom, target_snps, config, logger):
             intervals_sampled += 1
             logger.info(f"{chrom:} Found interval {intervals_sampled}: {sampled_interval['chrom']}:{sampled_interval['start']}-{sampled_interval['end']}")
             
-            # Import VCF for this interval and count variants
-            vcf_paths = find_shards_for_intervals([sampled_interval], config, logger)
-            if vcf_paths:
-                logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled}...")
-                mt = _import_and_filter_vcfs(vcf_paths, config, logger)
-                interval_variants = mt.count_rows()
-                current_variants += interval_variants
-                logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
-            else:
-                logger.warning(f"{chrom}: No VCF paths found for interval {intervals_sampled}")
+            # Import VCF directly using shard mapping (no search needed!)
+            logger.info(f"{chrom}: Importing VCF for interval {intervals_sampled} from shard {file_idx:010d}...")
+            mt = _import_and_filter_vcfs([vcf_path], config, logger)
+            interval_variants = mt.count_rows()
+            current_variants += interval_variants
+            logger.info(f"{chrom}: Sampled interval {intervals_sampled}, added {interval_variants} variants (total: {current_variants}/{target_snps})")
         else:
-            logger.info(f"{chrom}: No {chrom} intervals found in file {file_idx}")
+            logger.info(f"{chrom}: No {chrom} intervals found in shard {file_idx:010d}")
         
         processed_files.add(file_idx)
     
@@ -223,7 +224,12 @@ def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir)
     
     # Step 4: Export chromosome VCF
     chr_output_dir = f"{output_dir}/{chrom}"
-    hl.hadoop_mkdir(chr_output_dir)
+    
+    # Create chromosome-specific output directory by creating a marker file
+    logger.info(f"{chrom}: Creating output directory: {chr_output_dir}")
+    marker_file = f"{chr_output_dir}/.created"
+    with hl.hadoop_open(marker_file, 'w') as f:
+        f.write('created')
     
     chr_summary = export_chromosome_vcf(mt_sampled, chr_output_dir, chrom, target_snps, config, logger, base_dir)
     
@@ -556,39 +562,6 @@ def _import_and_filter_vcfs(vcf_paths, config, logger):
     
     return mt
 
-def find_shards_for_intervals(intervals, config, logger):
-    """Find VCF shards that contain the selected intervals."""
-    logger.info("Finding VCF shards for selected intervals...")
-    
-    sharded_vcf_base = config['vcf_processing']['sharded_vcf_base']
-    total_shards = config['vcf_processing']['total_shards']
-    
-    # Since we're using the actual VCF files (not sharded by chromosome),
-    # we'll sample shards directly from the total pool
-    # Each shard corresponds to a VCF file like 0000000000.vcf.bgz
-    
-    # Calculate how many shards we need based on interval distribution
-    # Aim for ~50-100 shards to get good coverage while keeping data manageable
-    n_shards_to_sample = min(100, max(50, len(intervals) // 10))
-    
-    # Set random seed for reproducibility
-    random.seed(config['sampling']['random_seed'])
-    
-    # Sample shard indices from the total pool
-    sampled_shard_indices = random.sample(range(total_shards), n_shards_to_sample)
-    
-    # Generate VCF paths
-    vcf_paths = []
-    for shard_idx in sampled_shard_indices:
-        vcf_path = f"{sharded_vcf_base}/{shard_idx:010d}.vcf.bgz"
-        vcf_paths.append(vcf_path)
-    
-    logger.info(f"Selected {len(vcf_paths)} VCF shards from {total_shards} total shards")
-    logger.info(f"Shard range: {min(sampled_shard_indices):010d} to {max(sampled_shard_indices):010d}")
-    
-    return vcf_paths
-
-
 def export_snps(mt, output_dir, config, logger, base_dir):
     """Sample exactly target SNPs with iterative approach and export as VCF."""
     target_snps = config['sampling']['target_total_snps']
@@ -760,12 +733,11 @@ def export_snps(mt, output_dir, config, logger, base_dir):
     
     summary_path = f"{output_dir}/{base_filename}_sampling_summary.json"
     
-    # Create output directory if it doesn't exist
-    try:
-        hl.hadoop_mkdir(output_dir)
-        logger.info(f"Created output directory: {output_dir}")
-    except Exception as e:
-        logger.debug(f"Directory may already exist or creation failed: {e}")
+    # Create output directory by creating a marker file
+    logger.info(f"Creating output directory: {output_dir}")
+    marker_file = f"{output_dir}/.created"
+    with hl.hadoop_open(marker_file, 'w') as f:
+        f.write('created')
     
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
