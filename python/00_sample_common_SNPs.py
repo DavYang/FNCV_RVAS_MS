@@ -215,13 +215,23 @@ def find_shards_for_intervals(intervals, config, logger):
     return vcf_paths
 
 
-def export_100k_snps(mt, output_dir, config, logger):
-    """Sample exactly 100K SNPs with iterative approach and export as VCF."""
+def export_100k_snps(mt, output_dir, config, logger, base_dir):
+    """Sample exactly target SNPs with iterative approach and export as VCF."""
     target_snps = config['sampling']['target_total_snps']
     random_seed = config['sampling']['random_seed']
     max_iterations = 10  # Prevent infinite loops
     
-    logger.info(f"Target: {target_snps:,} SNPs")
+    # Generate filename based on target SNP count
+    if target_snps >= 1000000:
+        snp_label = f"{target_snps//1000000}M"
+    elif target_snps >= 1000:
+        snp_label = f"{target_snps//1000}K"
+    else:
+        snp_label = f"{target_snps}"
+    
+    base_filename = f"{snp_label}_background_snps"
+    
+    logger.info(f"Target: {target_snps:,} SNPs ({snp_label})")
     
     # Count total variants first
     logger.info("Counting total variants in filtered data...")
@@ -282,7 +292,7 @@ def export_100k_snps(mt, output_dir, config, logger):
     logger.info(f"Coalescing to {optimal_partitions} partitions for VCF export...")
     mt_sampled = mt_sampled.naive_coalesce(optimal_partitions)
     
-    output_vcf = f"{output_dir}/100k_background_snps.vcf.bgz"
+    output_vcf = f"{output_dir}/{base_filename}.vcf.bgz"
     logger.info(f"Exporting to compressed VCF: {output_vcf}")
     
     export_start = time.time()
@@ -298,11 +308,11 @@ def export_100k_snps(mt, output_dir, config, logger):
     if optimal_partitions > 1:
         logger.info("Multiple partitions detected, copying shards locally for consolidation...")
         
-        # Create local temp directory
-        import tempfile
+        # Create local directory in results folder
         import os
-        local_temp_dir = tempfile.mkdtemp(prefix="vcf_parts_")
-        logger.info(f"Created temp directory: {local_temp_dir}")
+        local_parts_dir = f"{output_dir.replace('gs://', '/tmp/gs_')}/vcf_parts"
+        os.makedirs(local_parts_dir, exist_ok=True)
+        logger.info(f"Created local parts directory: {local_parts_dir}")
         
         # Copy all part files locally
         import subprocess
@@ -318,19 +328,19 @@ def export_100k_snps(mt, output_dir, config, logger):
             for gs_file in part_files:
                 if gs_file.strip():
                     filename = os.path.basename(gs_file)
-                    local_file = os.path.join(local_temp_dir, filename)
+                    local_file = os.path.join(local_parts_dir, filename)
                     copy_cmd = ["gsutil", "cp", gs_file, local_file]
                     subprocess.run(copy_cmd, check=True)
                     logger.debug(f"Copied {filename} locally")
             
             # Consolidate locally
             logger.info("Consolidating VCF parts locally...")
-            consolidated_vcf = f"{output_dir}/100k_background_snps_consolidated.vcf.bgz"
+            consolidated_vcf = f"{output_dir}/{base_filename}_consolidated.vcf.bgz"
             
             concat_cmd = [
                 "bcftools", "concat", 
                 "-Oz", "-o", consolidated_vcf,
-                f"{local_temp_dir}/part-*.bgz"
+                f"{local_parts_dir}/part-*.bgz"
             ]
             subprocess.run(concat_cmd, check=True)
             
@@ -340,17 +350,26 @@ def export_100k_snps(mt, output_dir, config, logger):
             logger.info(f"Consolidated VCF created: {consolidated_vcf}")
             summary['export_path'] = consolidated_vcf
             
+            # Copy consolidated VCF to local results directory
+            local_results_dir = f"{base_dir}/results"
+            os.makedirs(local_results_dir, exist_ok=True)
+            local_consolidated_vcf = f"{local_results_dir}/{base_filename}_consolidated.vcf.bgz"
+            
+            logger.info(f"Copying consolidated VCF to local results: {local_consolidated_vcf}")
+            subprocess.run(["gsutil", "cp", consolidated_vcf, local_consolidated_vcf], check=True)
+            subprocess.run(["gsutil", "cp", f"{consolidated_vcf}.tbi", f"{local_consolidated_vcf}.tbi"], check=True)
+            
             # Clean up temp directory
             import shutil
-            shutil.rmtree(local_temp_dir)
+            shutil.rmtree(local_parts_dir)
             logger.info("Cleaned up temporary files")
             
         except (subprocess.CalledProcessError, Exception) as e:
             logger.warning(f"Could not consolidate VCF: {e}")
             logger.info("Keeping multi-part VCF structure")
             # Clean up temp directory on error
-            if 'local_temp_dir' in locals() and os.path.exists(local_temp_dir):
-                shutil.rmtree(local_temp_dir)
+            if 'local_parts_dir' in locals() and os.path.exists(local_parts_dir):
+                shutil.rmtree(local_parts_dir)
     
     logger.info(f"VCF export completed in {export_time:.1f} seconds")
     
@@ -365,7 +384,7 @@ def export_100k_snps(mt, output_dir, config, logger):
         'timestamp': datetime.now().isoformat()
     }
     
-    summary_path = f"{output_dir}/100k_sampling_summary.json"
+    summary_path = f"{output_dir}/{base_filename}_sampling_summary.json"
     
     # Create output directory if it doesn't exist
     try:
@@ -390,6 +409,17 @@ def main():
     # Get timestamp for output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # Generate filename based on target SNP count
+    target_snps = config['sampling']['target_total_snps']
+    if target_snps >= 1000000:
+        snp_label = f"{target_snps//1000000}M"
+    elif target_snps >= 1000:
+        snp_label = f"{target_snps//1000}K"
+    else:
+        snp_label = f"{target_snps}"
+    
+    base_filename = f"{snp_label}_background_snps"
+    
     # Determine Output Directory
     workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
     
@@ -407,7 +437,7 @@ def main():
     logger.info(f"Detected AoU Workspace Bucket: {base_data_dir}")
     
     # Create output directory
-    output_dir = f"{base_data_dir}/results/FNCV_RVAS_MS/100k_background_snps_{timestamp}"
+    output_dir = f"{base_data_dir}/results/FNCV_RVAS_MS/{base_filename}_{timestamp}"
     logger.info(f"Output Directory: {output_dir}")
     
     try:
@@ -421,7 +451,7 @@ def main():
         logger.info(f"Filtered data - Rows: {mt.count_rows():,}, Cols: {mt.count_cols():,}")
         
         # Step 8: Sample exactly 100K SNPs and export
-        summary = export_100k_snps(mt, output_dir, config, logger)
+        summary = export_100k_snps(mt, output_dir, config, logger, BASE_DIR)
         
         logger.info("100K SNP sampling completed successfully!")
         logger.info(f"Results saved to: {output_dir}")

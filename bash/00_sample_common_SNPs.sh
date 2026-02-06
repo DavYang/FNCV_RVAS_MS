@@ -20,6 +20,19 @@ mkdir -p "$LOCAL_OUTPUT_DIR"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${LOG_DIR}/snp_sampling_${TIMESTAMP}.log"
 
+# Read target SNP count from config to determine naming
+TARGET_SNPS=$(grep "target_total_snps" "${CONFIG_DIR}/config.json" | head -1 | grep -o '[0-9]*')
+
+if [ "$TARGET_SNPS" -ge 1000000 ]; then
+    SNP_LABEL=$((TARGET_SNPS / 1000000))"M"
+elif [ "$TARGET_SNPS" -ge 1000 ]; then
+    SNP_LABEL=$((TARGET_SNPS / 1000))"K"
+else
+    SNP_LABEL="$TARGET_SNPS"
+fi
+
+BASE_FILENAME="${SNP_LABEL}_background_snps"
+
 echo "Date: ${TIMESTAMP}"
 echo "Script: ${PYTHON_DIR}/${SCRIPT_NAME}.py"
 echo "Log File: ${LOG_FILE}"
@@ -34,12 +47,13 @@ if [ ! -f "${PYTHON_DIR}/${SCRIPT_NAME}.py" ]; then
 fi
 
 echo "Starting SNP sampling from sharded VCFs..."
+echo "Target: ${TARGET_SNPS} SNPs (${BASE_FILENAME})"
 echo "This will:"
 echo "  1. Load EUR sample IDs from ancestry data"
 echo "  2. Select random genome-wide intervals"
 echo "  3. Find corresponding VCF shards"
 echo "  4. Import and filter VCFs to EUR samples"
-echo "  5. Sample exactly 100,000 SNPs (configurable)"
+echo "  5. Sample exactly ${TARGET_SNPS} SNPs"
 echo "  6. Export as compressed VCF with tabix index"
 echo ""
 
@@ -53,11 +67,11 @@ echo "To monitor progress, run:"
 echo "  tail -f ${LOG_FILE}"
 echo ""
 echo "To wait for completion and auto-copy results:"
-echo "  wait_for_job_and_copy() { wait $PID; echo 'Job completed, copying results...'; nohup gsutil -m cp -r gs://\${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/100k_background_snps_${TIMESTAMP}/ ${LOCAL_OUTPUT_DIR}/ > ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log 2>&1 & echo 'Copy started in background, check ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log'; }"
+echo "  wait_for_job_and_copy() { wait $PID; echo 'Job completed, copying results...'; nohup gsutil -m cp -r gs://\${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${BASE_FILENAME}_${TIMESTAMP}/ ${LOCAL_OUTPUT_DIR}/ > ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log 2>&1 & echo 'Copy started in background, check ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log'; }"
 echo "  wait_for_job_and_copy"
 echo ""
 echo "Or copy manually after completion:"
-echo "  nohup gsutil -m cp -r gs://\${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/100k_background_snps_${TIMESTAMP}/ ${LOCAL_OUTPUT_DIR}/ > ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log 2>&1 &"
+echo "  nohup gsutil -m cp -r gs://\${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${BASE_FILENAME}_${TIMESTAMP}/ ${LOCAL_OUTPUT_DIR}/ > ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log 2>&1 &"
 echo "  # Monitor copy progress: tail -f ${LOG_DIR}/gsutil_copy_${TIMESTAMP}.log"
 echo ""
 echo "==========================================="

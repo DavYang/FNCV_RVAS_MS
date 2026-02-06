@@ -11,7 +11,6 @@
     },
     "params": {
         "random_seed": 42,
-        "target_total_snps": 100000,
         "dated_exports": true,
         "test_mode": false,
         "single_session_mode": true
