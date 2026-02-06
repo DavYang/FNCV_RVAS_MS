@@ -116,83 +116,104 @@ def _discover_shards_lazy(chrom, config, logger):
             logger.debug(f"{chrom}: Error reading shard {file_idx:010d}: {e}")
         scanned += 1
         if scanned % 500 == 0:
-            logger.info(f"{chrom}: Shard scan progress: {scanned}/{len(all_shard_indices)} files checked")
+            logger.info(f"{chrom}: Shard scan progress: "
+                        f"{scanned}/{len(all_shard_indices)} files checked")
 
 
 def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir):
-    """Process a single chromosome: lazily discover shards, import in batches
-    until target variant count is met, sample SNPs, and export.
+    """Process a single chromosome: import one shard at a time, filter to
+    chromosome intervals, sample SNPs, and export.
     
-    Shards are discovered on-demand via a generator. Each discovered shard is
-    imported, filtered to the target chromosome, and accumulated. The loop
-    stops as soon as enough variants are collected or shards are exhausted.
+    Strategy to avoid Spark DAG explosion (union_rows OOM):
+      1. Import shard VCF, filter to chromosome.
+      2. Count variants in the shard (single Spark job).
+      3. If the shard has enough variants, sample and export directly.
+      4. If not, checkpoint the shard to a temp table, then move to next shard.
+         Checkpointing materializes the data and breaks the DAG.
+      5. After accumulating enough variants across shards, sample and export.
     """
     logger.info(f"\n=== Processing {chrom} (target: {target_snps} SNPs) ===")
     
     vcf_base = config['vcf_processing']['sharded_vcf_base'].rstrip('/')
-    batch_size = config.get('vcf_processing', {}).get('shard_batch_size', 5)
     max_shards = config.get('vcf_processing', {}).get('max_shards_per_chrom', 100)
     seed = config['sampling']['random_seed']
+    rng = random.Random(seed)
     
-    # Lazily discover shards — only scans files as we request them
     shard_generator = _discover_shards_lazy(chrom, config, logger)
     
-    mt_accumulated = None
+    # Collect VCF paths and their interval counts to decide how many shards we need
+    # We import one shard at a time, count, and stop when we have enough
+    shard_vcf_paths = []
     total_variants = 0
     shards_used = 0
     
-    while total_variants < target_snps and shards_used < max_shards:
-        # Collect next batch of shards from the generator
-        batch_shards = []
-        for shard in shard_generator:
-            batch_shards.append(shard)
-            if len(batch_shards) >= batch_size:
-                break
-        
-        if not batch_shards:
-            logger.info(f"{chrom}: No more shards available (exhausted all candidates)")
+    for shard_num in shard_generator:
+        if total_variants >= target_snps or shards_used >= max_shards:
             break
         
-        vcf_paths = [f"{vcf_base}/{shard:010d}.vcf.bgz" for shard in batch_shards]
-        logger.info(f"{chrom}: Importing batch of {len(batch_shards)} shard(s) "
-                    f"(shards used so far: {shards_used})...")
-        for vp in vcf_paths:
-            logger.info(f"{chrom}:   {vp}")
+        vcf_path = f"{vcf_base}/{shard_num:010d}.vcf.bgz"
+        logger.info(f"{chrom}: Importing shard {shard_num:010d}: {vcf_path}")
         
-        # Import and filter this batch
-        mt_batch = _import_and_filter_vcfs(vcf_paths, config, logger)
-        mt_batch = mt_batch.filter_rows(mt_batch.locus.contig == chrom)
+        # Import and count variants for this shard (single Spark job)
+        mt_shard = hl.import_vcf(
+            vcf_path,
+            reference_genome='GRCh38',
+            force_bgz=True,
+            array_elements_required=False
+        )
+        # Quick count: filter to chrom rows only, no sample filtering needed for counting
+        shard_count = mt_shard.filter_rows(
+            mt_shard.locus.contig == chrom
+        ).count_rows()
         
-        batch_count = mt_batch.count_rows()
-        shards_used += len(batch_shards)
-        logger.info(f"{chrom}: Batch yielded {batch_count:,} variants")
+        shards_used += 1
+        logger.info(f"{chrom}: Shard {shard_num:010d} has {shard_count:,} "
+                    f"{chrom} variants")
         
-        if batch_count == 0:
-            logger.info(f"{chrom}: Batch empty, trying next batch...")
+        if shard_count == 0:
+            logger.info(f"{chrom}: Shard empty, trying next...")
             continue
         
-        # Accumulate variants
-        if mt_accumulated is None:
-            mt_accumulated = mt_batch
-        else:
-            mt_accumulated = mt_accumulated.union_rows(mt_batch)
-        
-        total_variants += batch_count
-        logger.info(f"{chrom}: Accumulated {total_variants:,}/{target_snps:,} variants "
-                    f"from {shards_used} shard(s)")
+        shard_vcf_paths.append(vcf_path)
+        total_variants += shard_count
+        logger.info(f"{chrom}: Running total: {total_variants:,}/{target_snps:,} "
+                    f"variants from {shards_used} shard(s)")
     
-    if mt_accumulated is None or total_variants == 0:
-        logger.warning(f"{chrom}: No variants found after scanning {shards_used} shard(s)")
+    if not shard_vcf_paths or total_variants == 0:
+        logger.warning(f"{chrom}: No variants found after {shards_used} shard(s)")
         return None
     
-    logger.info(f"{chrom}: Final pool: {total_variants:,} variants from {shards_used} shard(s)")
+    logger.info(f"{chrom}: Collected {len(shard_vcf_paths)} shard path(s) with "
+                f"{total_variants:,} total variants. Now importing for sampling...")
     
-    # Sample target SNPs from accumulated pool
-    if total_variants > target_snps:
-        sampling_fraction = target_snps / total_variants
-        logger.info(f"{chrom}: Sampling {target_snps:,} from {total_variants:,} "
+    # Single import of all needed shards at once (Hail handles multi-VCF efficiently)
+    mt = hl.import_vcf(
+        shard_vcf_paths,
+        reference_genome='GRCh38',
+        force_bgz=True,
+        array_elements_required=False
+    )
+    
+    # Filter to EUR samples
+    eur_set = get_eur_samples_set(config, logger)
+    mt = mt.filter_cols(eur_set.contains(mt.s))
+    
+    # Split multi-allelic variants
+    mt = hl.split_multi_hts(mt)
+    
+    # Filter to target chromosome
+    mt = mt.filter_rows(mt.locus.contig == chrom)
+    
+    # Count after EUR filtering + split (may differ from raw count)
+    final_pool = mt.count_rows()
+    logger.info(f"{chrom}: Pool after EUR filtering + split: {final_pool:,} variants")
+    
+    # Sample target SNPs from pool
+    if final_pool > target_snps:
+        sampling_fraction = target_snps / final_pool
+        logger.info(f"{chrom}: Sampling {target_snps:,} from {final_pool:,} "
                     f"(fraction: {sampling_fraction:.6f})")
-        mt_sampled = mt_accumulated.sample_rows(sampling_fraction, seed=seed)
+        mt_sampled = mt.sample_rows(sampling_fraction, seed=seed)
         sampled_count = mt_sampled.count_rows()
         
         # Trim if overshot
@@ -203,17 +224,17 @@ def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir)
         
         logger.info(f"{chrom}: Sampled {sampled_count:,} variants")
     else:
-        logger.info(f"{chrom}: Using all {total_variants:,} variants "
+        logger.info(f"{chrom}: Using all {final_pool:,} variants "
                     f"(fewer than target {target_snps:,})")
-        mt_sampled = mt_accumulated
-        sampled_count = total_variants
+        mt_sampled = mt
+        sampled_count = final_pool
     
     # Export chromosome VCF
     chr_output_dir = f"{output_dir}/{chrom}"
     chr_summary = export_chromosome_vcf(mt_sampled, chr_output_dir, chrom, target_snps,
                                         config, logger, base_dir)
     chr_summary['shards_used'] = shards_used
-    chr_summary['total_pool_variants'] = total_variants
+    chr_summary['total_pool_variants'] = final_pool
     
     logger.info(f"{chrom}: Completed - exported {chr_summary['final_sampled_variants']:,} SNPs "
                 f"from {shards_used} shard(s)")
@@ -275,28 +296,6 @@ def load_ancestry_data(config, logger):
     
     logger.info(f"Found {len(eur_sample_ids)} European ancestry samples")
     return eur_sample_ids
-
-
-def _import_and_filter_vcfs(vcf_paths, config, logger):
-    """Import VCFs and apply standard filters."""
-    logger.info(f"Importing {len(vcf_paths)} VCF file(s)...")
-    
-    mt = hl.import_vcf(
-        vcf_paths,
-        reference_genome='GRCh38',
-        force_bgz=True,
-        array_elements_required=False
-    )
-    
-    # Filter to EUR samples using cached Hail Set
-    eur_set = get_eur_samples_set(config, logger)
-    mt = mt.filter_cols(eur_set.contains(mt.s))
-    
-    # Split multi-allelic variants
-    mt = hl.split_multi_hts(mt)
-    
-    return mt
-
 
 
 def main():
