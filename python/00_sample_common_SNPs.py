@@ -70,36 +70,34 @@ def calculate_chromosome_targets(target_snps, logger):
     
     return chr_targets
 
-def discover_chromosome_shards(chrom, config, logger):
-    """Discover all shard files containing intervals for a given chromosome.
+def _discover_shards_lazy(chrom, config, logger):
+    """Lazily discover shard files containing intervals for a given chromosome.
     
-    Returns an ordered list of shard numbers (shuffled for random sampling).
-    In test mode, the specified test shard is placed first, followed by any
-    additional shards for the chromosome (enabling fallback if needed).
-    Does NOT import VCFs - that is done in process_chromosome.
+    Yields shard numbers one at a time. In test mode, the specified test shard
+    is yielded first. Additional shards are discovered on-demand by scanning
+    interval list files only as the caller requests more.
     """
-    random.seed(config['sampling']['random_seed'])
-    
     interval_list_base = config['vcf_processing']['interval_list_base'].rstrip('/')
     total_interval_files = config['vcf_processing']['total_shards']
     
     test_mode = config['params'].get('test_mode', False)
     test_interval_file = config['params'].get('test_interval_file', None)
     
-    # In test mode, start with the specified shard
-    priority_shards = []
     skip_set = set()
+    
+    # In test mode, yield the priority shard first (no scanning needed)
     if test_mode and test_interval_file:
         test_shard = int(test_interval_file.split('.')[0])
-        priority_shards.append(test_shard)
+        logger.info(f"{chrom}: TEST MODE - yielding priority shard: {test_shard:010d}")
         skip_set.add(test_shard)
-        logger.info(f"{chrom}: TEST MODE - priority shard: {test_shard:010d}")
+        yield test_shard
     
-    # Scan remaining shards in shuffled order
+    # Lazily scan remaining shards in shuffled order
+    rng = random.Random(config['sampling']['random_seed'])
     all_shard_indices = [i for i in range(total_interval_files) if i not in skip_set]
-    random.shuffle(all_shard_indices)
+    rng.shuffle(all_shard_indices)
     
-    discovered = []
+    scanned = 0
     for file_idx in all_shard_indices:
         interval_list_path = f"{interval_list_base}/{file_idx:010d}.interval_list"
         try:
@@ -110,55 +108,49 @@ def discover_chromosome_shards(chrom, config, logger):
                         continue
                     parts = line.split()
                     if len(parts) >= 1 and parts[0] == chrom:
-                        discovered.append(file_idx)
+                        logger.info(f"{chrom}: Discovered matching shard {file_idx:010d} "
+                                    f"(scanned {scanned + 1} files)")
+                        yield file_idx
                     break  # Only need first data line
         except Exception as e:
             logger.debug(f"{chrom}: Error reading shard {file_idx:010d}: {e}")
-            continue
-    
-    # Priority shards first, then discovered shards
-    all_shards = priority_shards + discovered
-    logger.info(f"{chrom}: Discovered {len(all_shards)} total shards "
-                f"({len(priority_shards)} priority + {len(discovered)} additional)")
-    return all_shards
+        scanned += 1
+        if scanned % 500 == 0:
+            logger.info(f"{chrom}: Shard scan progress: {scanned}/{len(all_shard_indices)} files checked")
+
 
 def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir):
-    """Process a single chromosome: discover shards, iteratively import until
-    target is met, sample SNPs, and export.
+    """Process a single chromosome: lazily discover shards, import in batches
+    until target variant count is met, sample SNPs, and export.
     
-    Imports shards in batches, accumulating variants via union_rows. If the
-    first batch of shards doesn't contain enough variants, additional shards
-    are imported until the target is met or all shards are exhausted.
+    Shards are discovered on-demand via a generator. Each discovered shard is
+    imported, filtered to the target chromosome, and accumulated. The loop
+    stops as soon as enough variants are collected or shards are exhausted.
     """
     logger.info(f"\n=== Processing {chrom} (target: {target_snps} SNPs) ===")
-    
-    # Step 1: Discover all candidate shards for this chromosome
-    all_shards = discover_chromosome_shards(chrom, config, logger)
-    
-    if not all_shards:
-        logger.warning(f"{chrom}: No shards found")
-        return None
     
     vcf_base = config['vcf_processing']['sharded_vcf_base'].rstrip('/')
     batch_size = config.get('vcf_processing', {}).get('shard_batch_size', 5)
     max_shards = config.get('vcf_processing', {}).get('max_shards_per_chrom', 100)
     seed = config['sampling']['random_seed']
     
-    # Step 2: Iteratively import shard batches until target is met
+    # Lazily discover shards — only scans files as we request them
+    shard_generator = _discover_shards_lazy(chrom, config, logger)
+    
     mt_accumulated = None
     total_variants = 0
     shards_used = 0
-    shard_idx = 0
     
-    while total_variants < target_snps and shard_idx < len(all_shards) and shards_used < max_shards:
-        # Determine next batch of shards to import
-        remaining_budget = max_shards - shards_used
-        batch_end = min(shard_idx + batch_size, len(all_shards),
-                        shard_idx + remaining_budget)
-        batch_shards = all_shards[shard_idx:batch_end]
-        shard_idx = batch_end
+    while total_variants < target_snps and shards_used < max_shards:
+        # Collect next batch of shards from the generator
+        batch_shards = []
+        for shard in shard_generator:
+            batch_shards.append(shard)
+            if len(batch_shards) >= batch_size:
+                break
         
         if not batch_shards:
+            logger.info(f"{chrom}: No more shards available (exhausted all candidates)")
             break
         
         vcf_paths = [f"{vcf_base}/{shard:010d}.vcf.bgz" for shard in batch_shards]
@@ -195,7 +187,7 @@ def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir)
     
     logger.info(f"{chrom}: Final pool: {total_variants:,} variants from {shards_used} shard(s)")
     
-    # Step 3: Sample target SNPs from accumulated pool
+    # Sample target SNPs from accumulated pool
     if total_variants > target_snps:
         sampling_fraction = target_snps / total_variants
         logger.info(f"{chrom}: Sampling {target_snps:,} from {total_variants:,} "
@@ -216,7 +208,7 @@ def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir)
         mt_sampled = mt_accumulated
         sampled_count = total_variants
     
-    # Step 4: Export chromosome VCF
+    # Export chromosome VCF
     chr_output_dir = f"{output_dir}/{chrom}"
     chr_summary = export_chromosome_vcf(mt_sampled, chr_output_dir, chrom, target_snps,
                                         config, logger, base_dir)
