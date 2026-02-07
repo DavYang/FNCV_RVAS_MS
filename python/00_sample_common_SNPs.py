@@ -120,123 +120,183 @@ def _discover_shards_lazy(chrom, config, logger):
                         f"{scanned}/{len(all_shard_indices)} files checked")
 
 
+def _process_single_shard(vcf_path, chrom, shard_target, seed, eur_set, logger):
+    """Import a single shard, filter, sample proportionally, and return rows as Table.
+
+    Args:
+        vcf_path: GCS path to the shard VCF.
+        chrom: Target chromosome string.
+        shard_target: Number of SNPs to sample from this shard.
+        seed: Random seed for reproducible sampling.
+        eur_set: Hail literal Set of EUR sample IDs.
+        logger: Logger instance.
+
+    Returns:
+        Tuple of (Hail Table of sampled row keys, int sampled count).
+    """
+    mt = hl.import_vcf(
+        vcf_path,
+        reference_genome='GRCh38',
+        force_bgz=True,
+        array_elements_required=False
+    )
+    mt = mt.filter_cols(eur_set.contains(mt.s))
+    mt = hl.split_multi_hts(mt)
+    mt = mt.filter_rows(mt.locus.contig == chrom)
+
+    pool_count = mt.count_rows()
+    logger.info(f"{chrom}: Shard pool after EUR + split: {pool_count:,} variants")
+
+    if pool_count == 0:
+        return None, 0
+
+    if pool_count <= shard_target:
+        sampled = mt
+        sampled_count = pool_count
+    else:
+        frac = shard_target / pool_count
+        sampled = mt.sample_rows(frac, seed=seed)
+        sampled_count = sampled.count_rows()
+        if sampled_count > shard_target:
+            sampled = sampled.head(shard_target)
+            sampled_count = shard_target
+
+    return sampled, sampled_count
+
+
 def process_chromosome(chrom, target_snps, output_dir, config, logger, base_dir):
-    """Process a single chromosome: import one shard at a time, filter to
-    chromosome intervals, sample SNPs, and export.
-    
-    Strategy to avoid Spark DAG explosion (union_rows OOM):
-      1. Import shard VCF, filter to chromosome.
-      2. Count variants in the shard (single Spark job).
-      3. If the shard has enough variants, sample and export directly.
-      4. If not, checkpoint the shard to a temp table, then move to next shard.
-         Checkpointing materializes the data and breaks the DAG.
-      5. After accumulating enough variants across shards, sample and export.
+    """Process a single chromosome using per-shard proportional sampling.
+
+    Strategy (avoids union_rows entirely):
+      Phase 1 - Lightweight counting:
+        Import each shard individually and count chr variants to determine
+        how many shards are needed to reach the target.
+      Phase 2 - Per-shard proportional sampling:
+        For each shard, import -> EUR filter -> split -> sample a proportional
+        share of the target -> export to a small temp VCF.  Each shard is
+        processed and discarded independently (constant memory, no DAG growth).
+      Phase 3 - Final merge:
+        Import all small temp VCFs in one call (tiny data) -> export the
+        final chromosome VCF.
+
+    This approach keeps Spark memory bounded because at any point only one
+    shard's data is live in memory.
     """
     logger.info(f"\n=== Processing {chrom} (target: {target_snps} SNPs) ===")
-    
+
     vcf_base = config['vcf_processing']['sharded_vcf_base'].rstrip('/')
     max_shards = config.get('vcf_processing', {}).get('max_shards_per_chrom', 100)
     seed = config['sampling']['random_seed']
-    rng = random.Random(seed)
-    
+
     shard_generator = _discover_shards_lazy(chrom, config, logger)
-    
-    # Collect VCF paths and their interval counts to decide how many shards we need
-    # We import one shard at a time, count, and stop when we have enough
-    shard_vcf_paths = []
-    total_variants = 0
+
+    # ------------------------------------------------------------------
+    # Phase 1: Lightweight counting to decide which shards to use
+    # ------------------------------------------------------------------
+    shard_info = []  # list of (vcf_path, raw_count)
+    total_raw = 0
     shards_used = 0
-    
+
     for shard_num in shard_generator:
-        if total_variants >= target_snps or shards_used >= max_shards:
+        if total_raw >= target_snps or shards_used >= max_shards:
             break
-        
+
         vcf_path = f"{vcf_base}/{shard_num:010d}.vcf.bgz"
-        logger.info(f"{chrom}: Importing shard {shard_num:010d}: {vcf_path}")
-        
-        # Import and count variants for this shard (single Spark job)
-        mt_shard = hl.import_vcf(
+        logger.info(f"{chrom}: Counting shard {shard_num:010d}")
+
+        mt_tmp = hl.import_vcf(
             vcf_path,
             reference_genome='GRCh38',
             force_bgz=True,
             array_elements_required=False
         )
-        # Quick count: filter to chrom rows only, no sample filtering needed for counting
-        shard_count = mt_shard.filter_rows(
-            mt_shard.locus.contig == chrom
-        ).count_rows()
-        
+        cnt = mt_tmp.filter_rows(mt_tmp.locus.contig == chrom).count_rows()
         shards_used += 1
-        logger.info(f"{chrom}: Shard {shard_num:010d} has {shard_count:,} "
-                    f"{chrom} variants")
-        
-        if shard_count == 0:
-            logger.info(f"{chrom}: Shard empty, trying next...")
+
+        logger.info(f"{chrom}: Shard {shard_num:010d} has {cnt:,} {chrom} variants")
+        if cnt == 0:
             continue
-        
-        shard_vcf_paths.append(vcf_path)
-        total_variants += shard_count
-        logger.info(f"{chrom}: Running total: {total_variants:,}/{target_snps:,} "
-                    f"variants from {shards_used} shard(s)")
-    
-    if not shard_vcf_paths or total_variants == 0:
+
+        shard_info.append((vcf_path, cnt))
+        total_raw += cnt
+        logger.info(f"{chrom}: Running total: {total_raw:,}/{target_snps:,} "
+                    f"from {shards_used} shard(s)")
+
+    if not shard_info or total_raw == 0:
         logger.warning(f"{chrom}: No variants found after {shards_used} shard(s)")
         return None
-    
-    logger.info(f"{chrom}: Collected {len(shard_vcf_paths)} shard path(s) with "
-                f"{total_variants:,} total variants. Now importing for sampling...")
-    
-    # Single import of all needed shards at once (Hail handles multi-VCF efficiently)
-    mt = hl.import_vcf(
-        shard_vcf_paths,
+
+    logger.info(f"{chrom}: Phase 1 done - {len(shard_info)} usable shards, "
+                f"{total_raw:,} raw variants")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Per-shard proportional sampling -> temp VCFs
+    # ------------------------------------------------------------------
+    eur_set = get_eur_samples_set(config, logger)
+    temp_vcf_dir = f"{output_dir}/{chrom}_temp_shards"
+    temp_vcf_paths = []
+    total_sampled = 0
+    remaining_target = target_snps
+
+    for idx, (vcf_path, raw_count) in enumerate(shard_info):
+        # Proportional target for this shard (last shard gets remainder)
+        if idx < len(shard_info) - 1:
+            shard_target = max(1, int(target_snps * (raw_count / total_raw)))
+        else:
+            shard_target = remaining_target
+
+        shard_target = max(1, min(shard_target, remaining_target))
+        logger.info(f"{chrom}: Phase 2 - Shard {idx + 1}/{len(shard_info)}: "
+                    f"target {shard_target:,} SNPs from {vcf_path}")
+
+        mt_sampled, sampled_count = _process_single_shard(
+            vcf_path, chrom, shard_target, seed + idx, eur_set, logger
+        )
+
+        if mt_sampled is None or sampled_count == 0:
+            logger.info(f"{chrom}: Shard {idx + 1} yielded 0 after filtering, skipping")
+            continue
+
+        # Export sampled shard to a small temp VCF (constant memory)
+        temp_path = f"{temp_vcf_dir}/shard_{idx}.vcf.bgz"
+        mt_sampled = mt_sampled.naive_coalesce(1)
+        hl.export_vcf(mt_sampled, temp_path, tabix=True)
+
+        temp_vcf_paths.append(temp_path)
+        total_sampled += sampled_count
+        remaining_target -= sampled_count
+        logger.info(f"{chrom}: Shard {idx + 1} exported {sampled_count:,} SNPs "
+                    f"(cumulative: {total_sampled:,}/{target_snps:,})")
+
+        if remaining_target <= 0:
+            break
+
+    if not temp_vcf_paths or total_sampled == 0:
+        logger.warning(f"{chrom}: No variants sampled across all shards")
+        return None
+
+    # ------------------------------------------------------------------
+    # Phase 3: Merge small temp VCFs into final output
+    # ------------------------------------------------------------------
+    logger.info(f"{chrom}: Phase 3 - Merging {len(temp_vcf_paths)} temp VCFs "
+                f"({total_sampled:,} total variants)")
+
+    mt_final = hl.import_vcf(
+        temp_vcf_paths,
         reference_genome='GRCh38',
         force_bgz=True,
         array_elements_required=False
     )
-    
-    # Filter to EUR samples
-    eur_set = get_eur_samples_set(config, logger)
-    mt = mt.filter_cols(eur_set.contains(mt.s))
-    
-    # Split multi-allelic variants
-    mt = hl.split_multi_hts(mt)
-    
-    # Filter to target chromosome
-    mt = mt.filter_rows(mt.locus.contig == chrom)
-    
-    # Count after EUR filtering + split (may differ from raw count)
-    final_pool = mt.count_rows()
-    logger.info(f"{chrom}: Pool after EUR filtering + split: {final_pool:,} variants")
-    
-    # Sample target SNPs from pool
-    if final_pool > target_snps:
-        sampling_fraction = target_snps / final_pool
-        logger.info(f"{chrom}: Sampling {target_snps:,} from {final_pool:,} "
-                    f"(fraction: {sampling_fraction:.6f})")
-        mt_sampled = mt.sample_rows(sampling_fraction, seed=seed)
-        sampled_count = mt_sampled.count_rows()
-        
-        # Trim if overshot
-        if sampled_count > target_snps:
-            logger.info(f"{chrom}: Trimming {sampled_count:,} -> {target_snps:,}")
-            mt_sampled = mt_sampled.head(target_snps)
-            sampled_count = target_snps
-        
-        logger.info(f"{chrom}: Sampled {sampled_count:,} variants")
-    else:
-        logger.info(f"{chrom}: Using all {final_pool:,} variants "
-                    f"(fewer than target {target_snps:,})")
-        mt_sampled = mt
-        sampled_count = final_pool
-    
-    # Export chromosome VCF
+
     chr_output_dir = f"{output_dir}/{chrom}"
-    chr_summary = export_chromosome_vcf(mt_sampled, chr_output_dir, chrom, target_snps,
-                                        config, logger, base_dir)
+    chr_summary = export_chromosome_vcf(
+        mt_final, chr_output_dir, chrom, target_snps, config, logger, base_dir
+    )
     chr_summary['shards_used'] = shards_used
-    chr_summary['total_pool_variants'] = final_pool
-    
-    logger.info(f"{chrom}: Completed - exported {chr_summary['final_sampled_variants']:,} SNPs "
+    chr_summary['total_pool_variants'] = total_raw
+
+    logger.info(f"{chrom}: Completed - exported "
+                f"{chr_summary['final_sampled_variants']:,} SNPs "
                 f"from {shards_used} shard(s)")
     return chr_summary
 
