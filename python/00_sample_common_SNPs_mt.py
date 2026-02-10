@@ -10,11 +10,13 @@ Usage:
     python 00_sample_common_SNPs_mt.py
 """
 
+import math
 import os
 import sys
 import json
 import time
 import hail as hl
+import hailtop.fs as hfs
 from datetime import datetime
 from utils import load_config, setup_logger
 
@@ -41,6 +43,18 @@ ACAF_VARIANTS_PER_BP = 0.03826
 
 # Overshoot buffer for Bernoulli sampling (sample slightly more, trim after)
 SAMPLING_OVERSHOOT = 1.08
+
+# Maximum chunk size in base pairs (~50 Mbp, similar to chr21 which succeeded)
+CHUNK_SIZE_BP = 50_000_000
+
+
+def _cleanup_gcs_path(path: str) -> None:
+    """Recursively remove a GCS path, logging but not raising on failure."""
+    try:
+        hfs.rmtree(path)
+        logger.info(f"Cleaned up: {path}")
+    except Exception as e:
+        logger.warning(f"Failed to clean up {path}: {e}")
 
 # ---------------------------------------------------------------------------
 # Global caches
@@ -110,6 +124,25 @@ def calculate_chromosome_targets(target_snps: int) -> dict:
 # ---------------------------------------------------------------------------
 # Per-chromosome processing
 # ---------------------------------------------------------------------------
+def _make_chunk_intervals(chrom: str) -> list:
+    """Split a chromosome into sub-intervals of CHUNK_SIZE_BP.
+
+    Args:
+        chrom: Chromosome name, e.g. 'chr1'.
+
+    Returns:
+        List of (start, end) tuples in 1-based coordinates.
+    """
+    chr_size = CHR_SIZES[chrom]
+    n_chunks = math.ceil(chr_size / CHUNK_SIZE_BP)
+    intervals = []
+    for i in range(n_chunks):
+        start = i * CHUNK_SIZE_BP + 1
+        end = min((i + 1) * CHUNK_SIZE_BP, chr_size)
+        intervals.append((start, end))
+    return intervals
+
+
 def process_chromosome(
     chrom: str,
     chr_target: int,
@@ -119,15 +152,21 @@ def process_chromosome(
 ) -> dict:
     """Sample variants for a single chromosome from the ACAF splitMT.
 
-    Pipeline (single Spark job -- no count_rows):
+    Large chromosomes are split into ~50 Mbp chunks (chr21-sized) to avoid
+    OOM. Each chunk is processed independently as a small Spark job, then
+    the tiny sampled chunks are combined.
+
+    Pipeline per chunk:
       1. read_matrix_table  (lazy)
-      2. filter_intervals   (partition pruning)
+      2. filter_intervals   (partition pruning to chunk)
       3. filter_cols EUR    (lazy predicate)
       4. select_entries GT  (drop unused fields)
-      5. sample_rows        (lazy, fraction from estimated pool)
-      6. write              (single Spark job)
-      7. count written MT   (cheap, tiny data)
-      8. trim if overshot   (rare)
+      5. sample_rows        (lazy, fraction from estimated density)
+      6. write chunk MT     (small Spark job)
+
+    After all chunks:
+      7. union_rows tiny chunk MTs -> write final MT
+      8. trim if overshot
 
     Args:
         chrom: Chromosome name, e.g. 'chr21'.
@@ -147,45 +186,82 @@ def process_chromosome(
     logger.info(f"{'='*50}")
     chr_start = time.time()
 
-    # Estimate pool size from chromosome size and known ACAF density
+    # Compute sampling fraction from estimated ACAF density
     chr_size = CHR_SIZES[chrom]
     estimated_pool = int(chr_size * ACAF_VARIANTS_PER_BP)
     fraction = min(1.0, (chr_target / estimated_pool) * SAMPLING_OVERSHOOT)
-    logger.info(f"{chrom}: Estimated pool ~{estimated_pool:,}, "
+
+    # Split chromosome into manageable chunks
+    chunks = _make_chunk_intervals(chrom)
+    logger.info(f"{chrom}: {len(chunks)} chunks, estimated pool ~{estimated_pool:,}, "
                 f"sampling fraction {fraction:.6f}")
 
-    # Lazy read + partition-pruned interval filter
-    mt = hl.read_matrix_table(mt_path)
-    interval = hl.parse_locus_interval(chrom, reference_genome='GRCh38')
-    mt = hl.filter_intervals(mt, [interval])
-
-    # Filter to EUR samples and keep only GT
-    mt = mt.filter_cols(eur_set.contains(mt.s))
-    mt = mt.select_entries('GT')
-
-    # Sample (lazy) and write in a single Spark job
-    if fraction < 1.0:
-        mt_sampled = mt.sample_rows(fraction, seed=seed)
-    else:
-        mt_sampled = mt
-
     chr_output_dir = f"{output_dir}/{chrom}"
+    chunks_dir = f"{chr_output_dir}/_chunks"
+    chunk_paths = []
+
+    try:
+        for ci, (start, end) in enumerate(chunks):
+            chunk_label = f"{chrom}_chunk{ci}"
+            chunk_mt_path = f"{chunks_dir}/{chunk_label}.mt"
+
+            logger.info(f"  {chunk_label}: {start:,}-{end:,} "
+                        f"(~{(end - start) / 1e6:.0f} Mbp)")
+            chunk_start = time.time()
+
+            # Lazy read + partition-pruned interval filter for this chunk
+            mt = hl.read_matrix_table(mt_path)
+            interval = hl.parse_locus_interval(
+                f"{chrom}:{start}-{end}", reference_genome='GRCh38'
+            )
+            mt = hl.filter_intervals(mt, [interval])
+
+            # Filter to EUR samples, drop unused row/entry fields
+            mt = mt.filter_cols(eur_set.contains(mt.s))
+            mt = mt.select_entries('GT')
+            mt = mt.select_rows()
+
+            # Sample (lazy) and write this chunk
+            if fraction < 1.0:
+                mt_chunk = mt.sample_rows(fraction, seed=seed + ci)
+            else:
+                mt_chunk = mt
+
+            mt_chunk.write(chunk_mt_path, overwrite=True)
+            chunk_time = time.time() - chunk_start
+            logger.info(f"  {chunk_label}: wrote in {chunk_time:.1f}s")
+            chunk_paths.append(chunk_mt_path)
+
+    except Exception as e:
+        logger.error(f"{chrom}: Chunk processing failed at chunk {ci}: {e}")
+        _cleanup_gcs_path(chunks_dir)
+        raise
+
+    # Combine all tiny chunk MTs into the final chromosome MT
+    logger.info(f"{chrom}: Combining {len(chunk_paths)} chunks ...")
+    combine_start = time.time()
+
+    mt_combined = hl.read_matrix_table(chunk_paths[0])
+    for cp in chunk_paths[1:]:
+        mt_combined = mt_combined.union_rows(hl.read_matrix_table(cp))
+
     mt_output_path = f"{chr_output_dir}/{chrom}_background_snps.mt"
-    logger.info(f"{chrom}: Writing to {mt_output_path}")
+    mt_combined.write(mt_output_path, overwrite=True)
+    combine_time = time.time() - combine_start
+    logger.info(f"{chrom}: Combined in {combine_time:.1f}s")
 
-    write_start = time.time()
-    mt_sampled.write(mt_output_path, overwrite=True)
-    write_time = time.time() - write_start
+    # Clean up temporary chunk MTs now that final MT is written
+    _cleanup_gcs_path(chunks_dir)
 
-    # Count the tiny written MT (cheap)
-    mt_written = hl.read_matrix_table(mt_output_path)
-    final_count = mt_written.count_rows()
-    logger.info(f"{chrom}: Wrote {final_count:,} SNPs (target: {chr_target:,})")
+    # Count the final MT (cheap -- tiny)
+    mt_final = hl.read_matrix_table(mt_output_path)
+    final_count = mt_final.count_rows()
+    logger.info(f"{chrom}: {final_count:,} SNPs (target: {chr_target:,})")
 
-    # Trim if sample_rows overshot
+    # Trim if overshot
     if final_count > chr_target:
         logger.info(f"{chrom}: Trimming {final_count:,} -> {chr_target:,}")
-        mt_trimmed = mt_written.head(chr_target)
+        mt_trimmed = mt_final.head(chr_target)
         mt_trimmed.write(mt_output_path, overwrite=True)
         final_count = chr_target
 
@@ -197,9 +273,10 @@ def process_chromosome(
         'target_snps': chr_target,
         'estimated_pool': estimated_pool,
         'sampling_fraction': round(fraction, 6),
+        'n_chunks': len(chunks),
         'final_sampled_variants': final_count,
         'output_path': mt_output_path,
-        'write_time_seconds': round(write_time, 1),
+        'combine_time_seconds': round(combine_time, 1),
         'total_time_seconds': round(chr_time, 1),
         'timestamp': datetime.now().isoformat(),
     }
@@ -223,6 +300,9 @@ def main():
         spark_conf={
             'spark.driver.memory': '12g',
             'spark.executor.memory': '8g',
+            'spark.network.timeout': '600s',
+            'spark.executor.heartbeatInterval': '120s',
+            'spark.driver.maxResultSize': '4g',
         },
     )
     hl.default_reference('GRCh38')
