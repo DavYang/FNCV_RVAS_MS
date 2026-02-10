@@ -21,6 +21,28 @@ from utils import load_config, setup_logger
 logger = setup_logger("SNP_sampling_mt")
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+# GRCh38 autosome sizes
+CHR_SIZES = {
+    'chr1': 248956422, 'chr2': 242193529, 'chr3': 198295559,
+    'chr4': 190214555, 'chr5': 181538259, 'chr6': 170805979,
+    'chr7': 159345973, 'chr8': 145138636, 'chr9': 138394717,
+    'chr10': 133797422, 'chr11': 135086622, 'chr12': 133275309,
+    'chr13': 114364328, 'chr14': 107043718, 'chr15': 101991189,
+    'chr16': 90338345, 'chr17': 83257441, 'chr18': 80373285,
+    'chr19': 58617616, 'chr20': 64444167, 'chr21': 46709983,
+    'chr22': 50818468,
+}
+
+# Estimated ACAF variant density: ~99M variants / 2.88 Gbp autosomal genome
+# Calibrated from chr21 test: 1,787,412 variants / 46,709,983 bp = 0.03826
+ACAF_VARIANTS_PER_BP = 0.03826
+
+# Overshoot buffer for Bernoulli sampling (sample slightly more, trim after)
+SAMPLING_OVERSHOOT = 1.08
+
+# ---------------------------------------------------------------------------
 # Global caches
 # ---------------------------------------------------------------------------
 _eur_ids_cache = None
@@ -65,20 +87,9 @@ def calculate_chromosome_targets(target_snps: int) -> dict:
     Returns:
         dict mapping chromosome name to per-chromosome target count.
     """
-    chr_sizes = {
-        'chr1': 248956422, 'chr2': 242193529, 'chr3': 198295559,
-        'chr4': 190214555, 'chr5': 181538259, 'chr6': 170805979,
-        'chr7': 159345973, 'chr8': 145138636, 'chr9': 138394717,
-        'chr10': 133797422, 'chr11': 135086622, 'chr12': 133275309,
-        'chr13': 114364328, 'chr14': 107043718, 'chr15': 101991189,
-        'chr16': 90338345, 'chr17': 83257441, 'chr18': 80373285,
-        'chr19': 58617616, 'chr20': 64444167, 'chr21': 46709983,
-        'chr22': 50818468,
-    }
-
-    total_size = sum(chr_sizes.values())
+    total_size = sum(CHR_SIZES.values())
     chr_targets = {}
-    for chrom, size in chr_sizes.items():
+    for chrom, size in CHR_SIZES.items():
         chr_targets[chrom] = max(1, int(target_snps * (size / total_size)))
 
     # Adjust rounding so the total matches target_snps exactly
@@ -108,14 +119,15 @@ def process_chromosome(
 ) -> dict:
     """Sample variants for a single chromosome from the ACAF splitMT.
 
-    Pipeline (fused into 2 Spark jobs -- count + sample/write):
+    Pipeline (single Spark job -- no count_rows):
       1. read_matrix_table  (lazy)
       2. filter_intervals   (partition pruning)
       3. filter_cols EUR    (lazy predicate)
       4. select_entries GT  (drop unused fields)
-      5. count_rows         (Spark job 1)
-      6. sample_rows        (lazy)
-      7. write              (Spark job 2)
+      5. sample_rows        (lazy, fraction from estimated pool)
+      6. write              (single Spark job)
+      7. count written MT   (cheap, tiny data)
+      8. trim if overshot   (rare)
 
     Args:
         chrom: Chromosome name, e.g. 'chr21'.
@@ -135,6 +147,13 @@ def process_chromosome(
     logger.info(f"{'='*50}")
     chr_start = time.time()
 
+    # Estimate pool size from chromosome size and known ACAF density
+    chr_size = CHR_SIZES[chrom]
+    estimated_pool = int(chr_size * ACAF_VARIANTS_PER_BP)
+    fraction = min(1.0, (chr_target / estimated_pool) * SAMPLING_OVERSHOOT)
+    logger.info(f"{chrom}: Estimated pool ~{estimated_pool:,}, "
+                f"sampling fraction {fraction:.6f}")
+
     # Lazy read + partition-pruned interval filter
     mt = hl.read_matrix_table(mt_path)
     interval = hl.parse_locus_interval(chrom, reference_genome='GRCh38')
@@ -144,26 +163,12 @@ def process_chromosome(
     mt = mt.filter_cols(eur_set.contains(mt.s))
     mt = mt.select_entries('GT')
 
-    # Count available variants (1 Spark job)
-    pool = mt.count_rows()
-    logger.info(f"{chrom}: {pool:,} ACAF variants in pool")
-
-    if pool == 0:
-        logger.warning(f"{chrom}: No variants found, skipping")
-        return None
-
-    # Sample
-    if pool > chr_target:
-        fraction = chr_target / pool
-        logger.info(f"{chrom}: Sampling fraction {fraction:.6f} "
-                    f"({chr_target:,} / {pool:,})")
+    # Sample (lazy) and write in a single Spark job
+    if fraction < 1.0:
         mt_sampled = mt.sample_rows(fraction, seed=seed)
     else:
-        logger.info(f"{chrom}: Pool ({pool:,}) <= target ({chr_target:,}), "
-                    f"using all variants")
         mt_sampled = mt
 
-    # Write sampled MT to GCS (1 Spark job)
     chr_output_dir = f"{output_dir}/{chrom}"
     mt_output_path = f"{chr_output_dir}/{chrom}_background_snps.mt"
     logger.info(f"{chrom}: Writing to {mt_output_path}")
@@ -172,9 +177,10 @@ def process_chromosome(
     mt_sampled.write(mt_output_path, overwrite=True)
     write_time = time.time() - write_start
 
-    # Read back to get exact count (cheap -- tiny MT)
+    # Count the tiny written MT (cheap)
     mt_written = hl.read_matrix_table(mt_output_path)
     final_count = mt_written.count_rows()
+    logger.info(f"{chrom}: Wrote {final_count:,} SNPs (target: {chr_target:,})")
 
     # Trim if sample_rows overshot
     if final_count > chr_target:
@@ -189,7 +195,8 @@ def process_chromosome(
     summary = {
         'chromosome': chrom,
         'target_snps': chr_target,
-        'pool_variants': pool,
+        'estimated_pool': estimated_pool,
+        'sampling_fraction': round(fraction, 6),
         'final_sampled_variants': final_count,
         'output_path': mt_output_path,
         'write_time_seconds': round(write_time, 1),
@@ -294,20 +301,54 @@ def main():
             logger.info("=== PRODUCTION MODE: chr1-22 ===")
             all_summaries = []
             total_sampled = 0
+            failed_chroms = []
+
+            # Load progress for resume support
+            progress_path = f"{output_dir}/_progress.json"
+            completed_chroms = set()
+            try:
+                with hl.hadoop_open(progress_path, 'r') as f:
+                    progress = json.load(f)
+                    completed_chroms = set(progress.get('completed', []))
+                if completed_chroms:
+                    logger.info(f"Resuming: {len(completed_chroms)} chromosomes "
+                                f"already completed: {sorted(completed_chroms)}")
+            except Exception:
+                pass
 
             for chrom, chr_target in chr_targets.items():
-                summary = process_chromosome(
-                    chrom, chr_target, mt_path, output_dir, config,
-                )
-                if summary:
-                    all_summaries.append(summary)
-                    total_sampled += summary['final_sampled_variants']
+                if chrom in completed_chroms:
+                    logger.info(f"{chrom}: Already completed, skipping")
+                    continue
+
+                try:
+                    summary = process_chromosome(
+                        chrom, chr_target, mt_path, output_dir, config,
+                    )
+                    if summary:
+                        all_summaries.append(summary)
+                        total_sampled += summary['final_sampled_variants']
+                        completed_chroms.add(chrom)
+
+                        # Update progress file after each chromosome
+                        progress_data = {
+                            'completed': sorted(completed_chroms),
+                            'last_updated': datetime.now().isoformat(),
+                        }
+                        with hl.hadoop_open(progress_path, 'w') as f:
+                            json.dump(progress_data, f, indent=2)
+
+                except Exception as e:
+                    logger.error(f"{chrom}: FAILED - {e}")
+                    failed_chroms.append(chrom)
+                    continue
 
             overall = {
                 'target_snps': target_snps,
                 'chromosome_targets': chr_targets,
                 'total_sampled_variants': total_sampled,
                 'chromosomes_processed': len(all_summaries),
+                'chromosomes_failed': failed_chroms,
                 'output_directory': output_dir,
                 'timestamp': datetime.now().isoformat(),
             }
@@ -316,7 +357,9 @@ def main():
                 json.dump(overall, f, indent=2)
 
             logger.info("=== PRODUCTION COMPLETE ===")
-            logger.info(f"Chromosomes: {len(all_summaries)}")
+            logger.info(f"Chromosomes completed: {len(all_summaries)}")
+            if failed_chroms:
+                logger.warning(f"Chromosomes failed: {failed_chroms}")
             logger.info(f"Total SNPs: {total_sampled:,}")
             logger.info(f"Results: {output_dir}")
 
