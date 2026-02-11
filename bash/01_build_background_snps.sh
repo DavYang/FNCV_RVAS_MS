@@ -157,14 +157,9 @@ for chr in ${CHROMOSOMES}; do
     echo "Processing chr${chr} ..."
 
     # Check if output already exists (resume support)
-    OUTPUT_EXISTS=$(gsutil -u "${GOOGLE_PROJECT}" -q stat "${PLINK_OUTPUT_DIR}/background_snps_chr${chr}.bed" 2>&1 || true)
-    if echo "$OUTPUT_EXISTS" | grep -q "No URLs matched"; then
-        : # File does not exist, proceed
-    else
-        if ! echo "$OUTPUT_EXISTS" | grep -q "CommandException"; then
-            echo "  chr${chr}: Output already exists, skipping"
-            continue
-        fi
+    if gsutil -u "${GOOGLE_PROJECT}" -q stat "${PLINK_OUTPUT_DIR}/background_snps_chr${chr}.bed" 2>/dev/null; then
+        echo "  chr${chr}: Output already exists, skipping"
+        continue
     fi
 
     # Download pre-built PLINK files first (need .bim to detect chr format)
