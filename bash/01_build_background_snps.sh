@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eo pipefail
 
 # ---------------------------------------------------------------------------
 # 01_build_background_snps.sh
@@ -10,6 +10,10 @@ set -e
 #           exports plink2-compatible range/keep files, then exits.
 # Phase 2: plink2 extracts sampled loci + EUR samples from AoU pre-built
 #           per-chromosome PLINK files. No Spark/JVM involved.
+#
+# Usage (run with nohup to survive disconnects):
+#   nohup bash/01_build_background_snps.sh > /dev/null 2>&1 &
+#   tail -f logs/01_background_snps_*.log
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,16 +108,9 @@ echo "============================================================"
 echo ""
 
 cd "$PROJECT_DIR"
-echo "Starting Phase 1 (Hail) with nohup..."
-nohup python3 "$PYTHON_SCRIPT" --output-dir "$OUTPUT_DIR" > "${LOG_FILE%.log}_phase1.log" 2>&1 &
-PYTHON_PID=$!
-
-# Wait for Python script to complete and check exit code
-wait $PYTHON_PID
-PYTHON_EXIT=$?
-if [ $PYTHON_EXIT -ne 0 ]; then
-    echo "ERROR: Phase 1 (Hail) failed with exit code $PYTHON_EXIT"
-    echo "Check log: ${LOG_FILE%.log}_phase1.log"
+echo "Starting Phase 1 (Hail)..."
+if ! python3 "$PYTHON_SCRIPT" --output-dir "$OUTPUT_DIR"; then
+    echo "ERROR: Phase 1 (Hail) failed with exit code $?"
     exit 1
 fi
 
@@ -191,11 +188,11 @@ for chr in ${CHROMOSOMES}; do
     RANGE_FILE_GCS="${PLINK2_INPUTS}/chr${chr}${RANGE_SUFFIX}"
     RANGE_FILE_LOCAL="${LOCAL_TMP}/chr${chr}_variants.range"
     echo "  Downloading variant range file ..."
-    gsutil -u "${GOOGLE_PROJECT}" -q cp "${RANGE_FILE_GCS}" "${RANGE_FILE_LOCAL}" 2>/dev/null || {
+    if ! gsutil -u "${GOOGLE_PROJECT}" -q cp "${RANGE_FILE_GCS}" "${RANGE_FILE_LOCAL}" 2>/dev/null; then
         echo "  WARNING: No range file for chr${chr}, skipping"
         rm -f "${LOCAL_TMP}/chr${chr}"*
         continue
-    }
+    fi
 
     VARIANT_COUNT=$(wc -l < "${RANGE_FILE_LOCAL}")
     echo "  Variants to extract: ${VARIANT_COUNT}"
@@ -210,21 +207,14 @@ for chr in ${CHROMOSOMES}; do
     echo "  Running plink2 --extract range --keep --make-bed ..."
     LOCAL_OUT="${LOCAL_TMP}/background_snps_chr${chr}"
 
-    nohup plink2 \
+    if ! plink2 \
         --bfile "${LOCAL_TMP}/chr${chr}" \
         --extract range "${RANGE_FILE_LOCAL}" \
         --keep "${EUR_KEEP_FILE}" \
         --make-bed \
         --memory 4000 \
-        --out "${LOCAL_OUT}" > "${LOCAL_OUT}.plink2.log" 2>&1 &
-    PLINK_PID=$!
-
-    # Wait for plink2 to complete and check exit code
-    wait $PLINK_PID
-    PLINK_EXIT=$?
-    if [ $PLINK_EXIT -ne 0 ]; then
-        echo "  ERROR: plink2 failed for chr${chr} (exit code $PLINK_EXIT)"
-        echo "  Check log: ${LOCAL_OUT}.plink2.log"
+        --out "${LOCAL_OUT}"; then
+        echo "  ERROR: plink2 failed for chr${chr}"
         FAILED_CHROMS="${FAILED_CHROMS} chr${chr}"
         rm -f "${LOCAL_TMP}/chr${chr}"* "${LOCAL_OUT}"*
         continue
