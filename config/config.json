@@ -2,7 +2,8 @@
     "inputs": {
         "wgs_matrix_table": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/splitMT/hail.mt",
         "ancestry_pred": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
-        "phenotype_gwas": "gs://fc-aou-datasets-controlled/AllxAll/v1/ht/ACAF/EUR/phenotype_NS_326.1_ACAF_results.ht"
+        "phenotype_gwas": "gs://fc-aou-datasets-controlled/AllxAll/v1/ht/ACAF/EUR/phenotype_NS_326.1_ACAF_results.ht",
+        "plink_bed_base": "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/plink_bed"
     },
     "outputs": {
         "base_dir": "results",
