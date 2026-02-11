@@ -104,10 +104,18 @@ echo "============================================================"
 echo ""
 
 cd "$PROJECT_DIR"
-python3 "$PYTHON_SCRIPT" --output-dir "$OUTPUT_DIR" || {
-    echo "ERROR: Phase 1 (Hail) failed with exit code $?"
+echo "Starting Phase 1 (Hail) with nohup..."
+nohup python3 "$PYTHON_SCRIPT" --output-dir "$OUTPUT_DIR" > "${LOG_FILE%.log}_phase1.log" 2>&1 &
+PYTHON_PID=$!
+
+# Wait for Python script to complete and check exit code
+wait $PYTHON_PID
+PYTHON_EXIT=$?
+if [ $PYTHON_EXIT -ne 0 ]; then
+    echo "ERROR: Phase 1 (Hail) failed with exit code $PYTHON_EXIT"
+    echo "Check log: ${LOG_FILE%.log}_phase1.log"
     exit 1
-}
+fi
 
 echo ""
 echo "Phase 1 complete. Hail has exited. JVM memory freed."
@@ -202,18 +210,25 @@ for chr in ${CHROMOSOMES}; do
     echo "  Running plink2 --extract range --keep --make-bed ..."
     LOCAL_OUT="${LOCAL_TMP}/background_snps_chr${chr}"
 
-    plink2 \
+    nohup plink2 \
         --bfile "${LOCAL_TMP}/chr${chr}" \
         --extract range "${RANGE_FILE_LOCAL}" \
         --keep "${EUR_KEEP_FILE}" \
         --make-bed \
         --memory 4000 \
-        --out "${LOCAL_OUT}" || {
-        echo "  ERROR: plink2 failed for chr${chr}"
+        --out "${LOCAL_OUT}" > "${LOCAL_OUT}.plink2.log" 2>&1 &
+    PLINK_PID=$!
+
+    # Wait for plink2 to complete and check exit code
+    wait $PLINK_PID
+    PLINK_EXIT=$?
+    if [ $PLINK_EXIT -ne 0 ]; then
+        echo "  ERROR: plink2 failed for chr${chr} (exit code $PLINK_EXIT)"
+        echo "  Check log: ${LOCAL_OUT}.plink2.log"
         FAILED_CHROMS="${FAILED_CHROMS} chr${chr}"
         rm -f "${LOCAL_TMP}/chr${chr}"* "${LOCAL_OUT}"*
         continue
-    }
+    fi
 
     # Check output
     if [ ! -f "${LOCAL_OUT}.bed" ]; then
