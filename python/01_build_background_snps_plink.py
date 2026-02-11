@@ -11,7 +11,6 @@ Usage:
     python 01_build_background_snps_plink.py
 """
 
-import math
 import os
 import sys
 import json
@@ -43,39 +42,45 @@ CHR_SIZES = {
 ACAF_VARIANTS_PER_BP = 0.03826
 
 # Overshoot buffer for Bernoulli sampling (trim to exact target after)
-SAMPLING_OVERSHOOT = 1.10
+SAMPLING_OVERSHOOT = 1.02
 
 # ---------------------------------------------------------------------------
 # Global caches
 # ---------------------------------------------------------------------------
-_eur_ids_cache = None
-_eur_set_cache = None
+_eur_ht_cache = None
 
 
-def _load_eur_sample_ids(config: dict) -> list:
-    """Load EUR ancestry sample IDs from the ancestry TSV (cached)."""
-    global _eur_ids_cache
-    if _eur_ids_cache is None:
-        logger.info("Loading EUR ancestry sample IDs ...")
+def _get_eur_samples_ht(config: dict, tmp_dir: str) -> hl.Table:
+    """Return a checkpointed Hail Table of EUR sample IDs for semi_join_cols.
+
+    Uses a Table-based approach instead of hl.literal(set(...)) to avoid
+    embedding 234K sample IDs into the Spark DAG, which crashes the JVM.
+    The table is checkpointed to tmp_dir so it is materialized once and
+    reused efficiently across per-chromosome iterations.
+
+    Args:
+        config: Loaded config dict.
+        tmp_dir: GCS path for temporary checkpoint files.
+
+    Returns:
+        Hail Table keyed by 's' (sample ID string).
+    """
+    global _eur_ht_cache
+    if _eur_ht_cache is None:
+        logger.info("Loading EUR ancestry sample IDs as Table ...")
         ancestry_ht = hl.import_table(
             config['inputs']['ancestry_pred'],
             impute=True,
             types={'research_id': hl.tstr, 'ancestry_pred': hl.tstr},
         )
         eur_ht = ancestry_ht.filter(ancestry_ht.ancestry_pred == 'eur')
-        _eur_ids_cache = eur_ht.aggregate(hl.agg.collect(eur_ht.research_id))
-        logger.info(f"Cached {len(_eur_ids_cache)} EUR sample IDs")
-    return _eur_ids_cache
-
-
-def _get_eur_set(config: dict) -> hl.expr.SetExpression:
-    """Return a Hail literal Set of EUR sample IDs (cached)."""
-    global _eur_set_cache
-    if _eur_set_cache is None:
-        ids = _load_eur_sample_ids(config)
-        _eur_set_cache = hl.literal(set(ids))
-        logger.info("Created Hail Set for EUR filtering")
-    return _eur_set_cache
+        eur_ht = eur_ht.select(s=eur_ht.research_id).key_by('s')
+        eur_ht_path = f"{tmp_dir}/eur_samples.ht"
+        eur_ht = eur_ht.checkpoint(eur_ht_path, overwrite=True)
+        n_eur = eur_ht.count()
+        logger.info(f"EUR samples Table: {n_eur:,} samples, checkpointed to {eur_ht_path}")
+        _eur_ht_cache = eur_ht
+    return _eur_ht_cache
 
 
 def _cleanup_gcs_path(path: str) -> None:
@@ -206,10 +211,6 @@ def pass1_sample_loci(
     for ht in per_chr_tables[1:]:
         ht_combined = ht_combined.union(ht)
 
-    # Cap at global target before writing (avoids read-back-and-rewrite)
-    logger.info(f"Capping at {global_target:,} loci before write ...")
-    ht_combined = ht_combined.head(global_target)
-
     # Write the combined sampled loci Table
     logger.info(f"Writing sampled loci Table to {output_ht_path} ...")
     ht_combined.write(output_ht_path, overwrite=True)
@@ -261,7 +262,7 @@ def pass2_export_plink(
     For each chromosome:
       1. filter_intervals for partition pruning
       2. semi_join_rows against sampled loci (tiny Table)
-      3. filter_cols to EUR samples
+      3. semi_join_cols to EUR samples
       4. select_entries('GT'), select_rows(), select_cols()
       5. export_plink with FID=IID=research_id
 
@@ -275,7 +276,7 @@ def pass2_export_plink(
     Returns:
         Summary dict with per-chromosome variant/sample counts.
     """
-    eur_set = _get_eur_set(config)
+    eur_samples_ht = _get_eur_samples_ht(config, f"{output_dir}/tmp")
 
     logger.info("=" * 60)
     logger.info("PASS 2: Extracting genotypes and exporting PLINK")
@@ -315,26 +316,31 @@ def pass2_export_plink(
             chr_start = time.time()
             logger.info(f"\n  Processing {chrom} ...")
 
-            # Filter sampled loci to this chromosome
-            ht_chr_loci = ht_loci.filter(ht_loci.locus.contig == chrom)
+            # Parse interval once, reuse for both loci and MT pruning
+            chr_interval = hl.parse_locus_interval(
+                f"{chrom}:1-{CHR_SIZES[chrom]}", reference_genome='GRCh38'
+            )
+
+            # Filter sampled loci to this chromosome via interval pruning
+            ht_chr_loci = hl.filter_intervals(ht_loci, [chr_interval])
 
             # Read MT with partition pruning for this chromosome
             mt = hl.read_matrix_table(mt_path)
-            interval = hl.parse_locus_interval(
-                f"{chrom}:1-{CHR_SIZES[chrom]}", reference_genome='GRCh38'
-            )
-            mt = hl.filter_intervals(mt, [interval])
+            mt = hl.filter_intervals(mt, [chr_interval])
 
             # Restrict to sampled loci only (the key operation)
             mt = mt.semi_join_rows(ht_chr_loci)
 
-            # Filter to EUR samples
-            mt = mt.filter_cols(eur_set.contains(mt.s))
+            # Filter to EUR samples via distributed Table join
+            mt = mt.semi_join_cols(eur_samples_ht)
 
             # Drop all unused fields to minimize data
             mt = mt.select_entries('GT')
             mt = mt.select_rows()
             mt = mt.select_cols()
+
+            # Reduce empty partitions before checkpoint
+            mt = mt.naive_coalesce(max(1, mt.n_partitions() // 50))
 
             # Checkpoint to break DAG before export_plink
             logger.info(f"  {chrom}: Checkpointing filtered MT to {checkpoint_path} ...")
@@ -484,27 +490,29 @@ def main():
             mt_path, loci_ht_path, output_dir, chr_targets, config,
         )
 
-        # Write Pass 2 summary
-        p2_summary_path = f"{output_dir}/pass2_summary.json"
-        with hl.hadoop_open(p2_summary_path, 'w') as f:
-            json.dump(pass2_summary, f, indent=2, default=str)
-        logger.info(f"Pass 2 summary written to {p2_summary_path}")
+        # Write summaries (wrapped in try/except to survive JVM crashes)
+        try:
+            p2_summary_path = f"{output_dir}/pass2_summary.json"
+            with hl.hadoop_open(p2_summary_path, 'w') as f:
+                json.dump(pass2_summary, f, indent=2, default=str)
+            logger.info(f"Pass 2 summary written to {p2_summary_path}")
 
-        # Write overall summary
-        overall = {
-            'target_snps': target_snps,
-            'test_mode': test_mode,
-            'test_chromosome': test_chromosome if test_mode else None,
-            'output_directory': output_dir,
-            'plink_dir': f"{output_dir}/null_model_data",
-            'loci_table': loci_ht_path,
-            'pass1': pass1_summary,
-            'pass2': pass2_summary,
-            'timestamp': datetime.now().isoformat(),
-        }
-        overall_path = f"{output_dir}/{base_filename}_overall_summary.json"
-        with hl.hadoop_open(overall_path, 'w') as f:
-            json.dump(overall, f, indent=2, default=str)
+            overall = {
+                'target_snps': target_snps,
+                'test_mode': test_mode,
+                'test_chromosome': test_chromosome if test_mode else None,
+                'output_directory': output_dir,
+                'plink_dir': f"{output_dir}/null_model_data",
+                'loci_table': loci_ht_path,
+                'pass1': pass1_summary,
+                'pass2': pass2_summary,
+                'timestamp': datetime.now().isoformat(),
+            }
+            overall_path = f"{output_dir}/{base_filename}_overall_summary.json"
+            with hl.hadoop_open(overall_path, 'w') as f:
+                json.dump(overall, f, indent=2, default=str)
+        except Exception as summary_err:
+            logger.warning(f"Failed to write summary JSONs (JVM may be down): {summary_err}")
 
         logger.info("=" * 60)
         if test_mode:
@@ -513,7 +521,6 @@ def main():
             logger.info("=== PRODUCTION COMPLETE ===")
         logger.info(f"PLINK files: {output_dir}/null_model_data/")
         logger.info(f"Sampled loci Table: {loci_ht_path}")
-        logger.info(f"Overall summary: {overall_path}")
         logger.info("=" * 60)
 
     except Exception as e:
