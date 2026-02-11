@@ -414,11 +414,11 @@ def main():
     hl.init(
         log='/tmp/hail_background_snps.log',
         spark_conf={
-            'spark.driver.memory': '12g',
-            'spark.executor.memory': '8g',
+            'spark.driver.memory': '8g',
+            'spark.executor.memory': '4g',
             'spark.network.timeout': '600s',
             'spark.executor.heartbeatInterval': '120s',
-            'spark.driver.maxResultSize': '4g',
+            'spark.driver.maxResultSize': '2g',
         },
     )
     hl.default_reference('GRCh38')
