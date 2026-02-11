@@ -310,6 +310,7 @@ def pass2_export_plink(
             logger.info(f"  {chrom}: Already completed, skipping")
             continue
 
+        checkpoint_path = f"{output_dir}/tmp/{chrom}_checkpoint.mt"
         try:
             chr_start = time.time()
             logger.info(f"\n  Processing {chrom} ...")
@@ -335,6 +336,11 @@ def pass2_export_plink(
             mt = mt.select_rows()
             mt = mt.select_cols()
 
+            # Checkpoint to break DAG before export_plink
+            logger.info(f"  {chrom}: Checkpointing filtered MT to {checkpoint_path} ...")
+            mt = mt.checkpoint(checkpoint_path, overwrite=True)
+            logger.info(f"  {chrom}: Checkpoint written, exporting PLINK ...")
+
             # Export PLINK with FID = IID = research_id (mt.s)
             plink_prefix = f"{plink_dir}/{chrom}_background"
             logger.info(f"  {chrom}: Exporting PLINK to {plink_prefix} ...")
@@ -344,6 +350,9 @@ def pass2_export_plink(
                 fam_id=mt.s,
                 ind_id=mt.s,
             )
+
+            # Clean up checkpoint
+            _cleanup_gcs_path(checkpoint_path)
 
             chr_time = time.time() - chr_start
             per_chr_results[chrom] = {
@@ -364,6 +373,7 @@ def pass2_export_plink(
 
         except Exception as e:
             logger.error(f"  {chrom}: FAILED - {e}")
+            _cleanup_gcs_path(checkpoint_path)
             failed_chroms.append(chrom)
             continue
 
