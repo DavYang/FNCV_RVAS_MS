@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""Build background SNP PLINK files for Regenie null model (Phase 1).
+"""Build background SNP PLINK files for Regenie Step 1 null model.
 
-Two-pass pipeline to sample ~500K common SNPs from the AoU ACAF splitMT
-and export per-chromosome PLINK files for EUR ancestry samples.
+Samples ~500K common SNPs from the AoU ACAF splitMT and exports
+per-chromosome PLINK files for EUR ancestry samples.
 
 Pass 1 (cheap): Sample loci from the rows Table (no entry data).
-Pass 2 (targeted): Extract genotypes at sampled loci, export PLINK.
+Pass 2 (targeted): Extract genotypes at sampled loci, checkpoint,
+                    then export_plink per chromosome.
 
 Usage:
-    python 01_build_background_snps_plink.py
+    python 01_build_background_snps.py
 """
 
+import json
 import os
 import sys
-import json
 import time
+
 import hail as hl
 import hailtop.fs as hfs
 from datetime import datetime
+
 from utils import load_config, setup_logger
 
-logger = setup_logger("background_snps_plink")
+logger = setup_logger("background_snps")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,14 +41,11 @@ CHR_SIZES = {
     'chr22': 50818468,
 }
 
-# Estimated ACAF variant density (calibrated from chr21 test run)
 ACAF_VARIANTS_PER_BP = 0.03826
-
-# Overshoot buffer for Bernoulli sampling (trim to exact target after)
 SAMPLING_OVERSHOOT = 1.02
 
 # ---------------------------------------------------------------------------
-# Global caches
+# EUR sample Table (cached across chromosomes)
 # ---------------------------------------------------------------------------
 _eur_ht_cache = None
 
@@ -54,9 +54,8 @@ def _get_eur_samples_ht(config: dict, tmp_dir: str) -> hl.Table:
     """Return a checkpointed Hail Table of EUR sample IDs for semi_join_cols.
 
     Uses a Table-based approach instead of hl.literal(set(...)) to avoid
-    embedding 234K sample IDs into the Spark DAG, which crashes the JVM.
-    The table is checkpointed to tmp_dir so it is materialized once and
-    reused efficiently across per-chromosome iterations.
+    embedding ~234K sample IDs into the Spark DAG, which crashes the JVM.
+    Checkpointed once and reused across per-chromosome iterations.
 
     Args:
         config: Loaded config dict.
@@ -78,7 +77,7 @@ def _get_eur_samples_ht(config: dict, tmp_dir: str) -> hl.Table:
         eur_ht_path = f"{tmp_dir}/eur_samples.ht"
         eur_ht = eur_ht.checkpoint(eur_ht_path, overwrite=True)
         n_eur = eur_ht.count()
-        logger.info(f"EUR samples Table: {n_eur:,} samples, checkpointed to {eur_ht_path}")
+        logger.info(f"EUR samples: {n_eur:,} (checkpointed to {eur_ht_path})")
         _eur_ht_cache = eur_ht
     return _eur_ht_cache
 
@@ -102,7 +101,7 @@ def calculate_chromosome_targets(target_snps: int) -> dict:
         target_snps: Total number of SNPs to sample genome-wide.
 
     Returns:
-        dict mapping chromosome name to per-chromosome target count.
+        Dict mapping chromosome name to per-chromosome target count.
     """
     total_size = sum(CHR_SIZES.values())
     chr_targets = {}
@@ -113,13 +112,18 @@ def calculate_chromosome_targets(target_snps: int) -> dict:
     current_total = sum(chr_targets.values())
     remaining = target_snps - current_total
     if remaining != 0:
-        sorted_chroms = sorted(chr_targets, key=lambda c: chr_targets[c], reverse=True)
+        sorted_chroms = sorted(
+            chr_targets, key=lambda c: chr_targets[c], reverse=True
+        )
         for i, chrom in enumerate(sorted_chroms):
             if i >= abs(remaining):
                 break
             chr_targets[chrom] += 1 if remaining > 0 else -1
 
-    logger.info(f"Total target: {sum(chr_targets.values()):,} across {len(chr_targets)} autosomes")
+    logger.info(
+        f"Total target: {sum(chr_targets.values()):,} "
+        f"across {len(chr_targets)} autosomes"
+    )
     return chr_targets
 
 
@@ -156,7 +160,6 @@ def pass1_sample_loci(
     logger.info("=" * 60)
     pass1_start = time.time()
 
-    # Read only the rows table -- zero entry data
     logger.info(f"Reading rows Table from {mt_path} ...")
     mt = hl.read_matrix_table(mt_path)
     ht_rows = mt.rows().select()
@@ -172,55 +175,54 @@ def pass1_sample_loci(
 
         chr_start = time.time()
 
-        # Filter to this chromosome using interval pruning
         interval = hl.parse_locus_interval(
             f"{chrom}:1-{CHR_SIZES[chrom]}", reference_genome='GRCh38'
         )
         ht_chr = hl.filter_intervals(ht_rows, [interval])
 
-        # Exclude HLA region on chr6 if configured
         if avoid_hla and chrom == 'chr6' and hla_region:
             hla_chrom = f"chr{hla_region['chrom']}"
             hla_start = hla_region['start']
             hla_end = hla_region['end']
             hla_interval = hl.parse_locus_interval(
-                f"{hla_chrom}:{hla_start}-{hla_end}", reference_genome='GRCh38'
+                f"{hla_chrom}:{hla_start}-{hla_end}",
+                reference_genome='GRCh38',
             )
             ht_chr = ht_chr.filter(~hla_interval.contains(ht_chr.locus))
-            logger.info(f"  {chrom}: Excluded HLA region "
-                        f"{hla_chrom}:{hla_start}-{hla_end}")
+            logger.info(
+                f"  {chrom}: Excluded HLA region "
+                f"{hla_chrom}:{hla_start}-{hla_end}"
+            )
 
-        # Compute sampling fraction from estimated density
         estimated_pool = int(CHR_SIZES[chrom] * ACAF_VARIANTS_PER_BP)
-        fraction = min(1.0, (chr_target / estimated_pool) * SAMPLING_OVERSHOOT)
+        fraction = min(
+            1.0, (chr_target / estimated_pool) * SAMPLING_OVERSHOOT
+        )
 
-        # Bernoulli sampling using rand_unif on the rows Table
         chr_seed = seed + AUTOSOMES.index(chrom)
-        ht_sampled = ht_chr.filter(hl.rand_unif(0.0, 1.0, seed=chr_seed) < fraction)
+        ht_sampled = ht_chr.filter(
+            hl.rand_unif(0.0, 1.0, seed=chr_seed) < fraction
+        )
 
         per_chr_tables.append(ht_sampled)
         chr_time = time.time() - chr_start
-        logger.info(f"  {chrom}: target={chr_target:,}, "
-                    f"est_pool={estimated_pool:,}, "
-                    f"fraction={fraction:.6f} ({chr_time:.1f}s)")
+        logger.info(
+            f"  {chrom}: target={chr_target:,}, "
+            f"est_pool={estimated_pool:,}, "
+            f"fraction={fraction:.6f} ({chr_time:.1f}s)"
+        )
 
-    # Union all per-chromosome sampled Tables
-    global_target = sum(chr_targets.values())
     logger.info("Combining per-chromosome sampled loci ...")
     ht_combined = per_chr_tables[0]
     for ht in per_chr_tables[1:]:
         ht_combined = ht_combined.union(ht)
 
-    # Write the combined sampled loci Table
     logger.info(f"Writing sampled loci Table to {output_ht_path} ...")
     ht_combined.write(output_ht_path, overwrite=True)
 
-    # Read back and count per chromosome
     ht_final = hl.read_table(output_ht_path)
     total_count = ht_final.count()
-    logger.info(f"Pass 1 complete: {total_count:,} loci sampled")
 
-    # Get per-chromosome breakdown
     chr_counts = ht_final.group_by(
         contig=ht_final.locus.contig
     ).aggregate(n=hl.agg.count())
@@ -230,9 +232,11 @@ def pass1_sample_loci(
         n = chr_counts_dict.get(chrom, 0)
         target = chr_targets.get(chrom, 0)
         per_chr_counts[chrom] = {'sampled': n, 'target': target}
-        logger.info(f"  {chrom}: {n:,} sampled (target: {target:,})")
+        if n > 0 or target > 0:
+            logger.info(f"  {chrom}: {n:,} sampled (target: {target:,})")
 
     pass1_time = time.time() - pass1_start
+    global_target = sum(chr_targets.values())
     summary = {
         'pass': 1,
         'total_loci_sampled': total_count,
@@ -261,20 +265,21 @@ def pass2_export_plink(
 
     For each chromosome:
       1. filter_intervals for partition pruning
-      2. semi_join_rows against sampled loci (tiny Table)
-      3. semi_join_cols to EUR samples
-      4. select_entries('GT'), select_rows(), select_cols()
-      5. export_plink with FID=IID=research_id
+      2. semi_join_rows against sampled loci
+      3. semi_join_cols to EUR samples (Table-based, no hl.literal)
+      4. select_entries('GT'), drop row/col fields
+      5. checkpoint to break DAG
+      6. export_plink with FID=IID=research_id
 
     Args:
         mt_path: GCS path to ACAF splitMT.
         loci_ht_path: GCS path to sampled loci Hail Table from Pass 1.
-        output_dir: GCS base directory for PLINK output.
+        output_dir: GCS base directory for output.
         chr_targets: Dict of chromosome -> target SNP count.
         config: Loaded config dict.
 
     Returns:
-        Summary dict with per-chromosome variant/sample counts.
+        Summary dict with per-chromosome results.
     """
     eur_samples_ht = _get_eur_samples_ht(config, f"{output_dir}/tmp")
 
@@ -283,7 +288,6 @@ def pass2_export_plink(
     logger.info("=" * 60)
     pass2_start = time.time()
 
-    # Load the sampled loci Table
     logger.info(f"Reading sampled loci from {loci_ht_path} ...")
     ht_loci = hl.read_table(loci_ht_path)
 
@@ -291,7 +295,7 @@ def pass2_export_plink(
     per_chr_results = {}
     failed_chroms = []
 
-    # Load progress for resume support
+    # Resume support
     progress_path = f"{output_dir}/_pass2_progress.json"
     completed_chroms = set()
     try:
@@ -299,8 +303,10 @@ def pass2_export_plink(
             progress = json.load(f)
             completed_chroms = set(progress.get('completed', []))
         if completed_chroms:
-            logger.info(f"Resuming Pass 2: {len(completed_chroms)} chromosomes "
-                        f"already completed: {sorted(completed_chroms)}")
+            logger.info(
+                f"Resuming Pass 2: {len(completed_chroms)} chromosomes "
+                f"already done: {sorted(completed_chroms)}"
+            )
     except Exception:
         pass
 
@@ -314,40 +320,37 @@ def pass2_export_plink(
         checkpoint_path = f"{output_dir}/tmp/{chrom}_checkpoint.mt"
         try:
             chr_start = time.time()
-            logger.info(f"\n  Processing {chrom} ...")
+            logger.info(f"  Processing {chrom} ...")
 
-            # Parse interval once, reuse for both loci and MT pruning
             chr_interval = hl.parse_locus_interval(
-                f"{chrom}:1-{CHR_SIZES[chrom]}", reference_genome='GRCh38'
+                f"{chrom}:1-{CHR_SIZES[chrom]}",
+                reference_genome='GRCh38',
             )
 
-            # Filter sampled loci to this chromosome via interval pruning
+            # Filter sampled loci to this chromosome
             ht_chr_loci = hl.filter_intervals(ht_loci, [chr_interval])
 
-            # Read MT with partition pruning for this chromosome
+            # Read MT with partition pruning
             mt = hl.read_matrix_table(mt_path)
             mt = hl.filter_intervals(mt, [chr_interval])
 
-            # Restrict to sampled loci only (the key operation)
+            # Restrict to sampled loci (rows) and EUR samples (cols)
             mt = mt.semi_join_rows(ht_chr_loci)
-
-            # Filter to EUR samples via distributed Table join
             mt = mt.semi_join_cols(eur_samples_ht)
 
-            # Drop all unused fields to minimize data
+            # Keep only GT entries, drop all row/col annotations
             mt = mt.select_entries('GT')
             mt = mt.select_rows()
             mt = mt.select_cols()
 
-            # Reduce empty partitions before checkpoint
+            # Reduce partitions before checkpoint
             mt = mt.naive_coalesce(max(1, mt.n_partitions() // 50))
 
             # Checkpoint to break DAG before export_plink
-            logger.info(f"  {chrom}: Checkpointing filtered MT to {checkpoint_path} ...")
+            logger.info(f"  {chrom}: Checkpointing filtered MT ...")
             mt = mt.checkpoint(checkpoint_path, overwrite=True)
-            logger.info(f"  {chrom}: Checkpoint written, exporting PLINK ...")
 
-            # Export PLINK with FID = IID = research_id (mt.s)
+            # Export PLINK from the clean checkpoint
             plink_prefix = f"{plink_dir}/{chrom}_background"
             logger.info(f"  {chrom}: Exporting PLINK to {plink_prefix} ...")
             hl.export_plink(
@@ -357,7 +360,6 @@ def pass2_export_plink(
                 ind_id=mt.s,
             )
 
-            # Clean up checkpoint
             _cleanup_gcs_path(checkpoint_path)
 
             chr_time = time.time() - chr_start
@@ -369,7 +371,7 @@ def pass2_export_plink(
             completed_chroms.add(chrom)
             logger.info(f"  {chrom}: PLINK exported in {chr_time:.1f}s")
 
-            # Update progress after each chromosome
+            # Persist progress
             progress_data = {
                 'completed': sorted(completed_chroms),
                 'last_updated': datetime.now().isoformat(),
@@ -394,7 +396,9 @@ def pass2_export_plink(
         'timestamp': datetime.now().isoformat(),
     }
 
-    logger.info(f"\nPass 2 done: {len(completed_chroms)} chromosomes in {pass2_time:.1f}s")
+    logger.info(
+        f"Pass 2 done: {len(completed_chroms)} chromosomes in {pass2_time:.1f}s"
+    )
     if failed_chroms:
         logger.warning(f"Failed chromosomes: {failed_chroms}")
 
@@ -407,9 +411,8 @@ def pass2_export_plink(
 def main():
     config = load_config("config/config.json")
 
-    # Initialize Hail with hardened Spark config
     hl.init(
-        log='/tmp/hail_background_snps_plink.log',
+        log='/tmp/hail_background_snps.log',
         spark_conf={
             'spark.driver.memory': '12g',
             'spark.executor.memory': '8g',
@@ -420,7 +423,6 @@ def main():
     )
     hl.default_reference('GRCh38')
 
-    # Resolve workspace bucket
     workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
     if not workspace_bucket:
         logger.error("WORKSPACE_BUCKET environment variable not set")
@@ -429,12 +431,11 @@ def main():
         workspace_bucket = f"gs://{workspace_bucket}"
     logger.info(f"Workspace bucket: {workspace_bucket}")
 
-    # Source MT path
     mt_path = config['inputs']['wgs_matrix_table']
-    logger.info(f"Source MT: {mt_path}")
-
-    # Output directory
     target_snps = config['sampling']['target_total_snps']
+    test_mode = config['params'].get('test_mode', False)
+    test_chromosome = config['params'].get('test_chromosome', None)
+
     if target_snps >= 1_000_000:
         snp_label = f"{target_snps // 1_000_000}M"
     elif target_snps >= 1_000:
@@ -443,59 +444,63 @@ def main():
         snp_label = str(target_snps)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_filename = f"{snp_label}_background_snps"
-    output_dir = (f"{workspace_bucket}/results/FNCV_RVAS_MS/"
-                  f"{base_filename}_{timestamp}")
+    output_dir = (
+        f"{workspace_bucket}/results/FNCV_RVAS_MS/"
+        f"{snp_label}_background_snps_{timestamp}"
+    )
+
+    logger.info(f"Source MT: {mt_path}")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Target SNPs: {target_snps:,}")
 
-    # Paths for intermediate and final outputs
-    loci_ht_path = f"{output_dir}/sampled_loci.ht"
-
-    # Test mode vs production
-    test_mode = config['params'].get('test_mode', False)
-    test_chromosome = config['params'].get('test_chromosome', None)
-
-    # Calculate per-chromosome targets
     chr_targets = calculate_chromosome_targets(target_snps)
 
-    # In test mode, restrict to a single chromosome
     if test_mode and test_chromosome:
         logger.info(f"=== TEST MODE: {test_chromosome} only ===")
         if test_chromosome not in chr_targets:
             logger.error(f"{test_chromosome} not in autosome targets")
             sys.exit(1)
         chr_targets = {test_chromosome: chr_targets[test_chromosome]}
-        logger.info(f"Target for {test_chromosome}: {chr_targets[test_chromosome]:,}")
+        logger.info(
+            f"Target for {test_chromosome}: "
+            f"{chr_targets[test_chromosome]:,}"
+        )
     else:
         logger.info("=== PRODUCTION MODE: chr1-22 ===")
 
+    loci_ht_path = f"{output_dir}/sampled_loci.ht"
+
     try:
-        # --- Pass 1: Sample loci (rows only, no entry data) ---
-        if hfs.exists(f"{loci_ht_path}/_SUCCESS") or hfs.exists(f"{loci_ht_path}/metadata.json.gz"):
-            logger.info(f"Sampled loci Table already exists at {loci_ht_path}, skipping Pass 1")
-            pass1_summary = {'skipped': True, 'output_ht_path': loci_ht_path}
+        # --- Pass 1: Sample loci (rows only) ---
+        if (hfs.exists(f"{loci_ht_path}/_SUCCESS")
+                or hfs.exists(f"{loci_ht_path}/metadata.json.gz")):
+            logger.info(
+                f"Sampled loci Table exists at {loci_ht_path}, "
+                "skipping Pass 1"
+            )
+            pass1_summary = {
+                'skipped': True,
+                'output_ht_path': loci_ht_path,
+            }
         else:
             pass1_summary = pass1_sample_loci(
                 mt_path, loci_ht_path, chr_targets, config,
             )
 
-            # Write Pass 1 summary
-            p1_summary_path = f"{output_dir}/pass1_summary.json"
-            with hl.hadoop_open(p1_summary_path, 'w') as f:
-                json.dump(pass1_summary, f, indent=2, default=str)
-            logger.info(f"Pass 1 summary written to {p1_summary_path}")
+        p1_path = f"{output_dir}/pass1_summary.json"
+        with hl.hadoop_open(p1_path, 'w') as f:
+            json.dump(pass1_summary, f, indent=2, default=str)
+        logger.info(f"Pass 1 summary: {p1_path}")
 
         # --- Pass 2: Extract genotypes + export PLINK ---
         pass2_summary = pass2_export_plink(
             mt_path, loci_ht_path, output_dir, chr_targets, config,
         )
 
-        # Write summaries (wrapped in try/except to survive JVM crashes)
         try:
-            p2_summary_path = f"{output_dir}/pass2_summary.json"
-            with hl.hadoop_open(p2_summary_path, 'w') as f:
+            p2_path = f"{output_dir}/pass2_summary.json"
+            with hl.hadoop_open(p2_path, 'w') as f:
                 json.dump(pass2_summary, f, indent=2, default=str)
-            logger.info(f"Pass 2 summary written to {p2_summary_path}")
 
             overall = {
                 'target_snps': target_snps,
@@ -508,11 +513,13 @@ def main():
                 'pass2': pass2_summary,
                 'timestamp': datetime.now().isoformat(),
             }
-            overall_path = f"{output_dir}/{base_filename}_overall_summary.json"
+            overall_path = f"{output_dir}/{snp_label}_background_snps_summary.json"
             with hl.hadoop_open(overall_path, 'w') as f:
                 json.dump(overall, f, indent=2, default=str)
         except Exception as summary_err:
-            logger.warning(f"Failed to write summary JSONs (JVM may be down): {summary_err}")
+            logger.warning(
+                f"Failed to write summary JSONs: {summary_err}"
+            )
 
         logger.info("=" * 60)
         if test_mode:
@@ -520,7 +527,7 @@ def main():
         else:
             logger.info("=== PRODUCTION COMPLETE ===")
         logger.info(f"PLINK files: {output_dir}/null_model_data/")
-        logger.info(f"Sampled loci Table: {loci_ht_path}")
+        logger.info(f"Sampled loci: {loci_ht_path}")
         logger.info("=" * 60)
 
     except Exception as e:
