@@ -181,10 +181,7 @@ def pass1_sample_loci(
             hla_interval = hl.parse_locus_interval(
                 f"{hla_chrom}:{hla_start}-{hla_end}", reference_genome='GRCh38'
             )
-            ht_chr = ht_chr.filter(
-                ~hl.is_defined(hla_interval.contains(ht_chr.locus))
-                | ~hla_interval.contains(ht_chr.locus)
-            )
+            ht_chr = ht_chr.filter(~hla_interval.contains(ht_chr.locus))
             logger.info(f"  {chrom}: Excluded HLA region "
                         f"{hla_chrom}:{hla_start}-{hla_end}")
 
@@ -203,10 +200,15 @@ def pass1_sample_loci(
                     f"fraction={fraction:.6f} ({chr_time:.1f}s)")
 
     # Union all per-chromosome sampled Tables
+    global_target = sum(chr_targets.values())
     logger.info("Combining per-chromosome sampled loci ...")
     ht_combined = per_chr_tables[0]
     for ht in per_chr_tables[1:]:
         ht_combined = ht_combined.union(ht)
+
+    # Cap at global target before writing (avoids read-back-and-rewrite)
+    logger.info(f"Capping at {global_target:,} loci before write ...")
+    ht_combined = ht_combined.head(global_target)
 
     # Write the combined sampled loci Table
     logger.info(f"Writing sampled loci Table to {output_ht_path} ...")
@@ -228,14 +230,6 @@ def pass1_sample_loci(
         target = chr_targets.get(chrom, 0)
         per_chr_counts[chrom] = {'sampled': n, 'target': target}
         logger.info(f"  {chrom}: {n:,} sampled (target: {target:,})")
-
-    # Trim if total overshoots global target
-    global_target = sum(chr_targets.values())
-    if total_count > global_target:
-        logger.info(f"Trimming {total_count:,} -> {global_target:,} loci")
-        ht_trimmed = ht_final.head(global_target)
-        ht_trimmed.write(output_ht_path, overwrite=True)
-        total_count = global_target
 
     pass1_time = time.time() - pass1_start
     summary = {
