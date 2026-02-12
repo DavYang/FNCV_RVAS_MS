@@ -5,25 +5,26 @@ set -eo pipefail
 # 01_build_background_snps.sh
 #
 # Wrapper script for the background SNP PLINK pipeline (Regenie Step 1).
-# Runs a single Hail Python script that:
-#   Pass 1: Samples loci from ACAF splitMT rows Table (no genotypes).
-#   Pass 2: Extracts EUR genotypes at sampled loci and exports per-chromosome
-#           PLINK files via checkpoint + hl.export_plink.
+# Loops over autosomes (chr1-22), calling the Python script ONCE per
+# chromosome so each gets a fresh Hail/JVM session. This avoids JVM
+# state accumulation and OOM crashes seen in multi-chromosome runs.
 #
-# The script is designed to run in the background and survive terminal
-# disconnects. All output goes to a timestamped log file.
+# Features:
+#   - Computes per-chromosome SNP targets proportionally (same formula as Python).
+#   - Fault tolerant: failure on one chromosome does not block others.
+#   - Resume support: skips chromosomes with existing summary.json.
+#   - Writes pipeline_summary.json at the end with overall status.
 #
 # Usage:
 #   bash bash/01_build_background_snps.sh &
 #
 # Monitor:
 #   tail -f logs/01_background_snps_*.log
-#   cat logs/01_background_snps.pid   # check PID
-#   ps -p $(cat logs/01_background_snps.pid) -o pid,etime,cmd  # check status
-#   kill $(cat logs/01_background_snps.pid)  # stop if needed
+#   cat logs/01_background_snps.pid
+#   ps -p $(cat logs/01_background_snps.pid) -o pid,etime,cmd
+#   kill $(cat logs/01_background_snps.pid)
 # ---------------------------------------------------------------------------
 
-# Ignore hangup signals so the script survives terminal disconnects
 trap '' HUP
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,32 +39,32 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${LOG_DIR}/01_background_snps_${TIMESTAMP}.log"
 PID_FILE="${LOG_DIR}/01_background_snps.pid"
 
-# Redirect all output to log file AND stdout, detach stdin
 exec < /dev/null
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-# Write PID file for monitoring
 echo $$ > "${PID_FILE}"
 
-# Record start time for elapsed calculation
 START_SECONDS=$(date +%s)
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
 # ---------------------------------------------------------------------------
 echo "============================================================"
-echo "Background SNP PLINK Pipeline"
+echo "Background SNP PLINK Pipeline (per-chromosome mode)"
 echo "============================================================"
 echo "Started at : $(date)"
 echo "PID        : $$"
 echo "PID file   : ${PID_FILE}"
 echo "Log file   : ${LOG_FILE}"
-echo "Hail log   : /tmp/hail_background_snps.log"
 echo ""
 
 if [ -z "$WORKSPACE_BUCKET" ]; then
     echo "ERROR: WORKSPACE_BUCKET environment variable not set"
     exit 1
+fi
+# Ensure gs:// prefix
+if [[ "$WORKSPACE_BUCKET" != gs://* ]]; then
+    WORKSPACE_BUCKET="gs://${WORKSPACE_BUCKET}"
 fi
 echo "Workspace  : $WORKSPACE_BUCKET"
 
@@ -84,7 +85,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Read config for display
+# Read config
 # ---------------------------------------------------------------------------
 TARGET_SNPS=$(python3 -c "import json; c=json.load(open('${CONFIG_FILE}')); print(c['sampling']['target_total_snps'])")
 TEST_MODE=$(python3 -c "import json; c=json.load(open('${CONFIG_FILE}')); print(c['params'].get('test_mode', False))")
@@ -94,20 +95,135 @@ echo ""
 echo "Target SNPs: ${TARGET_SNPS}"
 if [ "$TEST_MODE" = "True" ]; then
     echo "Mode       : TEST (${TEST_CHR} only)"
+    CHROMOSOMES=("$TEST_CHR")
 else
     echo "Mode       : PRODUCTION (chr1-22)"
+    CHROMOSOMES=(chr{1..22})
 fi
+
+# ---------------------------------------------------------------------------
+# Build output directory name
+# ---------------------------------------------------------------------------
+if [ "$TARGET_SNPS" -ge 1000000 ]; then
+    SNP_LABEL="$((TARGET_SNPS / 1000000))M"
+elif [ "$TARGET_SNPS" -ge 1000 ]; then
+    SNP_LABEL="$((TARGET_SNPS / 1000))K"
+else
+    SNP_LABEL="${TARGET_SNPS}"
+fi
+
+DATE_STAMP=$(date +"%Y%m%d")
+OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${SNP_LABEL}_background_snps_${DATE_STAMP}"
+
+echo "Output dir : ${OUTPUT_DIR}"
 echo "------------------------------------------------------------"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Run pipeline
+# Compute per-chromosome targets (proportional to chromosome size)
+# GRCh38 sizes in bp
 # ---------------------------------------------------------------------------
-cd "$PROJECT_DIR"
+declare -A CHR_SIZES
+CHR_SIZES=(
+    [chr1]=248956422  [chr2]=242193529  [chr3]=198295559
+    [chr4]=190214555  [chr5]=181538259  [chr6]=170805979
+    [chr7]=159345973  [chr8]=145138636  [chr9]=138394717
+    [chr10]=133797422 [chr11]=135086622 [chr12]=133275309
+    [chr13]=114364328 [chr14]=107043718 [chr15]=101991189
+    [chr16]=90338345  [chr17]=83257441  [chr18]=80373285
+    [chr19]=58617616  [chr20]=64444167  [chr21]=46709983
+    [chr22]=50818468
+)
 
-EXIT_CODE=0
-python3 "$PYTHON_SCRIPT" || EXIT_CODE=$?
+TOTAL_GENOME_SIZE=0
+for chr_name in "${CHROMOSOMES[@]}"; do
+    TOTAL_GENOME_SIZE=$((TOTAL_GENOME_SIZE + CHR_SIZES[$chr_name]))
+done
 
+declare -A CHR_TARGETS
+ALLOCATED=0
+for chr_name in "${CHROMOSOMES[@]}"; do
+    size=${CHR_SIZES[$chr_name]}
+    # Integer proportional allocation: target * size / total_size
+    chr_target=$(python3 -c "print(max(1, int(${TARGET_SNPS} * ${size} / ${TOTAL_GENOME_SIZE})))")
+    CHR_TARGETS[$chr_name]=$chr_target
+    ALLOCATED=$((ALLOCATED + chr_target))
+done
+
+# Distribute remainder to largest chromosomes
+REMAINDER=$((TARGET_SNPS - ALLOCATED))
+if [ "$REMAINDER" -gt 0 ]; then
+    for chr_name in chr1 chr2 chr3 chr4 chr5; do
+        if [ "$REMAINDER" -le 0 ]; then break; fi
+        CHR_TARGETS[$chr_name]=$((CHR_TARGETS[$chr_name] + 1))
+        REMAINDER=$((REMAINDER - 1))
+    done
+fi
+
+echo "Per-chromosome targets:"
+for chr_name in "${CHROMOSOMES[@]}"; do
+    printf "  %-8s %'10d\n" "$chr_name" "${CHR_TARGETS[$chr_name]}"
+done
+echo ""
+
+# ---------------------------------------------------------------------------
+# Loop over chromosomes, one fresh Python/Hail process each
+# ---------------------------------------------------------------------------
+SUCCEEDED=()
+FAILED=()
+SKIPPED=()
+
+TOTAL_CHROMS=${#CHROMOSOMES[@]}
+CURRENT=0
+
+for chr_name in "${CHROMOSOMES[@]}"; do
+    CURRENT=$((CURRENT + 1))
+    chr_target=${CHR_TARGETS[$chr_name]}
+    chr_start=$(date +%s)
+
+    echo "============================================================"
+    echo "[${CURRENT}/${TOTAL_CHROMS}] Processing ${chr_name} (target: ${chr_target})"
+    echo "============================================================"
+
+    # Check if already completed (resume support)
+    SUMMARY_FILE="${OUTPUT_DIR}/${chr_name}/summary.json"
+    # Use gsutil to check existence since we can't use hfs in bash
+    if gsutil -q stat "${SUMMARY_FILE}" 2>/dev/null; then
+        echo "${chr_name}: summary.json exists, skipping (already completed)"
+        SKIPPED+=("$chr_name")
+        echo ""
+        continue
+    fi
+
+    CHR_EXIT=0
+    python3 "$PYTHON_SCRIPT" \
+        --chrom "$chr_name" \
+        --target "$chr_target" \
+        --output-dir "$OUTPUT_DIR" \
+        --config "$CONFIG_FILE" \
+    || CHR_EXIT=$?
+
+    chr_end=$(date +%s)
+    chr_elapsed=$((chr_end - chr_start))
+    chr_min=$((chr_elapsed / 60))
+    chr_sec=$((chr_elapsed % 60))
+
+    if [ $CHR_EXIT -eq 0 ]; then
+        echo "${chr_name}: SUCCEEDED in ${chr_min}m ${chr_sec}s"
+        SUCCEEDED+=("$chr_name")
+    else
+        echo "${chr_name}: FAILED (exit code ${CHR_EXIT}) after ${chr_min}m ${chr_sec}s"
+        echo "--- Last 30 lines of Hail log for ${chr_name} ---"
+        tail -30 "/tmp/hail_${chr_name}.log" 2>/dev/null || echo "(Hail log not found)"
+        echo "--- End Hail log ---"
+        FAILED+=("$chr_name")
+    fi
+    echo ""
+done
+
+# ---------------------------------------------------------------------------
+# Final summary
+# ---------------------------------------------------------------------------
 END_SECONDS=$(date +%s)
 ELAPSED=$((END_SECONDS - START_SECONDS))
 ELAPSED_MIN=$((ELAPSED / 60))
@@ -115,20 +231,40 @@ ELAPSED_SEC=$((ELAPSED % 60))
 
 echo ""
 echo "============================================================"
-if [ $EXIT_CODE -eq 0 ]; then
-    echo "Pipeline SUCCEEDED"
-else
-    echo "Pipeline FAILED (exit code: ${EXIT_CODE})"
-    echo ""
-    echo "--- Last 50 lines of Hail log ---"
-    tail -50 /tmp/hail_background_snps.log 2>/dev/null || echo "(Hail log not found)"
-    echo "--- End Hail log ---"
-fi
-echo "Elapsed    : ${ELAPSED_MIN}m ${ELAPSED_SEC}s"
+echo "PIPELINE SUMMARY"
+echo "============================================================"
+echo "Total time : ${ELAPSED_MIN}m ${ELAPSED_SEC}s"
+echo "Succeeded  : ${#SUCCEEDED[@]} - ${SUCCEEDED[*]:-none}"
+echo "Failed     : ${#FAILED[@]} - ${FAILED[*]:-none}"
+echo "Skipped    : ${#SKIPPED[@]} - ${SKIPPED[*]:-none}"
+echo "Output dir : ${OUTPUT_DIR}"
 echo "Finished at: $(date)"
 echo "============================================================"
 
-# Clean up PID file
+# Write pipeline summary JSON to GCS
+PIPELINE_SUMMARY=$(cat <<EOF
+{
+  "total_chromosomes": ${TOTAL_CHROMS},
+  "succeeded": ${#SUCCEEDED[@]},
+  "failed": ${#FAILED[@]},
+  "skipped": ${#SKIPPED[@]},
+  "succeeded_list": [$(printf '"%s",' "${SUCCEEDED[@]}" | sed 's/,$//') ],
+  "failed_list": [$(printf '"%s",' "${FAILED[@]}" | sed 's/,$//') ],
+  "skipped_list": [$(printf '"%s",' "${SKIPPED[@]}" | sed 's/,$//') ],
+  "output_dir": "${OUTPUT_DIR}",
+  "total_time_seconds": ${ELAPSED},
+  "timestamp": "$(date -Iseconds)"
+}
+EOF
+)
+
+echo "$PIPELINE_SUMMARY" | gsutil -q cp - "${OUTPUT_DIR}/pipeline_summary.json" 2>/dev/null \
+    || echo "WARNING: Failed to write pipeline_summary.json to GCS"
+
 rm -f "${PID_FILE}"
 
-exit $EXIT_CODE
+if [ ${#FAILED[@]} -gt 0 ]; then
+    exit 1
+else
+    exit 0
+fi
