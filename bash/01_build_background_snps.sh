@@ -19,7 +19,8 @@ set -eo pipefail
 #   nohup bash bash/01_build_background_snps.sh > /dev/null 2>&1 &
 #
 # Monitor:
-#   tail -f logs/01_background_snps_*.log
+#   tail -f logs/01_background_snps_*.log           # main pipeline log
+#   tail -f logs/01_background_snps_chr21_*.log      # per-chromosome log
 #   cat logs/01_background_snps.pid
 #   ps -p $(cat logs/01_background_snps.pid) -o pid,etime,cmd
 #   kill $(cat logs/01_background_snps.pid)
@@ -195,13 +196,21 @@ for chr_name in "${CHROMOSOMES[@]}"; do
         continue
     fi
 
+    # Per-chromosome log captures ALL Python/Spark/JVM output
+    CHR_LOG="${LOG_DIR}/01_background_snps_${chr_name}_${TIMESTAMP}.log"
+    HAIL_LOG="/tmp/hail_${chr_name}.log"
+
+    echo "  Python log : ${CHR_LOG}"
+    echo "  Hail log   : ${HAIL_LOG}"
+    echo "  Started at : $(date)"
+
     CHR_EXIT=0
-    nohup python3 "$PYTHON_SCRIPT" \
+    python3 "$PYTHON_SCRIPT" \
         --chrom "$chr_name" \
         --target "$chr_target" \
         --output-dir "$OUTPUT_DIR" \
         --config "$CONFIG_FILE" \
-        </dev/null 2>&1 \
+        </dev/null >"${CHR_LOG}" 2>&1 \
     || CHR_EXIT=$?
 
     chr_end=$(date +%s)
@@ -214,9 +223,37 @@ for chr_name in "${CHROMOSOMES[@]}"; do
         SUCCEEDED+=("$chr_name")
     else
         echo "${chr_name}: FAILED (exit code ${CHR_EXIT}) after ${chr_min}m ${chr_sec}s"
-        echo "--- Last 30 lines of Hail log for ${chr_name} ---"
-        tail -30 "/tmp/hail_${chr_name}.log" 2>/dev/null || echo "(Hail log not found)"
+
+        # Diagnose the failure mode
+        if [ $CHR_EXIT -gt 128 ]; then
+            SIGNAL=$((CHR_EXIT - 128))
+            echo "  >>> Process killed by signal ${SIGNAL}"
+            case $SIGNAL in
+                9)  echo "  >>> SIGKILL: likely OOM-killer or external kill" ;;
+                11) echo "  >>> SIGSEGV: JVM segmentation fault (memory corruption)" ;;
+                6)  echo "  >>> SIGABRT: JVM abort (assertion failure or OOM)" ;;
+                *)  echo "  >>> Signal ${SIGNAL}: unexpected termination" ;;
+            esac
+            # Check dmesg for OOM kills (may need root, best effort)
+            dmesg -T 2>/dev/null | grep -i "oom\|killed process" | tail -5 \
+                && echo "  >>> (dmesg OOM entries above)" \
+                || true
+        elif [ $CHR_EXIT -eq 1 ]; then
+            echo "  >>> Python exception (check log for traceback)"
+        else
+            echo "  >>> Unexpected exit code ${CHR_EXIT}"
+        fi
+
+        # Show tail of per-chromosome Python log
+        echo "--- Last 40 lines of Python log (${CHR_LOG}) ---"
+        tail -40 "${CHR_LOG}" 2>/dev/null || echo "(Python log not found)"
+        echo "--- End Python log ---"
+
+        # Show tail of Hail JVM log
+        echo "--- Last 20 lines of Hail log (${HAIL_LOG}) ---"
+        tail -20 "${HAIL_LOG}" 2>/dev/null || echo "(Hail log not found)"
         echo "--- End Hail log ---"
+
         FAILED+=("$chr_name")
     fi
     echo ""

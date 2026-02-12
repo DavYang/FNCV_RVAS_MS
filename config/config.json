@@ -14,8 +14,7 @@
         "dated_exports": true,
         "test_mode": false,
         "test_chromosome": "chr21",
-        "test_interval_file": "0000021371.interval_list",
-        "single_session_mode": true
+        "test_interval_file": "0000021371.interval_list"
     },
     "sampling": {
         "target_total_snps": 500000,
