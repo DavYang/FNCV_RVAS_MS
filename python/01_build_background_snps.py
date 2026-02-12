@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+import traceback
 
 import hail as hl
 import hailtop.fs as hfs
@@ -24,6 +25,48 @@ from datetime import datetime
 from utils import load_config, setup_logger
 
 logger = setup_logger("background_snps")
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    else:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+
+
+def _log_progress(
+    current: int, total: int, label: str, start_time: float
+) -> None:
+    """Log a progress line with ETA."""
+    elapsed = time.time() - start_time
+    pct = (current / total * 100) if total > 0 else 0
+    if current > 0:
+        eta = (elapsed / current) * (total - current)
+        eta_str = _fmt_elapsed(eta)
+    else:
+        eta_str = "?"
+    logger.info(
+        f"  [{current}/{total}] ({pct:.0f}%) {label} "
+        f"| elapsed: {_fmt_elapsed(elapsed)} | ETA: {eta_str}"
+    )
+
+
+def _log_memory() -> None:
+    """Log current system memory usage if /proc/meminfo is available."""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            lines = {l.split(':')[0]: l.split(':')[1].strip()
+                     for l in f.readlines() if ':' in l}
+        total = lines.get('MemTotal', '?')
+        avail = lines.get('MemAvailable', '?')
+        logger.info(f"  [memory] total={total}, available={avail}")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -159,81 +202,131 @@ def pass1_sample_loci(
     logger.info("PASS 1: Sampling loci from rows Table (no entry data)")
     logger.info("=" * 60)
     pass1_start = time.time()
+    _log_memory()
 
     logger.info(f"Reading rows Table from {mt_path} ...")
     mt = hl.read_matrix_table(mt_path)
     ht_rows = mt.rows().select()
     logger.info("Rows Table loaded (no entry data accessed)")
 
-    per_chr_tables = []
-    per_chr_counts = {}
+    chroms_to_process = [c for c in AUTOSOMES if chr_targets.get(c, 0) > 0]
+    total_chroms = len(chroms_to_process)
+    logger.info(f"Chromosomes to sample: {total_chroms}")
 
-    for chrom in AUTOSOMES:
-        chr_target = chr_targets.get(chrom, 0)
-        if chr_target == 0:
+    per_chr_counts = {}
+    per_chr_ht_paths = []
+    completed_count = 0
+
+    for chrom in chroms_to_process:
+        chr_target = chr_targets[chrom]
+        chr_ht_path = f"{output_ht_path}_parts/{chrom}.ht"
+        per_chr_ht_paths.append(chr_ht_path)
+
+        # Skip if this chromosome was already written (resume support)
+        if (hfs.exists(f"{chr_ht_path}/_SUCCESS")
+                or hfs.exists(f"{chr_ht_path}/metadata.json.gz")):
+            ht_chr_final = hl.read_table(chr_ht_path)
+            n = ht_chr_final.count()
+            per_chr_counts[chrom] = {'sampled': n, 'target': chr_target}
+            completed_count += 1
+            logger.info(
+                f"  {chrom}: {n:,} already sampled "
+                f"(target: {chr_target:,}), skipping "
+                f"[{completed_count}/{total_chroms}]"
+            )
             continue
 
         chr_start = time.time()
+        logger.info(f"  {chrom}: Starting sampling (target: {chr_target:,}) ...")
 
-        interval = hl.parse_locus_interval(
-            f"{chrom}:1-{CHR_SIZES[chrom]}", reference_genome='GRCh38'
-        )
-        ht_chr = hl.filter_intervals(ht_rows, [interval])
-
-        if avoid_hla and chrom == 'chr6' and hla_region:
-            hla_chrom = f"chr{hla_region['chrom']}"
-            hla_start = hla_region['start']
-            hla_end = hla_region['end']
-            hla_interval = hl.parse_locus_interval(
-                f"{hla_chrom}:{hla_start}-{hla_end}",
-                reference_genome='GRCh38',
+        try:
+            interval = hl.parse_locus_interval(
+                f"{chrom}:1-{CHR_SIZES[chrom]}", reference_genome='GRCh38'
             )
-            ht_chr = ht_chr.filter(~hla_interval.contains(ht_chr.locus))
+            ht_chr = hl.filter_intervals(ht_rows, [interval])
+
+            if avoid_hla and chrom == 'chr6' and hla_region:
+                hla_chrom = f"chr{hla_region['chrom']}"
+                hla_start = hla_region['start']
+                hla_end = hla_region['end']
+                hla_interval = hl.parse_locus_interval(
+                    f"{hla_chrom}:{hla_start}-{hla_end}",
+                    reference_genome='GRCh38',
+                )
+                ht_chr = ht_chr.filter(~hla_interval.contains(ht_chr.locus))
+                logger.info(
+                    f"  {chrom}: Excluded HLA region "
+                    f"{hla_chrom}:{hla_start}-{hla_end}"
+                )
+
+            estimated_pool = int(CHR_SIZES[chrom] * ACAF_VARIANTS_PER_BP)
+            fraction = min(
+                1.0, (chr_target / estimated_pool) * SAMPLING_OVERSHOOT
+            )
+
+            chr_seed = seed + AUTOSOMES.index(chrom)
+            ht_sampled = ht_chr.filter(
+                hl.rand_unif(0.0, 1.0, seed=chr_seed) < fraction
+            )
+
             logger.info(
-                f"  {chrom}: Excluded HLA region "
-                f"{hla_chrom}:{hla_start}-{hla_end}"
+                f"  {chrom}: Writing sampled loci "
+                f"(fraction={fraction:.6f}, est_pool={estimated_pool:,}) ..."
             )
+            ht_sampled.write(chr_ht_path, overwrite=True)
 
-        estimated_pool = int(CHR_SIZES[chrom] * ACAF_VARIANTS_PER_BP)
-        fraction = min(
-            1.0, (chr_target / estimated_pool) * SAMPLING_OVERSHOOT
-        )
+            logger.info(f"  {chrom}: Counting sampled loci ...")
+            ht_chr_final = hl.read_table(chr_ht_path)
+            n = ht_chr_final.count()
+            per_chr_counts[chrom] = {'sampled': n, 'target': chr_target}
 
-        chr_seed = seed + AUTOSOMES.index(chrom)
-        ht_sampled = ht_chr.filter(
-            hl.rand_unif(0.0, 1.0, seed=chr_seed) < fraction
-        )
+            completed_count += 1
+            chr_time = time.time() - chr_start
+            _log_progress(
+                completed_count, total_chroms,
+                f"{chrom}: {n:,} sampled (target: {chr_target:,}) "
+                f"in {_fmt_elapsed(chr_time)}",
+                pass1_start,
+            )
+            _log_memory()
 
-        per_chr_tables.append(ht_sampled)
-        chr_time = time.time() - chr_start
-        logger.info(
-            f"  {chrom}: target={chr_target:,}, "
-            f"est_pool={estimated_pool:,}, "
-            f"fraction={fraction:.6f} ({chr_time:.1f}s)"
-        )
+        except Exception as e:
+            logger.error(
+                f"  {chrom}: FAILED during sampling - {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            raise
 
-    logger.info("Combining per-chromosome sampled loci ...")
-    ht_combined = per_chr_tables[0]
-    for ht in per_chr_tables[1:]:
+    # Union all per-chromosome Tables into the final combined Table
+    logger.info("Combining per-chromosome sampled loci into single Table ...")
+    combine_start = time.time()
+    chr_tables = [hl.read_table(p) for p in per_chr_ht_paths]
+    ht_combined = chr_tables[0]
+    for ht in chr_tables[1:]:
         ht_combined = ht_combined.union(ht)
-
-    logger.info(f"Writing sampled loci Table to {output_ht_path} ...")
     ht_combined.write(output_ht_path, overwrite=True)
+    logger.info(
+        f"Combined Table written in {_fmt_elapsed(time.time() - combine_start)}"
+    )
 
-    ht_final = hl.read_table(output_ht_path)
-    total_count = ht_final.count()
+    total_count = sum(c['sampled'] for c in per_chr_counts.values())
 
-    chr_counts = ht_final.group_by(
-        contig=ht_final.locus.contig
-    ).aggregate(n=hl.agg.count())
-    chr_counts_dict = {row.contig: row.n for row in chr_counts.collect()}
-
+    # Summary table
+    logger.info("")
+    logger.info("Pass 1 Summary:")
+    logger.info(f"  {'Chrom':<8} {'Sampled':>10} {'Target':>10} {'Diff':>8}")
+    logger.info(f"  {'-'*8} {'-'*10} {'-'*10} {'-'*8}")
     for chrom in AUTOSOMES:
-        n = chr_counts_dict.get(chrom, 0)
-        target = chr_targets.get(chrom, 0)
-        per_chr_counts[chrom] = {'sampled': n, 'target': target}
-        if n > 0 or target > 0:
-            logger.info(f"  {chrom}: {n:,} sampled (target: {target:,})")
+        if chrom in per_chr_counts:
+            c = per_chr_counts[chrom]
+            diff = c['sampled'] - c['target']
+            sign = '+' if diff >= 0 else ''
+            logger.info(
+                f"  {chrom:<8} {c['sampled']:>10,} {c['target']:>10,} "
+                f"{sign}{diff:>7,}"
+            )
+    logger.info(f"  {'TOTAL':<8} {total_count:>10,} {sum(chr_targets.values()):>10,}")
+    logger.info("")
 
     pass1_time = time.time() - pass1_start
     global_target = sum(chr_targets.values())
@@ -247,7 +340,10 @@ def pass1_sample_loci(
         'timestamp': datetime.now().isoformat(),
     }
 
-    logger.info(f"Pass 1 done: {total_count:,} loci in {pass1_time:.1f}s")
+    logger.info(
+        f"Pass 1 COMPLETE: {total_count:,} loci sampled "
+        f"in {_fmt_elapsed(pass1_time)}"
+    )
     return summary
 
 
@@ -281,12 +377,16 @@ def pass2_export_plink(
     Returns:
         Summary dict with per-chromosome results.
     """
+    logger.info("Loading EUR samples Table ...")
+    eur_load_start = time.time()
     eur_samples_ht = _get_eur_samples_ht(config, f"{output_dir}/tmp")
+    logger.info(f"EUR samples loaded in {_fmt_elapsed(time.time() - eur_load_start)}")
 
     logger.info("=" * 60)
     logger.info("PASS 2: Extracting genotypes and exporting PLINK")
     logger.info("=" * 60)
     pass2_start = time.time()
+    _log_memory()
 
     logger.info(f"Reading sampled loci from {loci_ht_path} ...")
     ht_loci = hl.read_table(loci_ht_path)
@@ -310,66 +410,90 @@ def pass2_export_plink(
     except Exception:
         pass
 
-    for chrom in AUTOSOMES:
-        if chrom not in chr_targets:
-            continue
+    chroms_to_process = [c for c in AUTOSOMES if c in chr_targets]
+    total_chroms = len(chroms_to_process)
+    export_count = 0
+    logger.info(f"Chromosomes to export: {total_chroms}")
+
+    for chrom in chroms_to_process:
         if chrom in completed_chroms:
-            logger.info(f"  {chrom}: Already completed, skipping")
+            export_count += 1
+            logger.info(
+                f"  {chrom}: Already completed, skipping "
+                f"[{export_count}/{total_chroms}]"
+            )
             continue
 
         checkpoint_path = f"{output_dir}/tmp/{chrom}_checkpoint.mt"
         try:
             chr_start = time.time()
-            logger.info(f"  Processing {chrom} ...")
+            logger.info("")
+            logger.info(f"  {chrom}: === Starting PLINK export ===")
+            _log_memory()
 
+            logger.info(f"  {chrom}: Step 1/5 - Filtering loci and MT by interval ...")
+            step_start = time.time()
             chr_interval = hl.parse_locus_interval(
                 f"{chrom}:1-{CHR_SIZES[chrom]}",
                 reference_genome='GRCh38',
             )
-
-            # Filter sampled loci to this chromosome
             ht_chr_loci = hl.filter_intervals(ht_loci, [chr_interval])
-
-            # Read MT with partition pruning
             mt = hl.read_matrix_table(mt_path)
             mt = hl.filter_intervals(mt, [chr_interval])
+            logger.info(f"  {chrom}: Step 1/5 done ({_fmt_elapsed(time.time() - step_start)})")
 
-            # Restrict to sampled loci (rows) and EUR samples (cols)
+            logger.info(f"  {chrom}: Step 2/5 - Joining rows (sampled loci) and cols (EUR) ...")
+            step_start = time.time()
             mt = mt.semi_join_rows(ht_chr_loci)
             mt = mt.semi_join_cols(eur_samples_ht)
-
-            # Keep only GT entries, drop all row/col annotations
             mt = mt.select_entries('GT')
             mt = mt.select_rows()
             mt = mt.select_cols()
-
-            # Reduce partitions before checkpoint
             mt = mt.naive_coalesce(max(1, mt.n_partitions() // 50))
+            logger.info(f"  {chrom}: Step 2/5 done ({_fmt_elapsed(time.time() - step_start)})")
 
-            # Checkpoint to break DAG before export_plink
-            logger.info(f"  {chrom}: Checkpointing filtered MT ...")
+            logger.info(f"  {chrom}: Step 3/5 - Checkpointing filtered MT (breaks DAG) ...")
+            step_start = time.time()
             mt = mt.checkpoint(checkpoint_path, overwrite=True)
+            n_variants = mt.count_rows()
+            n_samples = mt.count_cols()
+            logger.info(
+                f"  {chrom}: Step 3/5 done - {n_variants:,} variants x "
+                f"{n_samples:,} samples ({_fmt_elapsed(time.time() - step_start)})"
+            )
 
-            # Export PLINK from the clean checkpoint
+            logger.info(f"  {chrom}: Step 4/5 - Exporting PLINK ...")
+            step_start = time.time()
             plink_prefix = f"{plink_dir}/{chrom}_background"
-            logger.info(f"  {chrom}: Exporting PLINK to {plink_prefix} ...")
             hl.export_plink(
                 mt,
                 plink_prefix,
                 fam_id=mt.s,
                 ind_id=mt.s,
             )
+            logger.info(f"  {chrom}: Step 4/5 done ({_fmt_elapsed(time.time() - step_start)})")
 
+            logger.info(f"  {chrom}: Step 5/5 - Cleaning up checkpoint ...")
             _cleanup_gcs_path(checkpoint_path)
 
             chr_time = time.time() - chr_start
             per_chr_results[chrom] = {
                 'plink_prefix': plink_prefix,
+                'n_variants': n_variants,
+                'n_samples': n_samples,
                 'time_seconds': round(chr_time, 1),
                 'status': 'success',
             }
             completed_chroms.add(chrom)
-            logger.info(f"  {chrom}: PLINK exported in {chr_time:.1f}s")
+            export_count += 1
+
+            _log_progress(
+                export_count, total_chroms,
+                f"{chrom}: {n_variants:,} variants exported "
+                f"in {_fmt_elapsed(chr_time)}",
+                pass2_start,
+            )
+            _log_memory()
 
             # Persist progress
             progress_data = {
@@ -380,12 +504,35 @@ def pass2_export_plink(
                 json.dump(progress_data, f, indent=2)
 
         except Exception as e:
-            logger.error(f"  {chrom}: FAILED - {e}")
+            logger.error(
+                f"  {chrom}: FAILED - {e}\n"
+                f"{traceback.format_exc()}"
+            )
             _cleanup_gcs_path(checkpoint_path)
             failed_chroms.append(chrom)
             continue
 
+    # Summary table
     pass2_time = time.time() - pass2_start
+    logger.info("")
+    logger.info("Pass 2 Summary:")
+    logger.info(f"  {'Chrom':<8} {'Variants':>10} {'Samples':>10} {'Time':>10} {'Status':>10}")
+    logger.info(f"  {'-'*8} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+    for chrom in chroms_to_process:
+        if chrom in per_chr_results:
+            r = per_chr_results[chrom]
+            logger.info(
+                f"  {chrom:<8} {r.get('n_variants', '?'):>10,} "
+                f"{r.get('n_samples', '?'):>10,} "
+                f"{_fmt_elapsed(r['time_seconds']):>10} "
+                f"{'OK':>10}"
+            )
+        elif chrom in completed_chroms:
+            logger.info(f"  {chrom:<8} {'(resumed)':>10} {'':>10} {'':>10} {'OK':>10}")
+        elif chrom in failed_chroms:
+            logger.info(f"  {chrom:<8} {'':>10} {'':>10} {'':>10} {'FAILED':>10}")
+    logger.info("")
+
     summary = {
         'pass': 2,
         'chromosomes_completed': len(completed_chroms),
@@ -397,10 +544,11 @@ def pass2_export_plink(
     }
 
     logger.info(
-        f"Pass 2 done: {len(completed_chroms)} chromosomes in {pass2_time:.1f}s"
+        f"Pass 2 COMPLETE: {len(completed_chroms)}/{total_chroms} chromosomes "
+        f"in {_fmt_elapsed(pass2_time)}"
     )
     if failed_chroms:
-        logger.warning(f"Failed chromosomes: {failed_chroms}")
+        logger.warning(f"FAILED chromosomes ({len(failed_chroms)}): {failed_chroms}")
 
     return summary
 
@@ -409,18 +557,17 @@ def pass2_export_plink(
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    pipeline_start = time.time()
     config = load_config("config/config.json")
 
-    hl.init(
-        log='/tmp/hail_background_snps.log',
-        spark_conf={
-            'spark.driver.memory': '8g',
-            'spark.executor.memory': '4g',
-            'spark.network.timeout': '600s',
-            'spark.executor.heartbeatInterval': '120s',
-            'spark.driver.maxResultSize': '2g',
-        },
-    )
+    logger.info("=" * 60)
+    logger.info("PIPELINE START")
+    logger.info("=" * 60)
+    logger.info(f"Timestamp: {datetime.now().isoformat()}")
+    logger.info(f"PID: {os.getpid()}")
+    _log_memory()
+
+    hl.init(log='/tmp/hail_background_snps.log')
     hl.default_reference('GRCh38')
 
     workspace_bucket = os.environ.get('WORKSPACE_BUCKET')
@@ -429,12 +576,22 @@ def main():
         sys.exit(1)
     if not workspace_bucket.startswith('gs://'):
         workspace_bucket = f"gs://{workspace_bucket}"
-    logger.info(f"Workspace bucket: {workspace_bucket}")
 
     mt_path = config['inputs']['wgs_matrix_table']
     target_snps = config['sampling']['target_total_snps']
     test_mode = config['params'].get('test_mode', False)
     test_chromosome = config['params'].get('test_chromosome', None)
+
+    # Log configuration
+    logger.info("Configuration:")
+    logger.info(f"  Workspace bucket: {workspace_bucket}")
+    logger.info(f"  Source MT: {mt_path}")
+    logger.info(f"  Target SNPs: {target_snps:,}")
+    logger.info(f"  Avoid HLA: {config['sampling'].get('avoid_hla', False)}")
+    logger.info(f"  Random seed: {config['sampling']['random_seed']}")
+    logger.info(f"  Test mode: {test_mode}")
+    if test_mode:
+        logger.info(f"  Test chromosome: {test_chromosome}")
 
     if target_snps >= 1_000_000:
         snp_label = f"{target_snps // 1_000_000}M"
@@ -448,10 +605,8 @@ def main():
         f"{workspace_bucket}/results/FNCV_RVAS_MS/"
         f"{snp_label}_background_snps_{timestamp}"
     )
-
-    logger.info(f"Source MT: {mt_path}")
-    logger.info(f"Output directory: {output_dir}")
-    logger.info(f"Target SNPs: {target_snps:,}")
+    logger.info(f"  Output directory: {output_dir}")
+    logger.info("")
 
     chr_targets = calculate_chromosome_targets(target_snps)
 
@@ -490,7 +645,7 @@ def main():
         p1_path = f"{output_dir}/pass1_summary.json"
         with hl.hadoop_open(p1_path, 'w') as f:
             json.dump(pass1_summary, f, indent=2, default=str)
-        logger.info(f"Pass 1 summary: {p1_path}")
+        logger.info(f"Pass 1 summary written to: {p1_path}")
 
         # --- Pass 2: Extract genotypes + export PLINK ---
         pass2_summary = pass2_export_plink(
@@ -518,20 +673,32 @@ def main():
                 json.dump(overall, f, indent=2, default=str)
         except Exception as summary_err:
             logger.warning(
-                f"Failed to write summary JSONs: {summary_err}"
+                f"Failed to write summary JSONs: {summary_err}\n"
+                f"{traceback.format_exc()}"
             )
 
+        pipeline_time = time.time() - pipeline_start
+        logger.info("")
         logger.info("=" * 60)
         if test_mode:
             logger.info(f"=== TEST COMPLETE: {test_chromosome} ===")
         else:
             logger.info("=== PRODUCTION COMPLETE ===")
+        logger.info(f"Total pipeline time: {_fmt_elapsed(pipeline_time)}")
         logger.info(f"PLINK files: {output_dir}/null_model_data/")
         logger.info(f"Sampled loci: {loci_ht_path}")
+        logger.info(f"Summaries: {output_dir}/")
+        n_failed = len(pass2_summary.get('chromosomes_failed', []))
+        n_done = pass2_summary.get('chromosomes_completed', 0)
+        logger.info(f"Chromosomes: {n_done} succeeded, {n_failed} failed")
         logger.info("=" * 60)
 
     except Exception as e:
-        logger.error(f"Pipeline failed: {e}")
+        pipeline_time = time.time() - pipeline_start
+        logger.error(
+            f"Pipeline FAILED after {_fmt_elapsed(pipeline_time)}: {e}\n"
+            f"{traceback.format_exc()}"
+        )
         raise
 
 
