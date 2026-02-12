@@ -16,7 +16,7 @@ set -eo pipefail
 #   - Writes pipeline_summary.json at the end with overall status.
 #
 # Usage:
-#   bash bash/01_build_background_snps.sh &
+#   nohup bash bash/01_build_background_snps.sh > /dev/null 2>&1 &
 #
 # Monitor:
 #   tail -f logs/01_background_snps_*.log
@@ -162,7 +162,7 @@ fi
 
 echo "Per-chromosome targets:"
 for chr_name in "${CHROMOSOMES[@]}"; do
-    printf "  %-8s %'10d\n" "$chr_name" "${CHR_TARGETS[$chr_name]}"
+    printf "  %-8s %10d\n" "$chr_name" "${CHR_TARGETS[$chr_name]}"
 done
 echo ""
 
@@ -196,11 +196,12 @@ for chr_name in "${CHROMOSOMES[@]}"; do
     fi
 
     CHR_EXIT=0
-    python3 "$PYTHON_SCRIPT" \
+    nohup python3 "$PYTHON_SCRIPT" \
         --chrom "$chr_name" \
         --target "$chr_target" \
         --output-dir "$OUTPUT_DIR" \
         --config "$CONFIG_FILE" \
+        </dev/null 2>&1 \
     || CHR_EXIT=$?
 
     chr_end=$(date +%s)
@@ -242,15 +243,24 @@ echo "Finished at: $(date)"
 echo "============================================================"
 
 # Write pipeline summary JSON to GCS
+_json_array() {
+    local arr=("$@")
+    if [ ${#arr[@]} -eq 0 ]; then
+        echo '[]'
+    else
+        printf '['; printf '"%s",' "${arr[@]}" | sed 's/,$//'; printf ']'
+    fi
+}
+
 PIPELINE_SUMMARY=$(cat <<EOF
 {
   "total_chromosomes": ${TOTAL_CHROMS},
   "succeeded": ${#SUCCEEDED[@]},
   "failed": ${#FAILED[@]},
   "skipped": ${#SKIPPED[@]},
-  "succeeded_list": [$(printf '"%s",' "${SUCCEEDED[@]}" | sed 's/,$//') ],
-  "failed_list": [$(printf '"%s",' "${FAILED[@]}" | sed 's/,$//') ],
-  "skipped_list": [$(printf '"%s",' "${SKIPPED[@]}" | sed 's/,$//') ],
+  "succeeded_list": $(_json_array "${SUCCEEDED[@]}"),
+  "failed_list": $(_json_array "${FAILED[@]}"),
+  "skipped_list": $(_json_array "${SKIPPED[@]}"),
   "output_dir": "${OUTPUT_DIR}",
   "total_time_seconds": ${ELAPSED},
   "timestamp": "$(date -Iseconds)"

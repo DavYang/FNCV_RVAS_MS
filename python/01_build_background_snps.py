@@ -350,21 +350,23 @@ def main() -> None:
     tmp_dir = f"{output_dir}/tmp"
     summary_path = f"{chrom_dir}/summary.json"
 
-    # Resume: skip if summary.json already exists for this chromosome
-    if hfs.exists(summary_path):
-        logger.info(f"  summary.json already exists at {summary_path}")
-        logger.info(f"  Skipping {chrom} (already completed)")
-        return
-
     logger.info(f"  Source MT : {mt_path}")
     logger.info("")
 
     # Initialize Hail (fresh session for this chromosome)
+    # Must init before hfs.exists() since hailtop.fs needs Hadoop/GCS access
     hail_log = f"/tmp/hail_{chrom}.log"
     logger.info(f"  Initializing Hail (log: {hail_log}) ...")
     hl.init(log=hail_log)
     hl.default_reference('GRCh38')
     logger.info("  Hail initialized")
+
+    # Resume: skip if summary.json already exists for this chromosome
+    if hfs.exists(summary_path):
+        logger.info(f"  summary.json already exists at {summary_path}")
+        logger.info(f"  Skipping {chrom} (already completed)")
+        hl.stop()
+        return
 
     summary = {
         'chrom': chrom,
