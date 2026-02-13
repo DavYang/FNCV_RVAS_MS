@@ -266,11 +266,9 @@ for chr_name in "${CHROMOSOMES[@]}"; do
     fi
     echo ""
 
-    # Memory mitigation: flush filesystem caches and pause between chromosomes
-    # to allow OS to fully reclaim memory from the terminated JVM process
+    # Pause between chromosomes to allow OS to reclaim memory from terminated JVM
     sync
-    echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true
-    echo "  [memory cleanup] Sleeping 60s between chromosomes ..."
+    echo "  [cleanup] Sleeping 60s between chromosomes ..."
     sleep 60
 done
 
