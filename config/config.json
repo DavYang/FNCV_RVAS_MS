@@ -17,7 +17,7 @@
         "test_interval_file": "0000021371.interval_list"
     },
     "sampling": {
-        "target_total_snps": 100000,
+        "target_total_snps": 1000000,
         "random_seed": 42,
         "avoid_hla": true,
         "hla_region": {
