@@ -18,6 +18,10 @@ set -eo pipefail
 # Usage:
 #   nohup bash bash/01_build_background_snps.sh > /dev/null 2>&1 &
 #
+# Resume a previous run (point at existing output dir):
+#   RESUME_OUTPUT_DIR=gs://bucket/results/FNCV_RVAS_MS/500K_background_snps \
+#     nohup bash bash/01_build_background_snps.sh > /dev/null 2>&1 &
+#
 # Monitor:
 #   tail -f logs/01_background_snps_*.log           # main pipeline log
 #   tail -f logs/01_background_snps_chr21_*.log      # per-chromosome log
@@ -103,7 +107,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Build output directory name
+# Build output directory name (stable across re-runs for resume support)
 # ---------------------------------------------------------------------------
 if [ "$TARGET_SNPS" -ge 1000000 ]; then
     SNP_LABEL="$((TARGET_SNPS / 1000000))M"
@@ -113,8 +117,12 @@ else
     SNP_LABEL="${TARGET_SNPS}"
 fi
 
-DATE_STAMP=$(date +"%Y%m%d")
-OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${SNP_LABEL}_background_snps_${DATE_STAMP}"
+# Allow explicit output dir override via env var or use a stable (no date) default
+if [ -n "$RESUME_OUTPUT_DIR" ]; then
+    OUTPUT_DIR="$RESUME_OUTPUT_DIR"
+else
+    OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${SNP_LABEL}_background_snps"
+fi
 
 echo "Output dir : ${OUTPUT_DIR}"
 echo "------------------------------------------------------------"
@@ -257,6 +265,13 @@ for chr_name in "${CHROMOSOMES[@]}"; do
         FAILED+=("$chr_name")
     fi
     echo ""
+
+    # Memory mitigation: flush filesystem caches and pause between chromosomes
+    # to allow OS to fully reclaim memory from the terminated JVM process
+    sync
+    echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true
+    echo "  [memory cleanup] Sleeping 60s between chromosomes ..."
+    sleep 60
 done
 
 # ---------------------------------------------------------------------------
