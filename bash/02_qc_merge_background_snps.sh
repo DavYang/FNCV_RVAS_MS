@@ -30,7 +30,6 @@ MERGE_LIST="${OUTPUT_DIR}/merge_list.txt"
 # ---------------------------------------------------------------------------
 # QC thresholds
 # ---------------------------------------------------------------------------
-MAF=0.01
 GENO=0.05
 HWE=1e-6
 
@@ -48,7 +47,7 @@ log "  QC + Merge Background SNPs for Regenie Step 1"
 log "============================================================"
 log "Input dir  : ${INPUT_DIR}"
 log "Output dir : ${OUTPUT_DIR}"
-log "QC params  : MAF=${MAF}, GENO=${GENO}, HWE=${HWE}"
+log "QC params  : GENO=${GENO}, HWE=${HWE}"
 log "============================================================"
 log ""
 
@@ -90,7 +89,6 @@ for chr_num in $(seq 1 22); do
 
     if plink2 \
         --bfile "${INPUT_PREFIX}" \
-        --maf "${MAF}" \
         --geno "${GENO}" \
         --hwe "${HWE}" \
         --max-alleles 2 \
