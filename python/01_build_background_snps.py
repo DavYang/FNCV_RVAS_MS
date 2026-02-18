@@ -41,7 +41,8 @@ CHR_SIZES = {
 }
 
 ACAF_VARIANTS_PER_BP = 0.03826
-SAMPLING_OVERSHOOT = 1.02
+SAMPLING_OVERSHOOT = 1.65
+DEFAULT_MIN_CALL_RATE = 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +219,14 @@ def export_plink(
     plink_prefix: str,
     eur_samples_ht: hl.Table,
     tmp_dir: str,
+    config: dict,
 ) -> dict:
-    """Filter MT to sampled loci + EUR samples, checkpoint, export PLINK.
+    """Filter MT to sampled loci + EUR samples, apply call rate filter,
+    checkpoint, and export PLINK.
+
+    The ACAF splitMT contains entries that are missing for samples below
+    the population-specific ACAF threshold. A call rate filter removes
+    variants with excessive missingness in EUR before export.
 
     Args:
         mt_path: GCS path to ACAF splitMT.
@@ -228,9 +235,10 @@ def export_plink(
         plink_prefix: Output prefix for PLINK files (.bed/.bim/.fam).
         eur_samples_ht: Hail Table of EUR sample IDs keyed by 's'.
         tmp_dir: GCS path for checkpoint files.
+        config: Loaded config dict (used for min_call_rate).
 
     Returns:
-        Dict with 'n_variants', 'n_samples', 'time_seconds'.
+        Dict with 'n_variants', 'n_samples', 'n_pre_callrate', 'time_seconds'.
     """
     step_start = time.time()
     checkpoint_path = f"{tmp_dir}/{chrom}_checkpoint.mt"
@@ -258,6 +266,16 @@ def export_plink(
     mt = mt.select_cols()
     logger.info(f"  2b done ({_fmt_elapsed(time.time() - t0)})")
 
+    min_call_rate = config['sampling'].get('min_call_rate', DEFAULT_MIN_CALL_RATE)
+    logger.info(
+        f"  2b-filter: Filtering variants by call rate >= {min_call_rate} ..."
+    )
+    t0 = time.time()
+    mt = mt.filter_rows(
+        hl.agg.fraction(hl.is_defined(mt.GT)) >= min_call_rate
+    )
+    logger.info(f"  2b-filter done ({_fmt_elapsed(time.time() - t0)})")
+
     logger.info(f"  2c: Checkpointing filtered MT (breaks DAG) ...")
     t0 = time.time()
     mt = mt.checkpoint(checkpoint_path, overwrite=True)
@@ -265,7 +283,7 @@ def export_plink(
     n_samples = mt.count_cols()
     logger.info(
         f"  2c done: {n_variants:,} variants x {n_samples:,} samples "
-        f"({_fmt_elapsed(time.time() - t0)})"
+        f"(call rate >= {min_call_rate}) ({_fmt_elapsed(time.time() - t0)})"
     )
 
     logger.info(f"  2d: Exporting PLINK to {plink_prefix} ...")
@@ -285,6 +303,7 @@ def export_plink(
     return {
         'n_variants': n_variants,
         'n_samples': n_samples,
+        'min_call_rate': min_call_rate,
         'plink_prefix': plink_prefix,
         'time_seconds': round(elapsed, 1),
     }
@@ -410,6 +429,7 @@ def main() -> None:
             plink_summary = export_plink(
                 mt_path, chrom, loci_ht_path,
                 plink_prefix, eur_samples_ht, tmp_dir,
+                config,
             )
 
         summary['plink'] = plink_summary

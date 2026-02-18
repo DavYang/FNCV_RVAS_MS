@@ -19,6 +19,7 @@
     "sampling": {
         "target_total_snps": 1000000,
         "random_seed": 42,
+        "min_call_rate": 0.95,
         "avoid_hla": true,
         "hla_region": {
             "chrom": "6",

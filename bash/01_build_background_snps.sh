@@ -117,11 +117,11 @@ else
     SNP_LABEL="${TARGET_SNPS}"
 fi
 
-# Allow explicit output dir override via env var or use a stable (no date) default
+# Allow explicit output dir override via env var or use a datestamped default
 if [ -n "$RESUME_OUTPUT_DIR" ]; then
     OUTPUT_DIR="$RESUME_OUTPUT_DIR"
 else
-    OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${SNP_LABEL}_background_snps"
+    OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${SNP_LABEL}_background_snps_$(date +%Y%m%d)"
 fi
 
 echo "Output dir : ${OUTPUT_DIR}"
