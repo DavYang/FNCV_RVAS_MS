@@ -48,7 +48,7 @@ log "  QC + Merge Background SNPs for Regenie Step 1"
 log "============================================================"
 log "Input dir  : ${INPUT_DIR}"
 log "Output dir : ${OUTPUT_DIR}"
-log "QC params  : MAF=${MAF}, GENO=${GENO}, MIND=${MIND}, HWE=${HWE}"
+log "QC params  : MAF=${MAF}, GENO=${GENO}, HWE=${HWE}"
 log "============================================================"
 log ""
 
