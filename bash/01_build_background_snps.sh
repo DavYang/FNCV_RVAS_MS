@@ -121,7 +121,7 @@ fi
 if [ -n "$RESUME_OUTPUT_DIR" ]; then
     OUTPUT_DIR="$RESUME_OUTPUT_DIR"
 else
-    OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/${SNP_LABEL}_2x_background_snps_$(date +%Y%m%d)"
+    OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/background_snps_$(date +%Y%m%d)"
 fi
 
 echo "Output dir : ${OUTPUT_DIR}"
