@@ -32,7 +32,6 @@ MERGE_LIST="${OUTPUT_DIR}/merge_list.txt"
 # ---------------------------------------------------------------------------
 MAF=0.01
 GENO=0.1
-MIND=0.1
 HWE=1e-6
 
 # ---------------------------------------------------------------------------
@@ -93,7 +92,6 @@ for chr_num in $(seq 1 22); do
         --bfile "${INPUT_PREFIX}" \
         --maf "${MAF}" \
         --geno "${GENO}" \
-        --mind "${MIND}" \
         --hwe "${HWE}" \
         --max-alleles 2 \
         --make-bed \
