@@ -91,7 +91,6 @@ for chr_num in $(seq 1 22); do
         --bfile "${INPUT_PREFIX}" \
         --geno "${GENO}" \
         --hwe "${HWE}" \
-        --mind 0.1 \
         --max-alleles 2 \
         --make-bed \
         --out "${OUTPUT_PREFIX}" \
@@ -176,7 +175,6 @@ else
         --bfile "${MERGED_PREFIX}" \
         --geno "${GENO}" \
         --hwe "${HWE}" \
-        --mind 0.1 \
         --max-alleles 2 \
         --make-bed \
         --out "${FINAL_PREFIX}" \
