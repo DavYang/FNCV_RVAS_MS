@@ -158,6 +158,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 3: Post-merge QC on the genome-wide merged file
+# ---------------------------------------------------------------------------
+FINAL_PREFIX="${OUTPUT_DIR}/all_background_final_qc"
+
+if [ -f "${FINAL_PREFIX}.bed" ]; then
+    log "Post-merge QC file already exists: ${FINAL_PREFIX}.bed"
+    log "Delete it to re-run post-merge QC."
+else
+    MERGED_PRE=$(wc -l < "${MERGED_PREFIX}.bim")
+    log "============================================================"
+    log "  Post-merge QC (genome-wide)"
+    log "============================================================"
+    log "Input  : ${MERGED_PREFIX} (${MERGED_PRE} variants)"
+    log "Output : ${FINAL_PREFIX}"
+
+    if plink2 \
+        --bfile "${MERGED_PREFIX}" \
+        --maf "${MAF}" \
+        --geno "${GENO}" \
+        --hwe "${HWE}" \
+        --max-alleles 2 \
+        --make-bed \
+        --out "${FINAL_PREFIX}" \
+        --threads 4 \
+        --memory 16000 >> "${LOG_FILE}" 2>&1; then
+
+        FINAL_VARIANTS=$(wc -l < "${FINAL_PREFIX}.bim")
+        FINAL_SAMPLES=$(wc -l < "${FINAL_PREFIX}.fam")
+        FINAL_REMOVED=$((MERGED_PRE - FINAL_VARIANTS))
+        log "Post-merge QC done: ${FINAL_VARIANTS} variants x ${FINAL_SAMPLES} samples (${FINAL_REMOVED} removed)"
+    else
+        log "POST-MERGE QC FAILED - check plink2 log: ${FINAL_PREFIX}.log"
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Final summary
 # ---------------------------------------------------------------------------
 log ""
@@ -166,8 +203,9 @@ log "  Pipeline complete"
 log "============================================================"
 log "Per-chrom QC files : ${OUTPUT_DIR}/chrN_background_qc.{bed,bim,fam}"
 log "Merged file        : ${MERGED_PREFIX}.{bed,bim,fam}"
+log "Final QC file      : ${FINAL_PREFIX}.{bed,bim,fam}"
 log ""
-ls -lh "${MERGED_PREFIX}".{bed,bim,fam} 2>/dev/null | while read -r line; do
+ls -lh "${FINAL_PREFIX}".{bed,bim,fam} 2>/dev/null | while read -r line; do
     log "  ${line}"
 done
 log "============================================================"
