@@ -7,14 +7,19 @@
     "outputs": {
         "base_dir": "results",
         "intermediate_dir": "tmp/",
-        "data_dir_suffix": "FNCV_RVAS_MS"
+        "data_dir_suffix": "FNCV_RVAS_MS",
+        "loci_bed": "results/2-locus_definition/target_loci.bed",
+        "ld_reference": "results/1-bg_snp/plink_qc/all_background_final_qc"
     },
     "params": {
         "random_seed": 42,
         "dated_exports": true,
         "test_mode": false,
         "test_chromosome": "chr21",
-        "test_interval_file": "0000021371.interval_list"
+        "test_interval_file": "0000021371.interval_list",
+        "gwas_p_threshold": 5e-8,
+        "mhc_interval": "chr6:25000000-35000000",
+        "locus_flank_window": 500000
     },
     "sampling": {
         "target_total_snps": 1000000,

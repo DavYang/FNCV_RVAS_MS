@@ -63,7 +63,7 @@ def main():
     GCTA_BIN = os.path.abspath(config['tools']['gcta'])
     
     # LD Reference (From Phase 1)
-    REF_BFILE = os.path.abspath(config['outputs']['data_dir'] + "/eur_common_snps_500k")
+    REF_BFILE = os.path.abspath(config['outputs']['ld_reference'])
     
     # Params
     P_THRESH = config['params']['gwas_p_threshold']
