@@ -4,8 +4,10 @@
 
 This pipeline generates background common-SNP PLINK files (`.bed/.bim/.fam`) for use in
 **Regenie Step 1** null model fitting. It samples a configurable number of common SNPs
-(default: 100K) proportionally across autosomes (chr1-22) from the AoU v8 ACAF splitMT,
+(d~1 million SNPs get downsampled to 500K) across autosomes (chr1-22) from the AoU v8 ACAF splitMT,
 filters to EUR-ancestry samples, and exports per-chromosome PLINK binary files to GCS.
+Results are copied and saved both ways, both on the current VM and GCS (virtual machine, google cloud storage)
+
 
 ### Spark/Hail Strategy
 

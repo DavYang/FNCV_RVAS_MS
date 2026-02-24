@@ -94,8 +94,8 @@ for chr_num in $(seq 1 22); do
         --max-alleles 2 \
         --make-bed \
         --out "${OUTPUT_PREFIX}" \
-        --threads 4 \
-        --memory 8000 >> "${LOG_FILE}" 2>&1; then
+        --threads 50 \
+        --memory 16000 >> "${LOG_FILE}" 2>&1; then
 
         POST_COUNT=$(wc -l < "${OUTPUT_PREFIX}.bim")
         TOTAL_VARIANTS_POST=$((TOTAL_VARIANTS_POST + POST_COUNT))
@@ -143,8 +143,8 @@ else
         --pmerge-list "${MERGE_LIST}" bfile \
         --make-bed \
         --out "${MERGED_PREFIX}" \
-        --threads 4 \
-        --memory 16000 >> "${LOG_FILE}" 2>&1; then
+        --threads 50 \
+        --memory 32000 >> "${LOG_FILE}" 2>&1; then
 
         MERGED_VARIANTS=$(wc -l < "${MERGED_PREFIX}.bim")
         MERGED_SAMPLES=$(wc -l < "${MERGED_PREFIX}.fam")
@@ -178,8 +178,8 @@ else
         --max-alleles 2 \
         --make-bed \
         --out "${FINAL_PREFIX}" \
-        --threads 4 \
-        --memory 16000 >> "${LOG_FILE}" 2>&1; then
+        --threads 50 \
+        --memory 32000 >> "${LOG_FILE}" 2>&1; then
 
         FINAL_VARIANTS=$(wc -l < "${FINAL_PREFIX}.bim")
         FINAL_SAMPLES=$(wc -l < "${FINAL_PREFIX}.fam")

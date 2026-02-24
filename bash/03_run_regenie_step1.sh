@@ -51,7 +51,7 @@ LOG_DIR="${PROJECT_DIR}/logs"
 # REGENIE parameters
 # ---------------------------------------------------------------------------
 BSIZE=1000
-THREADS=32
+THREADS=50
 MEM=110000   # MB — leave headroom on 120GB node
 
 # Covariate columns to use (must match header in MS_covariates.txt exactly)

@@ -45,16 +45,19 @@ LOG_DIR="${PROJECT_DIR}/logs"
 # Parameters
 # ---------------------------------------------------------------------------
 TARGET_SNPS=500000
-THREADS=32
+THREADS=50
 # LD pruning window/step/r2 — loose r2 threshold keeps more genome coverage
 LD_WINDOW=1000
 LD_STEP=100
 LD_R2=0.9
-# MHC exclusion range (chr6: 25–35 Mb)
-MHC_CHROM=6
-MHC_START=25000000
-MHC_END=35000000
-RANDOM_SEED=42
+
+# Parse MHC exclusion range from config.json
+MHC_INTERVAL=$(python3 -c "import json; print(json.load(open('${PROJECT_DIR}/config/config.json'))['params']['mhc_interval'])")
+MHC_CHROM=$(echo "$MHC_INTERVAL" | awk -F'[:-]' '{print $1}' | sed 's/chr//')
+MHC_START=$(echo "$MHC_INTERVAL" | awk -F'[:-]' '{print $2}')
+MHC_END=$(echo "$MHC_INTERVAL" | awk -F'[:-]' '{print $3}')
+
+RANDOM_SEED=$(python3 -c "import json; print(json.load(open('${PROJECT_DIR}/config/config.json'))['params']['random_seed'])")
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -190,6 +193,27 @@ echo ""
 echo "  Final variants : ${N_FINAL}"
 echo "  Samples        : ${N_SAMPLES}"
 echo "  Output         : ${OUT_PREFIX}.{bed,bim,fam}"
+
+# ---------------------------------------------------------------------------
+# Step 4: Upload to GCS
+# ---------------------------------------------------------------------------
+echo ""
+echo "------------------------------------------------------------"
+echo "  Step 4: Upload to GCS"
+echo "------------------------------------------------------------"
+if [ -n "${WORKSPACE_BUCKET}" ]; then
+    if [[ "${WORKSPACE_BUCKET}" != gs://* ]]; then
+        WORKSPACE_BUCKET="gs://${WORKSPACE_BUCKET}"
+    fi
+    GCS_DEST="${WORKSPACE_BUCKET}/results/1-bg_snp/plink_step1/"
+    echo "Uploading to GCS: ${GCS_DEST}"
+    gsutil -u "${GOOGLE_PROJECT}" -m cp "${OUT_PREFIX}".* "${GCS_DEST}"
+    echo "  Upload complete."
+else
+    echo "WARNING: WORKSPACE_BUCKET not set — skipping GCS upload."
+    echo "  To upload manually:"
+    echo "  gsutil -u \$GOOGLE_PROJECT -m cp ${OUT_PREFIX}.* \$WORKSPACE_BUCKET/results/1-bg_snp/plink_step1/"
+fi
 
 # ---------------------------------------------------------------------------
 # Cleanup temp files
