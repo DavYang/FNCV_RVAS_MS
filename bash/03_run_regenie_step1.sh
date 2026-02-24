@@ -9,7 +9,7 @@ set -eo pipefail
 # top 10 ancestry PCs.
 #
 # Inputs  (all local on VM):
-#   results/1-bg_snp/plink_qc/all_background_final_qc.{bed,bim,fam}
+#   results/1-bg_snp/plink_step1/step1_500k.{bed,bim,fam}  (500K downsampled; see 02b_downsample_background_snps.sh)
 #   results/0-phenotype/MS_phenotype.txt
 #   results/0-phenotype/MS_covariates.txt
 #
@@ -34,13 +34,12 @@ set -eo pipefail
 
 trap '' HUP
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECT_DIR="/home/jupyter/FNCV_RVAS_MS"
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PLINK_PREFIX="${PROJECT_DIR}/results/1-bg_snp/plink_qc/all_background_final_qc"
+PLINK_PREFIX="${PROJECT_DIR}/results/1-bg_snp/plink_step1/step1_500k"
 PHENO_FILE="${PROJECT_DIR}/results/0-phenotype/MS_phenotype.txt"
 COVAR_FILE="${PROJECT_DIR}/results/0-phenotype/MS_covariates.txt"
 OUT_DIR="${PROJECT_DIR}/results/1-bg_snp/regenie"
