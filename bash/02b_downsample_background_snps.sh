@@ -46,6 +46,15 @@ LOG_DIR="${PROJECT_DIR}/logs"
 # ---------------------------------------------------------------------------
 TARGET_SNPS=500000
 THREADS=50
+
+# Pre-LD QC thresholds
+QC_MIND=0.05
+QC_GENO=0.01
+QC_MAF=0.05
+QC_HWE="1e-6 midp"
+# Relatedness threshold for up to 2nd degree relatives
+QC_KING=0.0884
+
 # LD pruning window/step/r2 — loose r2 threshold keeps more genome coverage
 LD_WINDOW=1000
 LD_STEP=100
@@ -93,6 +102,8 @@ echo "Started at    : $(date)"
 echo "Log file      : ${LOG_FILE}"
 echo "Input         : ${INPUT_PREFIX}"
 echo "Output        : ${OUT_PREFIX}"
+echo "Pre-LD QC     : --mind ${QC_MIND} --geno ${QC_GENO} --maf ${QC_MAF} --hwe ${QC_HWE}"
+echo "Relatedness   : --king-cutoff ${QC_KING} (up to 2nd degree)"
 echo "Target SNPs   : ${TARGET_SNPS}"
 echo "LD pruning    : window=${LD_WINDOW} step=${LD_STEP} r2=${LD_R2}"
 echo "MHC exclusion : chr${MHC_CHROM}:${MHC_START}-${MHC_END}"
@@ -123,10 +134,37 @@ if [ -f "${OUT_PREFIX}.bed" ] && [ "${FORCE}" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 1: Exclude MHC region and write a SNP exclusion list
+# Step 1: Pre-LD QC and Relatedness Filtering
 # ---------------------------------------------------------------------------
 echo "------------------------------------------------------------"
-echo "  Step 1: Exclude MHC region (chr${MHC_CHROM}:${MHC_START}-${MHC_END})"
+echo "  Step 1: Pre-LD QC (mind, geno, maf, hwe, relatedness)"
+echo "------------------------------------------------------------"
+
+QC_PREFIX="${TMP_DIR}/qc_filtered"
+
+plink2 \
+    --bfile "${INPUT_PREFIX}" \
+    --mind "${QC_MIND}" \
+    --geno "${QC_GENO}" \
+    --maf "${QC_MAF}" \
+    --hwe ${QC_HWE} \
+    --king-cutoff "${QC_KING}" \
+    --make-bed \
+    --threads "${THREADS}" \
+    --memory 32000 \
+    --out "${QC_PREFIX}"
+
+N_QC_VARIANTS=$(wc -l < "${QC_PREFIX}.bim")
+N_QC_SAMPLES=$(wc -l < "${QC_PREFIX}.fam")
+echo "  Variants passing QC : ${N_QC_VARIANTS}"
+echo "  Samples passing QC  : ${N_QC_SAMPLES}"
+
+# ---------------------------------------------------------------------------
+# Step 2: Exclude MHC region and write a SNP exclusion list
+# ---------------------------------------------------------------------------
+echo ""
+echo "------------------------------------------------------------"
+echo "  Step 2: Exclude MHC region (chr${MHC_CHROM}:${MHC_START}-${MHC_END})"
 echo "------------------------------------------------------------"
 
 MHC_EXCLUDE="${TMP_DIR}/mhc_snps.txt"
@@ -135,26 +173,27 @@ awk -v chrom="${MHC_CHROM}" \
     -v start="${MHC_START}" \
     -v end="${MHC_END}" \
     '$1 == chrom && $4 >= start && $4 <= end { print $2 }' \
-    "${INPUT_PREFIX}.bim" > "${MHC_EXCLUDE}"
+    "${QC_PREFIX}.bim" > "${MHC_EXCLUDE}"
 
 N_MHC=$(wc -l < "${MHC_EXCLUDE}")
 echo "  MHC SNPs excluded: ${N_MHC}"
 
 # ---------------------------------------------------------------------------
-# Step 2: LD pruning on non-MHC variants
+# Step 3: LD pruning on non-MHC variants
 # ---------------------------------------------------------------------------
 echo ""
 echo "------------------------------------------------------------"
-echo "  Step 2: LD pruning (r2 < ${LD_R2})"
+echo "  Step 3: LD pruning (r2 < ${LD_R2})"
 echo "------------------------------------------------------------"
 
 PRUNE_PREFIX="${TMP_DIR}/pruned"
 
 plink2 \
-    --bfile "${INPUT_PREFIX}" \
+    --bfile "${QC_PREFIX}" \
     --exclude "${MHC_EXCLUDE}" \
     --indep-pairwise "${LD_WINDOW}" "${LD_STEP}" "${LD_R2}" \
     --threads "${THREADS}" \
+    --memory 32000 \
     --seed "${RANDOM_SEED}" \
     --out "${PRUNE_PREFIX}"
 
@@ -171,20 +210,21 @@ if [ "${N_PRUNED_IN}" -lt "${TARGET_SNPS}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3: Thin pruned set to TARGET_SNPS and write final PLINK fileset
+# Step 4: Thin pruned set to TARGET_SNPS and write final PLINK fileset
 # ---------------------------------------------------------------------------
 echo ""
 echo "------------------------------------------------------------"
-echo "  Step 3: Thin to ${TARGET_SNPS} SNPs and write PLINK fileset"
+echo "  Step 4: Thin to ${TARGET_SNPS} SNPs and write PLINK fileset"
 echo "------------------------------------------------------------"
 
 plink2 \
-    --bfile "${INPUT_PREFIX}" \
+    --bfile "${QC_PREFIX}" \
     --extract "${PRUNE_PREFIX}.prune.in" \
     --thin-count "${TARGET_SNPS}" \
     --seed "${RANDOM_SEED}" \
     --make-bed \
     --threads "${THREADS}" \
+    --memory 32000 \
     --out "${OUT_PREFIX}"
 
 N_FINAL=$(wc -l < "${OUT_PREFIX}.bim")
@@ -195,11 +235,11 @@ echo "  Samples        : ${N_SAMPLES}"
 echo "  Output         : ${OUT_PREFIX}.{bed,bim,fam}"
 
 # ---------------------------------------------------------------------------
-# Step 4: Upload to GCS
+# Step 5: Upload to GCS
 # ---------------------------------------------------------------------------
 echo ""
 echo "------------------------------------------------------------"
-echo "  Step 4: Upload to GCS"
+echo "  Step 5: Upload to GCS"
 echo "------------------------------------------------------------"
 if [ -n "${WORKSPACE_BUCKET}" ]; then
     if [[ "${WORKSPACE_BUCKET}" != gs://* ]]; then
@@ -220,7 +260,8 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "Cleaning up temp files..."
-rm -f "${PRUNE_PREFIX}".prune.in \
+rm -f "${QC_PREFIX}".{bed,bim,fam,log} \
+      "${PRUNE_PREFIX}".prune.in \
       "${PRUNE_PREFIX}".prune.out \
       "${PRUNE_PREFIX}".log \
       "${MHC_EXCLUDE}"
