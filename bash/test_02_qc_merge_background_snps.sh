@@ -32,7 +32,7 @@ OUTPUT_PREFIX="${OUTPUT_DIR}/chr21_background"
 # ---------------------------------------------------------------------------
 GENO=0.05
 HWE=1e-6
-MAF=0.05
+MAF=0.01
 MIND=0.01
 
 plink2 \
