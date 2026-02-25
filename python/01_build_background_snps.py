@@ -133,13 +133,16 @@ def sample_loci(
     target: int,
     output_ht_path: str,
     config: dict,
+    fraction_override: float = None,
+    seed_offset: int = 0,
 ) -> dict:
     """Sample loci on a single chromosome using Bernoulli sampling.
 
     Reads only the rows Table of the ACAF splitMT (no entry data touched).
-    Applies HLA exclusion on chr6 if configured. Uses an adaptive retry loop
-    that boosts the sampling fraction until the raw sampled count meets or
-    exceeds `target` (up to `resample_max_attempts` attempts).
+    Pre-filters by pre-computed info.AF (MAF) and variant_qc.call_rate so that
+    the sampled pool contains only QC-passing variants. HLA exclusion is applied
+    on chr6 if configured. The retry loop lives in main(); this function performs
+    a single sampling attempt at the given fraction.
 
     Args:
         mt_path: GCS path to ACAF splitMT.
@@ -147,30 +150,47 @@ def sample_loci(
         target: Target number of SNPs to sample on this chromosome.
         output_ht_path: GCS path to write the sampled loci Table.
         config: Loaded config dict.
+        fraction_override: If provided, use this sampling fraction instead of
+            computing one from the estimated pool size.
+        seed_offset: Added to the base chromosome seed to vary draws on retries.
 
     Returns:
-        Dict with 'n_sampled', 'target', 'fraction', 'attempts', 'time_seconds'.
+        Dict with 'n_sampled', 'target', 'fraction', 'time_seconds'.
     """
     step_start = time.time()
     seed = config['sampling']['random_seed']
     avoid_hla = config['sampling'].get('avoid_hla', False)
     hla_region = config['sampling'].get('hla_region', {})
-    max_attempts = config['sampling'].get(
-        'resample_max_attempts', DEFAULT_RESAMPLE_MAX_ATTEMPTS
+    hail_min_maf = config['sampling'].get('hail_min_maf', DEFAULT_HAIL_MIN_MAF)
+    hail_min_cr = config['sampling'].get(
+        'hail_min_variant_call_rate', DEFAULT_HAIL_MIN_VARIANT_CALL_RATE
     )
 
-    logger.info(f"  Step 1: Sampling loci (target={target:,}, max_attempts={max_attempts})")
+    logger.info(f"  Step 1: Sampling loci (target={target:,})")
+    logger.info(
+        f"  Pre-filters: info.AF > {hail_min_maf}, "
+        f"variant_qc.call_rate >= {hail_min_cr} (rows-only, no GT scan)"
+    )
     _log_memory()
 
     logger.info(f"  Reading rows Table from {mt_path} ...")
+    t0 = time.time()
     mt = hl.read_matrix_table(mt_path)
-    ht_rows = mt.rows().select()
+    ht_rows = mt.rows()
 
     chr_size = CHR_SIZES[chrom]
     interval = hl.parse_locus_interval(
         f"{chrom}:1-{chr_size}", reference_genome='GRCh38'
     )
     ht_chr = hl.filter_intervals(ht_rows, [interval])
+
+    # Pre-filter by pre-computed annotations (rows-only, zero genotype scan)
+    ht_chr = ht_chr.filter(
+        (ht_chr.info.AF[0] > hail_min_maf) &
+        (ht_chr.info.AF[0] < (1.0 - hail_min_maf)) &
+        (ht_chr.variant_qc.call_rate >= hail_min_cr)
+    )
+    logger.info(f"  Rows Table read and pre-filter applied ({_fmt_elapsed(time.time() - t0)})")
 
     if avoid_hla and chrom == 'chr6' and hla_region:
         hla_chrom = f"chr{hla_region['chrom']}"
@@ -184,50 +204,26 @@ def sample_loci(
         logger.info(f"  Excluded HLA region {hla_chrom}:{hla_start}-{hla_end}")
 
     estimated_pool = int(chr_size * ACAF_VARIANTS_PER_BP)
-    # Initial fraction: aim for target / pool with 2x overshoot as starting point
-    fraction = min(1.0, (target / estimated_pool) * 2.0)
+    if fraction_override is not None:
+        fraction = fraction_override
+    else:
+        # Initial fraction: aim for target / pool with 2x overshoot as starting point
+        fraction = min(1.0, (target / estimated_pool) * 2.0)
 
     autosomes = [f"chr{i}" for i in range(1, 23)]
-    chr_seed = seed + autosomes.index(chrom)
+    chr_seed = seed + autosomes.index(chrom) + seed_offset
 
-    n_sampled = 0
-    attempt = 0
-    for attempt in range(1, max_attempts + 1):
-        logger.info(
-            f"  Sampling attempt {attempt}/{max_attempts}: "
-            f"fraction={fraction:.6f}, est_pool={estimated_pool:,}, seed={chr_seed}"
-        )
-        ht_sampled = ht_chr.filter(
-            hl.rand_unif(0.0, 1.0, seed=chr_seed) < fraction
-        )
-        ht_sampled.write(output_ht_path, overwrite=True)
-        ht_sampled = hl.read_table(output_ht_path)
-        n_sampled = ht_sampled.count()
-        logger.info(f"  Attempt {attempt}: {n_sampled:,} loci sampled")
-
-        if n_sampled >= target:
-            logger.info(
-                f"  Target met ({n_sampled:,} >= {target:,}) on attempt {attempt}"
-            )
-            break
-
-        if attempt < max_attempts:
-            # Boost fraction proportionally with 10% headroom, capped at 1.0
-            boost = (target / n_sampled) * 1.1 if n_sampled > 0 else 2.0
-            fraction = min(1.0, fraction * boost)
-            logger.warning(
-                f"  Attempt {attempt}: {n_sampled:,} < target {target:,}. "
-                f"Boosting fraction to {fraction:.6f} for next attempt"
-            )
-            # Vary seed per attempt to avoid identical draws
-            chr_seed += 100
-
-    if n_sampled < target:
-        logger.warning(
-            f"  Step 1: {chrom} reached {n_sampled:,} loci after "
-            f"{attempt} attempt(s); below target {target:,}. "
-            f"Proceeding with available loci."
-        )
+    logger.info(
+        f"  Sampling: fraction={fraction:.6f}, est_pool={estimated_pool:,}, seed={chr_seed}"
+    )
+    ht_sampled = ht_chr.filter(
+        hl.rand_unif(0.0, 1.0, seed=chr_seed) < fraction
+    )
+    ht_sampled = ht_sampled.select()  # drop all row fields except key
+    ht_sampled.write(output_ht_path, overwrite=True)
+    ht_sampled = hl.read_table(output_ht_path)
+    n_sampled = ht_sampled.count()
+    logger.info(f"  Sampled {n_sampled:,} loci")
 
     elapsed = time.time() - step_start
     logger.info(
@@ -240,7 +236,6 @@ def sample_loci(
         'n_sampled': n_sampled,
         'target': target,
         'fraction': round(fraction, 6),
-        'attempts': attempt,
         'time_seconds': round(elapsed, 1),
     }
 
@@ -274,24 +269,15 @@ def export_plink(
         config: Loaded config dict (used for filter thresholds).
 
     Returns:
-        Dict with 'n_pre_qc', 'n_post_maf_cr', 'n_variants', 'n_samples',
-        'hail_min_maf', 'hail_min_variant_call_rate', 'time_seconds'.
+        Dict with 'n_variants', 'n_samples', 'plink_prefix', 'time_seconds'.
     """
     step_start = time.time()
     checkpoint_path = f"{tmp_dir}/{chrom}_checkpoint.mt"
 
     min_call_rate = config['sampling'].get('min_call_rate', DEFAULT_MIN_CALL_RATE)
-    hail_min_maf = config['sampling'].get('hail_min_maf', DEFAULT_HAIL_MIN_MAF)
-    hail_min_cr = config['sampling'].get(
-        'hail_min_variant_call_rate', DEFAULT_HAIL_MIN_VARIANT_CALL_RATE
-    )
 
     logger.info(f"  Step 2: Extracting genotypes and exporting PLINK")
-    logger.info(
-        f"  Filters: MAF (EUR) > {hail_min_maf}, "
-        f"variant call rate (EUR) >= {hail_min_cr}, "
-        f"safety call rate >= {min_call_rate}"
-    )
+    logger.info(f"  Safety call rate filter >= {min_call_rate}")
     _log_memory()
 
     logger.info(f"  2a: Filtering MT by interval ...")
@@ -315,23 +301,11 @@ def export_plink(
     logger.info(f"  2b done ({_fmt_elapsed(time.time() - t0)})")
 
     logger.info(
-        f"  2b-qc: Computing variant QC in EUR and applying "
-        f"MAF > {hail_min_maf} and call rate >= {hail_min_cr} ..."
+        f"  2b-coalesce: Repartitioning to 200 partitions to reduce checkpoint overhead ..."
     )
     t0 = time.time()
-    mt = hl.variant_qc(mt)
-    n_pre_qc = mt.count_rows()
-    mt = mt.filter_rows(
-        (mt.variant_qc.AF[1] > hail_min_maf) &
-        (mt.variant_qc.call_rate >= hail_min_cr)
-    )
-    mt = mt.drop('variant_qc')
-    n_post_qc = mt.count_rows()
-    logger.info(
-        f"  2b-qc done: {n_pre_qc:,} -> {n_post_qc:,} variants "
-        f"(removed {n_pre_qc - n_post_qc:,}) "
-        f"({_fmt_elapsed(time.time() - t0)})"
-    )
+    mt = mt.naive_coalesce(200)
+    logger.info(f"  2b-coalesce done ({_fmt_elapsed(time.time() - t0)})")
 
     logger.info(
         f"  2b-filter: Safety call rate filter >= {min_call_rate} ..."
@@ -367,12 +341,8 @@ def export_plink(
     _log_memory()
 
     return {
-        'n_pre_qc': n_pre_qc,
-        'n_post_maf_cr': n_post_qc,
         'n_variants': n_variants,
         'n_samples': n_samples,
-        'hail_min_maf': hail_min_maf,
-        'hail_min_variant_call_rate': hail_min_cr,
         'plink_prefix': plink_prefix,
         'time_seconds': round(elapsed, 1),
     }
@@ -468,39 +438,92 @@ def main() -> None:
         logger.info("  Loading EUR samples Table ...")
         eur_samples_ht = _get_eur_samples_ht(config, shared_dir)
 
-        # --- Step 1: Sample loci ---
+        # --- Steps 1 + 2: Sample loci then export PLINK, with retry loop ---
+        # The retry loop lives here so it can check the post-QC exported variant
+        # count (n_variants from Step 2) against the target. Step 1 pre-filters
+        # the sampling pool to QC-passing variants using pre-computed rows
+        # annotations, so n_sampled in Step 1 closely tracks n_variants in Step 2.
         loci_ht_path = f"{chrom_dir}/sampled_loci.ht"
-        if (hfs.exists(f"{loci_ht_path}/_SUCCESS")
-                or hfs.exists(f"{loci_ht_path}/metadata.json.gz")):
-            logger.info(f"  Sampled loci Table exists, skipping Step 1")
-            ht_loci = hl.read_table(loci_ht_path)
-            n_sampled = ht_loci.count()
-            loci_summary = {
-                'n_sampled': n_sampled,
-                'target': target,
-                'skipped': True,
-            }
-        else:
-            loci_summary = sample_loci(
-                mt_path, chrom, target, loci_ht_path, config
-            )
-
-        summary['loci'] = loci_summary
-
-        # --- Step 2: Export PLINK ---
         plink_prefix = f"{chrom_dir}/{chrom}_background"
         bed_path = f"{plink_prefix}.bed"
 
-        if hfs.exists(bed_path):
-            logger.info(f"  PLINK .bed exists at {bed_path}, skipping Step 2")
+        max_attempts = config['sampling'].get(
+            'resample_max_attempts', DEFAULT_RESAMPLE_MAX_ATTEMPTS
+        )
+
+        # Resume: if both loci Table and PLINK .bed already exist, skip both steps
+        loci_exists = (
+            hfs.exists(f"{loci_ht_path}/_SUCCESS")
+            or hfs.exists(f"{loci_ht_path}/metadata.json.gz")
+        )
+        plink_exists = hfs.exists(bed_path)
+
+        if loci_exists and plink_exists:
+            logger.info(f"  Sampled loci Table and PLINK .bed both exist, skipping Steps 1+2")
+            ht_loci = hl.read_table(loci_ht_path)
+            n_sampled = ht_loci.count()
+            loci_summary = {'n_sampled': n_sampled, 'target': target, 'skipped': True}
             plink_summary = {'skipped': True, 'plink_prefix': plink_prefix}
         else:
-            plink_summary = export_plink(
-                mt_path, chrom, loci_ht_path,
-                plink_prefix, eur_samples_ht, tmp_dir,
-                config,
-            )
+            chr_size = CHR_SIZES[chrom]
+            estimated_pool = int(chr_size * ACAF_VARIANTS_PER_BP)
+            fraction = min(1.0, (target / estimated_pool) * 2.0)
 
+            loci_summary = None
+            plink_summary = None
+            n_exported = 0
+
+            for attempt in range(1, max_attempts + 1):
+                logger.info(
+                    f"  --- Attempt {attempt}/{max_attempts} "
+                    f"(fraction={fraction:.6f}) ---"
+                )
+                seed_offset = (attempt - 1) * 100
+
+                loci_summary = sample_loci(
+                    mt_path, chrom, target, loci_ht_path, config,
+                    fraction_override=fraction,
+                    seed_offset=seed_offset,
+                )
+
+                plink_summary = export_plink(
+                    mt_path, chrom, loci_ht_path,
+                    plink_prefix, eur_samples_ht, tmp_dir,
+                    config,
+                )
+
+                n_exported = plink_summary['n_variants']
+                logger.info(
+                    f"  Attempt {attempt}: {n_exported:,} variants exported "
+                    f"(target={target:,})"
+                )
+
+                if n_exported >= target:
+                    logger.info(
+                        f"  Target met ({n_exported:,} >= {target:,}) "
+                        f"on attempt {attempt}"
+                    )
+                    break
+
+                if attempt < max_attempts:
+                    boost = (target / n_exported) * 1.1 if n_exported > 0 else 2.0
+                    fraction = min(1.0, fraction * boost)
+                    logger.warning(
+                        f"  Attempt {attempt}: {n_exported:,} < target {target:,}. "
+                        f"Boosting fraction to {fraction:.6f} for next attempt"
+                    )
+
+            if n_exported < target:
+                logger.warning(
+                    f"  {chrom}: reached {n_exported:,} variants after "
+                    f"{max_attempts} attempt(s); below target {target:,}. "
+                    f"Proceeding with available variants."
+                )
+
+            loci_summary['attempts'] = attempt
+            plink_summary['attempts'] = attempt
+
+        summary['loci'] = loci_summary
         summary['plink'] = plink_summary
         summary['status'] = 'success'
 
