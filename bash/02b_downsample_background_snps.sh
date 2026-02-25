@@ -37,7 +37,7 @@ PROJECT_DIR="/home/jupyter/FNCV_RVAS_MS"
 # ---------------------------------------------------------------------------
 INPUT_PREFIX="${PROJECT_DIR}/results/1-bg_snp/plink_qc/all_background_final_qc"
 OUT_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_step1"
-OUT_PREFIX="${OUT_DIR}/step1_500k"
+OUT_PREFIX="${OUT_DIR}/step1_downsample"
 TMP_DIR="${PROJECT_DIR}/tmp/downsample"
 LOG_DIR="${PROJECT_DIR}/logs"
 
