@@ -419,12 +419,25 @@ def main() -> None:
     hl.default_reference('GRCh38')
     logger.info("  Hail initialized")
 
-    # Resume: skip if summary.json already exists for this chromosome
+    # Resume: skip only if summary.json exists AND status == 'success'
     if hfs.exists(summary_path):
-        logger.info(f"  summary.json already exists at {summary_path}")
-        logger.info(f"  Skipping {chrom} (already completed)")
-        hl.stop()
-        return
+        try:
+            with hl.hadoop_open(summary_path, 'r') as f:
+                prior = json.load(f)
+            if prior.get('status') == 'success':
+                logger.info(f"  summary.json exists with status=success at {summary_path}")
+                logger.info(f"  Skipping {chrom} (already completed)")
+                hl.stop()
+                return
+            else:
+                logger.warning(
+                    f"  summary.json exists but status={prior.get('status')!r} — "
+                    f"re-running {chrom}"
+                )
+        except Exception as read_err:
+            logger.warning(
+                f"  Could not read prior summary.json ({read_err}); re-running {chrom}"
+            )
 
     summary = {
         'chrom': chrom,
@@ -445,83 +458,71 @@ def main() -> None:
         # annotations, so n_sampled in Step 1 closely tracks n_variants in Step 2.
         loci_ht_path = f"{chrom_dir}/sampled_loci.ht"
         plink_prefix = f"{chrom_dir}/{chrom}_background"
-        bed_path = f"{plink_prefix}.bed"
 
         max_attempts = config['sampling'].get(
             'resample_max_attempts', DEFAULT_RESAMPLE_MAX_ATTEMPTS
         )
 
-        # Resume: if both loci Table and PLINK .bed already exist, skip both steps
-        loci_exists = (
-            hfs.exists(f"{loci_ht_path}/_SUCCESS")
-            or hfs.exists(f"{loci_ht_path}/metadata.json.gz")
-        )
-        plink_exists = hfs.exists(bed_path)
+        chr_size = CHR_SIZES[chrom]
+        estimated_pool = int(chr_size * ACAF_VARIANTS_PER_BP)
+        fraction = min(1.0, (target / estimated_pool) * 2.0)
 
-        if loci_exists and plink_exists:
-            logger.info(f"  Sampled loci Table and PLINK .bed both exist, skipping Steps 1+2")
-            ht_loci = hl.read_table(loci_ht_path)
-            n_sampled = ht_loci.count()
-            loci_summary = {'n_sampled': n_sampled, 'target': target, 'skipped': True}
-            plink_summary = {'skipped': True, 'plink_prefix': plink_prefix}
-        else:
-            chr_size = CHR_SIZES[chrom]
-            estimated_pool = int(chr_size * ACAF_VARIANTS_PER_BP)
-            fraction = min(1.0, (target / estimated_pool) * 2.0)
+        loci_summary = None
+        plink_summary = None
+        n_exported = 0
 
-            loci_summary = None
-            plink_summary = None
-            n_exported = 0
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                f"  --- Attempt {attempt}/{max_attempts} "
+                f"(fraction={fraction:.6f}) ---"
+            )
+            seed_offset = (attempt - 1) * 100
 
-            for attempt in range(1, max_attempts + 1):
+            # Step 1: sample QC-passing loci (rows-only, no GT scan)
+            loci_summary = sample_loci(
+                mt_path, chrom, target, loci_ht_path, config,
+                fraction_override=fraction,
+                seed_offset=seed_offset,
+            )
+
+            # Step 2: extract EUR genotypes, apply safety call-rate filter,
+            # checkpoint, and export PLINK — returns actual post-QC variant count
+            plink_summary = export_plink(
+                mt_path, chrom, loci_ht_path,
+                plink_prefix, eur_samples_ht, tmp_dir,
+                config,
+            )
+
+            n_exported = plink_summary['n_variants']
+            logger.info(
+                f"  Attempt {attempt}: {n_exported:,} variants passed QC "
+                f"and exported (target={target:,})"
+            )
+
+            if n_exported >= target:
                 logger.info(
-                    f"  --- Attempt {attempt}/{max_attempts} "
-                    f"(fraction={fraction:.6f}) ---"
+                    f"  Target met ({n_exported:,} >= {target:,}) "
+                    f"on attempt {attempt}"
                 )
-                seed_offset = (attempt - 1) * 100
+                break
 
-                loci_summary = sample_loci(
-                    mt_path, chrom, target, loci_ht_path, config,
-                    fraction_override=fraction,
-                    seed_offset=seed_offset,
-                )
-
-                plink_summary = export_plink(
-                    mt_path, chrom, loci_ht_path,
-                    plink_prefix, eur_samples_ht, tmp_dir,
-                    config,
-                )
-
-                n_exported = plink_summary['n_variants']
-                logger.info(
-                    f"  Attempt {attempt}: {n_exported:,} variants exported "
-                    f"(target={target:,})"
-                )
-
-                if n_exported >= target:
-                    logger.info(
-                        f"  Target met ({n_exported:,} >= {target:,}) "
-                        f"on attempt {attempt}"
-                    )
-                    break
-
-                if attempt < max_attempts:
-                    boost = (target / n_exported) * 1.1 if n_exported > 0 else 2.0
-                    fraction = min(1.0, fraction * boost)
-                    logger.warning(
-                        f"  Attempt {attempt}: {n_exported:,} < target {target:,}. "
-                        f"Boosting fraction to {fraction:.6f} for next attempt"
-                    )
-
-            if n_exported < target:
+            if attempt < max_attempts:
+                boost = (target / n_exported) * 1.1 if n_exported > 0 else 2.0
+                fraction = min(1.0, fraction * boost)
                 logger.warning(
-                    f"  {chrom}: reached {n_exported:,} variants after "
-                    f"{max_attempts} attempt(s); below target {target:,}. "
-                    f"Proceeding with available variants."
+                    f"  Attempt {attempt}: {n_exported:,} < target {target:,}. "
+                    f"Boosting fraction to {fraction:.6f} for next attempt"
                 )
 
-            loci_summary['attempts'] = attempt
-            plink_summary['attempts'] = attempt
+        if n_exported < target:
+            logger.warning(
+                f"  {chrom}: reached {n_exported:,} variants after "
+                f"{max_attempts} attempt(s); below target {target:,}. "
+                f"Proceeding with available variants."
+            )
+
+        loci_summary['attempts'] = attempt
+        plink_summary['attempts'] = attempt
 
         summary['loci'] = loci_summary
         summary['plink'] = plink_summary

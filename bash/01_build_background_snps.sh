@@ -144,8 +144,12 @@ CHR_SIZES=(
     [chr22]=50818468
 )
 
+# Always compute TOTAL_GENOME_SIZE against all 22 autosomes so that
+# per-chromosome targets are correct proportional fractions of the
+# genome-wide total, even in test mode (where CHROMOSOMES may be a subset).
+ALL_AUTOSOMES=(chr{1..22})
 TOTAL_GENOME_SIZE=0
-for chr_name in "${CHROMOSOMES[@]}"; do
+for chr_name in "${ALL_AUTOSOMES[@]}"; do
     TOTAL_GENOME_SIZE=$((TOTAL_GENOME_SIZE + CHR_SIZES[$chr_name]))
 done
 
@@ -153,20 +157,23 @@ declare -A CHR_TARGETS
 ALLOCATED=0
 for chr_name in "${CHROMOSOMES[@]}"; do
     size=${CHR_SIZES[$chr_name]}
-    # Integer proportional allocation: target * size / total_size
+    # Integer proportional allocation: target * chr_size / full_genome_size
     chr_target=$(python3 -c "print(max(1, int(${TARGET_SNPS} * ${size} / ${TOTAL_GENOME_SIZE})))")
     CHR_TARGETS[$chr_name]=$chr_target
     ALLOCATED=$((ALLOCATED + chr_target))
 done
 
-# Distribute remainder to largest chromosomes
-REMAINDER=$((TARGET_SNPS - ALLOCATED))
-if [ "$REMAINDER" -gt 0 ]; then
-    for chr_name in chr1 chr2 chr3 chr4 chr5; do
-        if [ "$REMAINDER" -le 0 ]; then break; fi
-        CHR_TARGETS[$chr_name]=$((CHR_TARGETS[$chr_name] + 1))
-        REMAINDER=$((REMAINDER - 1))
-    done
+# Remainder distribution only applies in production (all 22 chroms);
+# in test mode the remainder is intentionally left unallocated.
+if [ "${#CHROMOSOMES[@]}" -eq 22 ]; then
+    REMAINDER=$((TARGET_SNPS - ALLOCATED))
+    if [ "$REMAINDER" -gt 0 ]; then
+        for chr_name in chr1 chr2 chr3 chr4 chr5; do
+            if [ "$REMAINDER" -le 0 ]; then break; fi
+            CHR_TARGETS[$chr_name]=$((CHR_TARGETS[$chr_name] + 1))
+            REMAINDER=$((REMAINDER - 1))
+        done
+    fi
 fi
 
 echo "Per-chromosome targets:"
