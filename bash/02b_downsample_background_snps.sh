@@ -50,7 +50,7 @@ THREADS=50
 # Pre-LD QC thresholds
 QC_MIND=0.05
 QC_GENO=0.01
-QC_MAF=0.05
+QC_MAF=0.01
 QC_HWE="1e-6 midp"
 # Relatedness threshold for up to 2nd degree relatives
 QC_KING=0.0884
