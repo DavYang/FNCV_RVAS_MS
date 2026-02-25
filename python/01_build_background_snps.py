@@ -252,12 +252,12 @@ def export_plink(
     tmp_dir: str,
     config: dict,
 ) -> dict:
-    """Filter MT to sampled loci + EUR samples, apply Hail variant QC filters
-    (MAF and call rate computed in EUR), checkpoint, and export PLINK.
+    """Filter MT to sampled loci + EUR samples, apply a safety call-rate filter,
+    checkpoint, and export PLINK.
 
-    The ACAF splitMT contains entries that are missing for samples below
-    the population-specific ACAF threshold. Variant QC is computed on EUR
-    samples only so that MAF reflects the target population.
+    MAF and primary call-rate filtering are done upstream in sample_loci() using
+    pre-computed rows annotations. This function applies only a lightweight
+    safety call-rate filter in the EUR genotype data before export.
 
     Args:
         mt_path: GCS path to ACAF splitMT.
@@ -301,13 +301,6 @@ def export_plink(
     logger.info(f"  2b done ({_fmt_elapsed(time.time() - t0)})")
 
     logger.info(
-        f"  2b-coalesce: Repartitioning to 200 partitions to reduce checkpoint overhead ..."
-    )
-    t0 = time.time()
-    mt = mt.naive_coalesce(200)
-    logger.info(f"  2b-coalesce done ({_fmt_elapsed(time.time() - t0)})")
-
-    logger.info(
         f"  2b-filter: Safety call rate filter >= {min_call_rate} ..."
     )
     t0 = time.time()
@@ -315,6 +308,13 @@ def export_plink(
         hl.agg.fraction(hl.is_defined(mt.GT)) >= min_call_rate
     )
     logger.info(f"  2b-filter done ({_fmt_elapsed(time.time() - t0)})")
+
+    logger.info(
+        f"  2b-coalesce: Repartitioning to 200 partitions to reduce checkpoint overhead ..."
+    )
+    t0 = time.time()
+    mt = mt.naive_coalesce(200)
+    logger.info(f"  2b-coalesce done ({_fmt_elapsed(time.time() - t0)})")
 
     logger.info(f"  2c: Checkpointing filtered MT (breaks DAG) ...")
     t0 = time.time()
