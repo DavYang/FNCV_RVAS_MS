@@ -130,70 +130,70 @@ log ""
 # ---------------------------------------------------------------------------
 # Step 2: Merge all QC'd chromosomes into a single PLINK fileset
 # ---------------------------------------------------------------------------
-MERGED_PREFIX="${OUTPUT_DIR}/all_background_qc"
+# MERGED_PREFIX="${OUTPUT_DIR}/all_background_qc"
 
-if [ -f "${MERGED_PREFIX}.bed" ]; then
-    log "Merged file already exists: ${MERGED_PREFIX}.bed"
-    log "Delete it to re-merge."
-else
-    N_FILES=$(wc -l < "${MERGE_LIST}")
-    log "============================================================"
-    log "  Merging ${N_FILES} chromosome files"
-    log "============================================================"
+# if [ -f "${MERGED_PREFIX}.bed" ]; then
+#     log "Merged file already exists: ${MERGED_PREFIX}.bed"
+#     log "Delete it to re-merge."
+# else
+#     N_FILES=$(wc -l < "${MERGE_LIST}")
+#     log "============================================================"
+#     log "  Merging ${N_FILES} chromosome files"
+#     log "============================================================"
 
-    if plink2 \
-        --pmerge-list "${MERGE_LIST}" bfile \
-        --make-bed \
-        --out "${MERGED_PREFIX}" \
-        --threads 50 \
-        --memory 32000 >> "${LOG_FILE}" 2>&1; then
+#     if plink2 \
+#         --pmerge-list "${MERGE_LIST}" bfile \
+#         --make-bed \
+#         --out "${MERGED_PREFIX}" \
+#         --threads 50 \
+#         --memory 32000 >> "${LOG_FILE}" 2>&1; then
 
-        MERGED_VARIANTS=$(wc -l < "${MERGED_PREFIX}.bim")
-        MERGED_SAMPLES=$(wc -l < "${MERGED_PREFIX}.fam")
-        log "Merge complete: ${MERGED_VARIANTS} variants x ${MERGED_SAMPLES} samples"
-    else
-        log "MERGE FAILED - check plink2 log: ${MERGED_PREFIX}.log"
-        exit 1
-    fi
-fi
+#         MERGED_VARIANTS=$(wc -l < "${MERGED_PREFIX}.bim")
+#         MERGED_SAMPLES=$(wc -l < "${MERGED_PREFIX}.fam")
+#         log "Merge complete: ${MERGED_VARIANTS} variants x ${MERGED_SAMPLES} samples"
+#     else
+#         log "MERGE FAILED - check plink2 log: ${MERGED_PREFIX}.log"
+#         exit 1
+#     fi
+# fi
 
-# ---------------------------------------------------------------------------
-# Step 3: Post-merge QC on the genome-wide merged file
-# ---------------------------------------------------------------------------
-FINAL_PREFIX="${OUTPUT_DIR}/all_background_final_qc"
+# # ---------------------------------------------------------------------------
+# # Step 3: Post-merge QC on the genome-wide merged file
+# # ---------------------------------------------------------------------------
+# FINAL_PREFIX="${OUTPUT_DIR}/all_background_final_qc"
 
-if [ -f "${FINAL_PREFIX}.bed" ]; then
-    log "Post-merge QC file already exists: ${FINAL_PREFIX}.bed"
-    log "Delete it to re-run post-merge QC."
-else
-    MERGED_PRE=$(wc -l < "${MERGED_PREFIX}.bim")
-    log "============================================================"
-    log "  Post-merge QC (genome-wide)"
-    log "============================================================"
-    log "Input  : ${MERGED_PREFIX} (${MERGED_PRE} variants)"
-    log "Output : ${FINAL_PREFIX}"
+# if [ -f "${FINAL_PREFIX}.bed" ]; then
+#     log "Post-merge QC file already exists: ${FINAL_PREFIX}.bed"
+#     log "Delete it to re-run post-merge QC."
+# else
+#     MERGED_PRE=$(wc -l < "${MERGED_PREFIX}.bim")
+#     log "============================================================"
+#     log "  Post-merge QC (genome-wide)"
+#     log "============================================================"
+#     log "Input  : ${MERGED_PREFIX} (${MERGED_PRE} variants)"
+#     log "Output : ${FINAL_PREFIX}"
 
-    if plink2 \
-        --bfile "${MERGED_PREFIX}" \
-        --geno "${GENO}" \
-        --hwe "${HWE}" \
-        --max-alleles 2 \
-        --make-bed \
-        --maf 0.05 \
-        --mind 0.01 \
-        --out "${FINAL_PREFIX}" \
-        --threads 50 \
-        --memory 32000 >> "${LOG_FILE}" 2>&1; then
+#     if plink2 \
+#         --bfile "${MERGED_PREFIX}" \
+#         --geno "${GENO}" \
+#         --hwe "${HWE}" \
+#         --max-alleles 2 \
+#         --make-bed \
+#         --maf 0.05 \
+#         --mind 0.01 \
+#         --out "${FINAL_PREFIX}" \
+#         --threads 50 \
+#         --memory 32000 >> "${LOG_FILE}" 2>&1; then
 
-        FINAL_VARIANTS=$(wc -l < "${FINAL_PREFIX}.bim")
-        FINAL_SAMPLES=$(wc -l < "${FINAL_PREFIX}.fam")
-        FINAL_REMOVED=$((MERGED_PRE - FINAL_VARIANTS))
-        log "Post-merge QC done: ${FINAL_VARIANTS} variants x ${FINAL_SAMPLES} samples (${FINAL_REMOVED} removed)"
-    else
-        log "POST-MERGE QC FAILED - check plink2 log: ${FINAL_PREFIX}.log"
-        exit 1
-    fi
-fi
+#         FINAL_VARIANTS=$(wc -l < "${FINAL_PREFIX}.bim")
+#         FINAL_SAMPLES=$(wc -l < "${FINAL_PREFIX}.fam")
+#         FINAL_REMOVED=$((MERGED_PRE - FINAL_VARIANTS))
+#         log "Post-merge QC done: ${FINAL_VARIANTS} variants x ${FINAL_SAMPLES} samples (${FINAL_REMOVED} removed)"
+#     else
+#         log "POST-MERGE QC FAILED - check plink2 log: ${FINAL_PREFIX}.log"
+#         exit 1
+#     fi
+# fi
 
 # ---------------------------------------------------------------------------
 # Final summary
