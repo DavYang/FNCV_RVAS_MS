@@ -22,6 +22,10 @@ set -eo pipefail
 #   RESUME_OUTPUT_DIR=gs://bucket/results/FNCV_RVAS_MS/500K_background_snps \
 #     nohup bash bash/01_build_background_snps.sh > /dev/null 2>&1 &
 #
+# Force-rerun (ignore existing summary.json and pool_count.txt):
+#   FORCE_RERUN=true RESUME_OUTPUT_DIR=gs://bucket/results/... \
+#     nohup bash bash/01_build_background_snps.sh > /dev/null 2>&1 &
+#
 # Monitor:
 #   tail -f logs/01_background_snps_*.log           # main pipeline log
 #   tail -f logs/01_background_snps_chr21_*.log      # per-chromosome log
@@ -124,6 +128,18 @@ else
     OUTPUT_DIR="${WORKSPACE_BUCKET}/results/FNCV_RVAS_MS/background_snps_$(date +%Y%m%d)"
 fi
 
+# ---------------------------------------------------------------------------
+# Force-rerun flag (passed through to Python --force-rerun)
+# ---------------------------------------------------------------------------
+FORCE_RERUN="${FORCE_RERUN:-false}"
+if [ "$FORCE_RERUN" = "true" ]; then
+    FORCE_RERUN_FLAG="--force-rerun"
+    echo "Force rerun: ENABLED (all chromosomes will be re-processed)"
+else
+    FORCE_RERUN_FLAG=""
+    echo "Force rerun: disabled (will skip chromosomes with status=success)"
+fi
+
 echo "Output dir : ${OUTPUT_DIR}"
 echo "------------------------------------------------------------"
 echo ""
@@ -201,16 +217,6 @@ for chr_name in "${CHROMOSOMES[@]}"; do
     echo "[${CURRENT}/${TOTAL_CHROMS}] Processing ${chr_name} (target: ${chr_target})"
     echo "============================================================"
 
-    # Check if already completed (resume support)
-    SUMMARY_FILE="${OUTPUT_DIR}/${chr_name}/summary.json"
-    # Use gsutil to check existence since we can't use hfs in bash
-    if gsutil -q stat "${SUMMARY_FILE}" 2>/dev/null; then
-        echo "${chr_name}: summary.json exists, skipping (already completed)"
-        SKIPPED+=("$chr_name")
-        echo ""
-        continue
-    fi
-
     # Per-chromosome log captures ALL Python/Spark/JVM output
     CHR_LOG="${LOG_DIR}/01_background_snps_${chr_name}_${TIMESTAMP}.log"
     HAIL_LOG="/tmp/hail_${chr_name}.log"
@@ -219,12 +225,15 @@ for chr_name in "${CHROMOSOMES[@]}"; do
     echo "  Hail log   : ${HAIL_LOG}"
     echo "  Started at : $(date)"
 
+    # Resume and force-rerun logic is handled entirely by the Python script:
+    # it skips if summary.json status=success (unless --force-rerun is passed).
     CHR_EXIT=0
     python3 "$PYTHON_SCRIPT" \
         --chrom "$chr_name" \
         --target "$chr_target" \
         --output-dir "$OUTPUT_DIR" \
         --config "$CONFIG_FILE" \
+        ${FORCE_RERUN_FLAG} \
         </dev/null >"${CHR_LOG}" 2>&1 \
     || CHR_EXIT=$?
 
