@@ -91,6 +91,7 @@ for chr_num in $(seq 1 22); do
         --bfile "${INPUT_PREFIX}" \
         --maf 0.05 \ 
         --geno "${GENO}" \
+        --mind 0.01 \
         --hwe "${HWE}" \
         --max-alleles 2 \
         --make-bed \
@@ -178,7 +179,8 @@ else
         --hwe "${HWE}" \
         --max-alleles 2 \
         --make-bed \
-        --maf 0.005 \
+        --maf 0.05 \
+        --mind 0.01 \
         --out "${FINAL_PREFIX}" \
         --threads 50 \
         --memory 32000 >> "${LOG_FILE}" 2>&1; then
