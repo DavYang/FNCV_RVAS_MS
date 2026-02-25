@@ -25,7 +25,8 @@ INPUT_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_no-qc/test"
 OUTPUT_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_qc/test"
 LOG_DIR="${PROJECT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/02_qc_merge_background_snps.log"
-
+INPUT_PREFIX="${INPUT_DIR}/chr21_background"
+OUTPUT_PREFIX="${OUTPUT_DIR}/chr21_background"
 # ---------------------------------------------------------------------------
 # QC thresholds
 # ---------------------------------------------------------------------------
