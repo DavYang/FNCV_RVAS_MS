@@ -48,10 +48,10 @@ TARGET_SNPS=500000
 THREADS=50
 
 # Pre-LD QC thresholds
-QC_MIND=0.05
-QC_GENO=0.01
+QC_MIND=0.1
+QC_GENO=0.05
 QC_MAF=0.01
-QC_HWE="1e-6 midp"
+QC_HWE=1e-6
 # Relatedness threshold for up to 2nd degree relatives
 QC_KING=0.0884
 
@@ -102,7 +102,7 @@ echo "Started at    : $(date)"
 echo "Log file      : ${LOG_FILE}"
 echo "Input         : ${INPUT_PREFIX}"
 echo "Output        : ${OUT_PREFIX}"
-echo "Pre-LD QC     : --mind ${QC_MIND} --geno ${QC_GENO} --maf ${QC_MAF} --hwe ${QC_HWE}"
+echo "Pre-LD QC     : --maf ${QC_MAF} --geno ${QC_GENO} --hwe ${QC_HWE} --mind ${QC_MIND}"
 echo "Relatedness   : --king-cutoff ${QC_KING} (up to 2nd degree)"
 echo "Target SNPs   : ${TARGET_SNPS}"
 echo "LD pruning    : window=${LD_WINDOW} step=${LD_STEP} r2=${LD_R2}"
