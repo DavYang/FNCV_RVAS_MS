@@ -35,7 +35,6 @@
         "min_call_rate": 0.95,
         "hail_min_maf": 0.1,
         "hail_min_variant_call_rate": 0.99,
-        "resample_max_attempts": 3,
         "oversample_factor": 3,
         "avoid_hla": true,
         "hla_region": {

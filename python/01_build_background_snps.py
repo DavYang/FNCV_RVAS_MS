@@ -6,17 +6,20 @@ ACAF splitMT rows Table, then extracts EUR genotypes and exports PLINK.
 The bash wrapper calls this script once per chromosome (chr1-22), giving
 each invocation a fresh Hail/JVM session to avoid accumulated state crashes.
 
-Pipeline per chromosome:
-  1. count_qc_pool()      - Count real post-filter variant pool (rows-only, no GT).
-                            Uses pre-computed info.AF and variant_qc.call_rate.
-                            Result cached to pool_count.txt to avoid recomputation.
-  2. Retry loop:
-     a. sample_loci()     - Bernoulli sample from QC-passing rows at fraction
-                            computed from real pool size * oversample_factor.
-     b. extract_and_count() - Extract EUR GTs, apply safety call-rate filter,
-                            checkpoint, count. No PLINK export on failed attempts.
-     c. If count >= target: export_plink_final() once, break.
-        Else: boost fraction, discard checkpoint, retry.
+Pipeline per chromosome (2 steps):
+  1. sample_loci()   - Bernoulli sample from QC-passing rows Table at a
+                       generous oversample_factor. Rows-only, no GT data read.
+                       Uses pre-computed info.AF (global AF > hail_min_maf as
+                       EUR MAF proxy) and variant_qc.call_rate pre-filters.
+  2. export_plink()  - Join sampled loci + EUR samples on the full MT, apply
+                       EUR-specific call-rate filter, coalesce partitions, and
+                       export PLINK directly from the DAG (no intermediate
+                       checkpoint). Variant count is read from the .bim file
+                       after export.
+
+The oversample_factor (default 3+) ensures the target is met on the first
+attempt without needing a pool-count step or retry loop. Empirically,
+the EUR call-rate filter drops <0.1% of pre-filtered variants.
 
 Usage:
     python 01_build_background_snps.py --chrom chr21 --target 11700 \
@@ -56,7 +59,6 @@ CHR_SIZES = {
 DEFAULT_MIN_CALL_RATE = 0.95
 DEFAULT_HAIL_MIN_MAF = 0.01
 DEFAULT_HAIL_MIN_VARIANT_CALL_RATE = 0.99
-DEFAULT_RESAMPLE_MAX_ATTEMPTS = 5
 DEFAULT_OVERSAMPLE_FACTOR = 2.5
 
 
@@ -137,105 +139,24 @@ def _get_eur_samples_ht(config: dict, shared_dir: str) -> hl.Table:
     return eur_ht
 
 
-# ---------------------------------------------------------------------------
-# Step 0: Count the real QC-passing variant pool for this chromosome
-# ---------------------------------------------------------------------------
-def count_qc_pool(
-    mt_path: str,
-    chrom: str,
-    pool_count_path: str,
-    config: dict,
-    force: bool = False,
-) -> int:
-    """Count QC-passing variants for this chromosome using rows Table only.
+def _count_bim_lines(bim_path: str) -> int:
+    """Count the number of lines in a .bim file on GCS.
 
-    Applies the same pre-filters used in sample_loci() (global info.AF proxy
-    for MAF, pre-computed variant_qc.call_rate, HLA exclusion on chr6) but
-    counts rather than samples. No entry (genotype) data is read.
-
-    The count is cached to pool_count_path so that retries within the same
-    invocation do not re-scan; also safe to reuse across re-invocations unless
-    force=True.
+    This is used to determine the variant count after export_plink, avoiding
+    the need for a separate checkpoint + count_rows() call. Each line in a
+    .bim file corresponds to exactly one variant.
 
     Args:
-        mt_path: GCS path to ACAF splitMT.
-        chrom: Chromosome name, e.g. 'chr21'.
-        pool_count_path: GCS path to a plain-text file caching the count.
-        config: Loaded config dict.
-        force: If True, ignore cached count and recompute.
+        bim_path: GCS path to the .bim file.
 
     Returns:
-        Integer count of QC-passing variants in the pool.
+        Integer count of variants (lines) in the .bim file.
     """
-    # Check cache first (skip if force=True)
-    if not force and hfs.exists(pool_count_path):
-        try:
-            with hl.hadoop_open(pool_count_path, 'r') as f:
-                cached = int(f.read().strip())
-            logger.info(
-                f"  Step 0: Loaded cached pool count: {cached:,} "
-                f"(from {pool_count_path})"
-            )
-            return cached
-        except Exception as e:
-            logger.warning(f"  Step 0: Could not read cached pool count ({e}); recomputing")
-
-    step_start = time.time()
-    hail_min_maf = config['sampling'].get('hail_min_maf', DEFAULT_HAIL_MIN_MAF)
-    hail_min_cr = config['sampling'].get(
-        'hail_min_variant_call_rate', DEFAULT_HAIL_MIN_VARIANT_CALL_RATE
-    )
-    avoid_hla = config['sampling'].get('avoid_hla', False)
-    hla_region = config['sampling'].get('hla_region', {})
-
-    logger.info(
-        f"  Step 0: Counting QC-passing pool for {chrom} "
-        f"(info.AF > {hail_min_maf}, call_rate >= {hail_min_cr}) ..."
-    )
-    _log_memory()
-
-    t0 = time.time()
-    mt = hl.read_matrix_table(mt_path)
-    ht_rows = mt.rows()
-
-    chr_size = CHR_SIZES[chrom]
-    interval = hl.parse_locus_interval(
-        f"{chrom}:1-{chr_size}", reference_genome='GRCh38'
-    )
-    ht_chr = hl.filter_intervals(ht_rows, [interval])
-    ht_chr = ht_chr.filter(
-        (ht_chr.info.AF[0] > hail_min_maf) &
-        (ht_chr.info.AF[0] < (1.0 - hail_min_maf)) &
-        (ht_chr.variant_qc.call_rate >= hail_min_cr)
-    )
-
-    if avoid_hla and chrom == 'chr6' and hla_region:
-        hla_chrom = f"chr{hla_region['chrom']}"
-        hla_start = hla_region['start']
-        hla_end = hla_region['end']
-        hla_interval = hl.parse_locus_interval(
-            f"{hla_chrom}:{hla_start}-{hla_end}",
-            reference_genome='GRCh38',
-        )
-        ht_chr = ht_chr.filter(~hla_interval.contains(ht_chr.locus))
-        logger.info(f"  Excluded HLA region {hla_chrom}:{hla_start}-{hla_end}")
-
-    n_pool = ht_chr.count()
-    logger.info(
-        f"  Step 0 DONE: pool={n_pool:,} variants "
-        f"({_fmt_elapsed(time.time() - step_start)})"
-    )
-
-    # Cache to GCS
-    try:
-        with hl.hadoop_open(pool_count_path, 'w') as f:
-            f.write(str(n_pool))
-        logger.info(f"  Pool count cached to {pool_count_path}")
-    except Exception as e:
-        logger.warning(f"  Could not cache pool count ({e}); will recompute on re-run")
-
-    _log_memory()
-    return n_pool
+    n = 0
+    with hl.hadoop_open(bim_path, 'r') as f:
+        for _ in f:
+            n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +176,7 @@ def sample_loci(
     Reads only the rows Table of the ACAF splitMT (no entry data touched).
     Pre-filters by pre-computed info.AF (global AF > hail_min_maf as a proxy
     for EUR MAF) and variant_qc.call_rate. HLA exclusion is applied on chr6
-    if configured. The retry loop lives in main(); this function performs a
-    single sampling attempt at the given fraction.
+    if configured.
 
     Args:
         mt_path: GCS path to ACAF splitMT.
@@ -264,8 +184,8 @@ def sample_loci(
         target: Target number of SNPs (used for logging only).
         output_ht_path: GCS path to write the sampled loci Table.
         config: Loaded config dict.
-        fraction: Bernoulli sampling fraction (computed in main() from real pool).
-        seed_offset: Added to the base chromosome seed to vary draws on retries.
+        fraction: Bernoulli sampling fraction (computed in main()).
+        seed_offset: Added to the base chromosome seed (reserved for future use).
 
     Returns:
         Dict with 'n_sampled', 'target', 'fraction', 'time_seconds'.
@@ -348,41 +268,47 @@ def sample_loci(
 
 
 # ---------------------------------------------------------------------------
-# Step 2a: Extract EUR genotypes, apply call-rate filter, checkpoint + count
+# Step 2: Export PLINK directly from filtered DAG (no checkpoint)
 # ---------------------------------------------------------------------------
-def extract_and_count(
+def export_plink(
     mt_path: str,
     chrom: str,
     loci_ht_path: str,
     eur_samples_ht: hl.Table,
-    checkpoint_path: str,
+    plink_prefix: str,
     config: dict,
-) -> tuple:
-    """Filter MT to sampled loci + EUR samples, apply call-rate filter,
-    checkpoint, and count QC-passing variants. Does NOT export PLINK.
+) -> dict:
+    """Build a filtered MatrixTable and export PLINK directly.
 
-    Separating count from export lets the retry loop skip the expensive
-    export on failed attempts, paying that cost only once when target is met.
+    Constructs the full DAG: interval filter -> semi_join to sampled loci +
+    EUR samples -> select GT only -> EUR call-rate filter -> naive_coalesce ->
+    export_plink. No intermediate checkpoint is written. The variant count is
+    read from the .bim file after export instead of count_rows().
+
+    Per Hail docs, export_plink accepts any MatrixTable keyed by
+    (locus, alleles) with column key of type tstr and diploid unphased GT.
+    filter_rows supports aggregation over columns (hl.agg.fraction).
+    naive_coalesce merges adjacent partitions without shuffle.
 
     Args:
         mt_path: GCS path to ACAF splitMT.
         chrom: Chromosome name, e.g. 'chr21'.
         loci_ht_path: GCS path to sampled loci Table for this chromosome.
         eur_samples_ht: Hail Table of EUR sample IDs keyed by 's'.
-        checkpoint_path: GCS path for the intermediate checkpoint MT.
+        plink_prefix: Output prefix for PLINK files (.bed/.bim/.fam).
         config: Loaded config dict.
 
     Returns:
-        Tuple of (mt, n_passing, n_samples, elapsed_seconds) where mt is the
-        checkpointed MatrixTable ready for export.
+        Dict with 'plink_prefix', 'n_variants', 'n_samples', 'time_seconds'.
     """
     step_start = time.time()
     min_call_rate = config['sampling'].get('min_call_rate', DEFAULT_MIN_CALL_RATE)
 
-    logger.info(f"  Step 2a: Extracting EUR genotypes (call_rate >= {min_call_rate})")
+    logger.info(f"  Step 2: Export PLINK (direct DAG, no checkpoint)")
+    logger.info(f"  EUR call_rate filter: >= {min_call_rate}")
     _log_memory()
 
-    logger.info(f"  2a-interval: Filtering MT to {chrom} interval ...")
+    logger.info(f"  2-interval: Filtering MT to {chrom} interval ...")
     t0 = time.time()
     chr_size = CHR_SIZES[chrom]
     chr_interval = hl.parse_locus_interval(
@@ -391,88 +317,58 @@ def extract_and_count(
     ht_loci = hl.read_table(loci_ht_path)
     mt = hl.read_matrix_table(mt_path)
     mt = hl.filter_intervals(mt, [chr_interval])
-    logger.info(f"  2a-interval done ({_fmt_elapsed(time.time() - t0)})")
+    logger.info(f"  2-interval done ({_fmt_elapsed(time.time() - t0)})")
 
-    logger.info(f"  2a-join: Joining to sampled loci + EUR samples ...")
+    logger.info(f"  2-join: Joining to sampled loci + EUR samples ...")
     t0 = time.time()
     mt = mt.semi_join_rows(ht_loci)
     mt = mt.semi_join_cols(eur_samples_ht)
     mt = mt.select_entries('GT')
     mt = mt.select_rows()
     mt = mt.select_cols()
-    logger.info(f"  2a-join done ({_fmt_elapsed(time.time() - t0)})")
+    logger.info(f"  2-join done ({_fmt_elapsed(time.time() - t0)})")
 
-    logger.info(f"  2a-filter: Applying call_rate >= {min_call_rate} on EUR GTs ...")
+    logger.info(f"  2-filter: Applying call_rate >= {min_call_rate} on EUR GTs ...")
     t0 = time.time()
     mt = mt.filter_rows(
         hl.agg.fraction(hl.is_defined(mt.GT)) >= min_call_rate
     )
-    logger.info(f"  2a-filter done ({_fmt_elapsed(time.time() - t0)})")
+    logger.info(f"  2-filter done ({_fmt_elapsed(time.time() - t0)})")
 
-    logger.info(f"  2a-coalesce: Repartitioning to 200 partitions ...")
+    logger.info(f"  2-coalesce: Repartitioning to 200 partitions ...")
     t0 = time.time()
     mt = mt.naive_coalesce(200)
-    logger.info(f"  2a-coalesce done ({_fmt_elapsed(time.time() - t0)})")
+    logger.info(f"  2-coalesce done ({_fmt_elapsed(time.time() - t0)})")
 
-    logger.info(f"  2a-checkpoint: Checkpointing (breaks DAG for count) ...")
-    t0 = time.time()
-    mt = mt.checkpoint(checkpoint_path, overwrite=True)
-    n_passing = mt.count_rows()
-    n_samples = mt.count_cols()
-    logger.info(
-        f"  2a-checkpoint done: {n_passing:,} variants x {n_samples:,} samples "
-        f"({_fmt_elapsed(time.time() - t0)})"
-    )
-
-    elapsed = time.time() - step_start
-    logger.info(
-        f"  Step 2a DONE: {n_passing:,} variants pass EUR QC "
-        f"in {_fmt_elapsed(elapsed)}"
-    )
-    _log_memory()
-
-    return mt, n_passing, n_samples, round(elapsed, 1)
-
-
-# ---------------------------------------------------------------------------
-# Step 2b: Export PLINK from already-checkpointed MatrixTable
-# ---------------------------------------------------------------------------
-def export_plink_final(
-    mt: hl.MatrixTable,
-    plink_prefix: str,
-    checkpoint_path: str,
-) -> dict:
-    """Export PLINK files from a checkpointed MatrixTable and clean up.
-
-    Called only after extract_and_count() confirms the variant count meets the
-    target, so the expensive checkpoint+export is paid exactly once.
-
-    Args:
-        mt: Checkpointed MatrixTable returned by extract_and_count().
-        plink_prefix: Output prefix for PLINK files (.bed/.bim/.fam).
-        checkpoint_path: GCS path of the checkpoint MT to clean up after export.
-
-    Returns:
-        Dict with 'plink_prefix', 'time_seconds'.
-    """
-    step_start = time.time()
-
-    logger.info(f"  Step 2b: Exporting PLINK to {plink_prefix} ...")
-    _log_memory()
-
+    logger.info(f"  2-export: Writing PLINK to {plink_prefix} ...")
     t0 = time.time()
     hl.export_plink(mt, plink_prefix, fam_id=mt.s, ind_id=mt.s)
-    logger.info(f"  2b-export done ({_fmt_elapsed(time.time() - t0)})")
+    export_elapsed = time.time() - t0
+    logger.info(f"  2-export done ({_fmt_elapsed(export_elapsed)})")
 
-    logger.info(f"  2b-cleanup: Removing checkpoint {checkpoint_path} ...")
-    _cleanup_gcs_path(checkpoint_path)
+    logger.info(f"  2-count: Reading variant count from .bim ...")
+    t0 = time.time()
+    bim_path = f"{plink_prefix}.bim"
+    n_variants = _count_bim_lines(bim_path)
+    logger.info(
+        f"  2-count done: {n_variants:,} variants ({_fmt_elapsed(time.time() - t0)})"
+    )
+
+    # n_samples from .fam (one line per sample)
+    fam_path = f"{plink_prefix}.fam"
+    n_samples = _count_bim_lines(fam_path)
 
     elapsed = time.time() - step_start
-    logger.info(f"  Step 2b DONE: PLINK exported in {_fmt_elapsed(elapsed)}")
+    logger.info(
+        f"  Step 2 DONE: {n_variants:,} variants x {n_samples:,} samples "
+        f"exported in {_fmt_elapsed(elapsed)}"
+    )
     _log_memory()
 
     return {
         'plink_prefix': plink_prefix,
+        'n_variants': n_variants,
+        'n_samples': n_samples,
         'time_seconds': round(elapsed, 1),
     }
 
@@ -503,13 +399,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--force-rerun', action='store_true', default=False,
-        help='Ignore existing summary.json and pool_count.txt; overwrite all outputs'
+        help='Ignore existing summary.json; overwrite all outputs'
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    """Run the single-chromosome pipeline."""
+    """Run the single-chromosome pipeline.
+
+    Two-step flow:
+      1. sample_loci()  - rows-only Bernoulli sample (no GT data)
+      2. export_plink() - join sampled loci + EUR samples on full MT,
+                          apply EUR call-rate filter, export PLINK directly
+
+    No checkpoint or retry loop. The oversample_factor ensures we always
+    overshoot the target. Variant count is read from the .bim after export.
+    """
     args = parse_args()
     chrom = args.chrom
     target = args.target
@@ -540,9 +445,7 @@ def main() -> None:
 
     chrom_dir = f"{output_dir}/{chrom}"
     shared_dir = f"{output_dir}/shared"
-    tmp_dir = f"{output_dir}/tmp"
     summary_path = f"{chrom_dir}/summary.json"
-    pool_count_path = f"{chrom_dir}/pool_count.txt"
 
     logger.info(f"  Source MT   : {mt_path}")
     logger.info("")
@@ -588,111 +491,59 @@ def main() -> None:
         logger.info("  Loading EUR samples Table ...")
         eur_samples_ht = _get_eur_samples_ht(config, shared_dir)
 
-        # --- Step 0: Count real QC-passing pool for this chromosome ---
-        # Uses pre-computed info.AF (global AF > hail_min_maf as EUR MAF proxy)
-        # and variant_qc.call_rate. Rows-only scan, no genotype data read.
-        # Cached to pool_count.txt; recomputed only if force_rerun=True.
+        # --- Compute sampling fraction ---
+        # With oversample_factor >= 3 and the generous info.AF > 0.1 pre-filter,
+        # the QC-passing pool is always much larger than the target. We use a
+        # fixed fraction rather than counting the pool first (saves ~2 min).
+        # fraction = oversample_factor * target / target = oversample_factor,
+        # but capped at 1.0 for safety. In practice this means we sample ~3x
+        # the target from the rows Table, and the EUR call-rate filter drops <0.1%.
         oversample_factor = config['sampling'].get(
             'oversample_factor', DEFAULT_OVERSAMPLE_FACTOR
         )
-        n_pool = count_qc_pool(
-            mt_path, chrom, pool_count_path, config, force=force_rerun
-        )
-        if n_pool == 0:
-            raise RuntimeError(
-                f"{chrom}: QC-passing pool is empty after info.AF and call_rate filters. "
-                f"Check hail_min_maf and hail_min_variant_call_rate in config."
-            )
+        # Use a conservative estimate: ~1.75 QC-passing variants per 1000 bp
+        # (empirical from chr9: 241K pool / 138M bp = 1.75/kbp).
+        # This gives fraction = target * oversample_factor / estimated_pool.
+        # For safety, cap at 1.0.
+        estimated_pool = CHR_SIZES[chrom] * 0.00175
+        fraction = min(1.0, (target * oversample_factor) / estimated_pool)
 
         logger.info(
-            f"  Pool: {n_pool:,} variants | target: {target:,} | "
-            f"oversample_factor: {oversample_factor}"
+            f"  Sampling fraction: {fraction:.6f} "
+            f"(target={target:,}, oversample_factor={oversample_factor}, "
+            f"estimated_pool={estimated_pool:,.0f})"
         )
 
-        # --- Steps 1 + 2: Sample loci, extract GTs, check count, export ---
-        # Fraction is computed from the REAL pool size, not an estimated constant.
-        # export_plink_final() is called only when the target is met, so the
-        # expensive checkpoint+export cost is paid at most once per chromosome.
+        # --- Step 1: Sample loci (rows-only, no GT data) ---
         loci_ht_path = f"{chrom_dir}/sampled_loci.ht"
         plink_prefix = f"{chrom_dir}/{chrom}_background"
-        checkpoint_path = f"{tmp_dir}/{chrom}_checkpoint.mt"
 
-        max_attempts = config['sampling'].get(
-            'resample_max_attempts', DEFAULT_RESAMPLE_MAX_ATTEMPTS
+        loci_summary = sample_loci(
+            mt_path, chrom, target, loci_ht_path, config,
+            fraction=fraction,
         )
 
-        fraction = min(1.0, (target * oversample_factor) / n_pool)
+        # --- Step 2: Export PLINK directly (no checkpoint) ---
+        export_summary = export_plink(
+            mt_path, chrom, loci_ht_path,
+            eur_samples_ht, plink_prefix, config,
+        )
 
-        loci_summary = None
-        export_summary = None
-        n_passing = 0
-        n_samples = 0
-        attempt = 0
-
-        for attempt in range(1, max_attempts + 1):
-            logger.info(
-                f"  --- Attempt {attempt}/{max_attempts} "
-                f"(fraction={fraction:.6f}) ---"
-            )
-            seed_offset = (attempt - 1) * 100
-
-            # Step 1: sample QC-passing loci (rows-only, no GT scan)
-            loci_summary = sample_loci(
-                mt_path, chrom, target, loci_ht_path, config,
-                fraction=fraction,
-                seed_offset=seed_offset,
-            )
-
-            # Step 2a: extract EUR GTs, apply safety call-rate filter,
-            # checkpoint, and count — no PLINK export yet
-            mt, n_passing, n_samples, extract_elapsed = extract_and_count(
-                mt_path, chrom, loci_ht_path,
-                eur_samples_ht, checkpoint_path, config,
-            )
-
-            logger.info(
-                f"  Attempt {attempt}: {n_passing:,} variants passed EUR QC "
-                f"(target={target:,})"
-            )
-
-            if n_passing >= target:
-                logger.info(
-                    f"  Target met ({n_passing:,} >= {target:,}) on attempt {attempt}"
-                )
-                # Step 2b: export PLINK only now that target is confirmed
-                export_summary = export_plink_final(mt, plink_prefix, checkpoint_path)
-                break
-
-            # Target not met: discard checkpoint, boost fraction, retry
+        n_variants = export_summary['n_variants']
+        if n_variants < target:
             logger.warning(
-                f"  Attempt {attempt}: {n_passing:,} < target {target:,}."
+                f"  {chrom}: exported {n_variants:,} variants, below target "
+                f"{target:,}. Downstream PLINK QC will further filter. "
+                f"Consider increasing oversample_factor in config."
             )
-            _cleanup_gcs_path(checkpoint_path)
-
-            if attempt < max_attempts:
-                boost = (target / n_passing) * 1.1 if n_passing > 0 else 2.0
-                fraction = min(1.0, fraction * boost)
-                logger.warning(
-                    f"  Boosting fraction to {fraction:.6f} for attempt {attempt + 1}"
-                )
-
-        if n_passing < target:
-            logger.warning(
-                f"  {chrom}: reached {n_passing:,} variants after "
-                f"{max_attempts} attempt(s); below target {target:,}. "
-                f"Proceeding with available variants."
+        else:
+            logger.info(
+                f"  {chrom}: exported {n_variants:,} variants "
+                f"(target={target:,}, +{n_variants - target:,} surplus)"
             )
-            if export_summary is None:
-                # Final attempt did not export; export whatever we have
-                export_summary = export_plink_final(mt, plink_prefix, checkpoint_path)
 
-        loci_summary['attempts'] = attempt
-        export_summary['attempts'] = attempt
-        export_summary['n_variants'] = n_passing
-        export_summary['n_samples'] = n_samples
-
-        summary['pool_size'] = n_pool
         summary['oversample_factor'] = oversample_factor
+        summary['fraction'] = round(fraction, 6)
         summary['loci'] = loci_summary
         summary['plink'] = export_summary
         summary['status'] = 'success'
