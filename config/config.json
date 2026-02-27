@@ -14,7 +14,7 @@
         "regenie_step1_plink": "results/1-bg_snp/plink_step1/step1_500k",
         "regenie_pred_list": "results/1-bg_snp/regenie/MS_null_model_pred.list",
         "loci_bed": "results/2-locus_definition/target_loci.bed",
-        "ld_reference": "results/1-bg_snp/plink_qc/all_background_final_qc"
+        "ld_reference": "results/1-bg_snp/plink_pruned/all_background_pruned"
     },
     "params": {
         "random_seed": 42,
@@ -35,7 +35,7 @@
         "min_call_rate": 0.95,
         "hail_min_maf": 0.1,
         "hail_min_variant_call_rate": 0.99,
-        "oversample_factor": 3,
+        "oversample_factor": 2,
         "avoid_hla": true,
         "hla_region": {
             "chrom": "6",
