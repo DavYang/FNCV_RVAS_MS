@@ -93,3 +93,12 @@ The pipeline is structured sequentially. The outputs of each phase directly dict
 
 * **Inputs:** Phase 1 Null Model (`.loco`), `MS_phenotype.txt`, `MS_covariates.txt`, WGS BGEN files (filtered to Loci), and Phase 3 Group Files.
 * **Outputs:** Final enrichment delta and empirical significance calculated via label-shuffling permutation tests.
+
+
+#### Order of steps
+
+* Step 00: Generate the phenotype and covariate files required for Regenie background. model generation (Regenie step1)
+
+* Step 01: Generate and QC background SNPs used for Regenie background model generation.
+
+* Step 02: Generate loci for FNCV RVAS
