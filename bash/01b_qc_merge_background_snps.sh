@@ -10,22 +10,22 @@ set -e
 #   2. LD prune    (--indep-pairwise; MHC excluded on chr6)
 #   3. Extract pruned-in variants into a compact PLINK fileset
 #
-# After all 22 chromosomes:
+# After all 22 chromosomes are QCed:
 #   4. Merge pruned per-chrom files (~15-25K variants each)
-#   5. Optional thin to TARGET_SNPS if total exceeds it
+#   5. Thin down to TARGET_SNPS if total exceeds it (to be used by Regenie)
 #
 # This replaces the previous two-script workflow (02 + 02b) that tried
 # to merge 3.3M QC'd variants (~90 GB .bed), which exceeded disk space.
 # LD pruning per chromosome reduces the merge to ~200-500K variants.
 # ---------------------------------------------------------------------------
 # Usage:
-#   nohup bash bash/02_qc_merge_background_snps.sh > /dev/null 2>&1 &
+#   nohup bash bash/01b_qc_merge_background_snps.sh > /dev/null 2>&1 &
 #
 #   # Force re-run (deletes pruned + merged outputs)
-#   bash bash/02_qc_merge_background_snps.sh --force
+#   bash bash/01b_qc_merge_background_snps.sh --force
 #
 # Monitor:
-#   tail -f logs/02_qc_merge_*.log
+#   tail -f logs/01b_qc_merge_*.log
 #
 # Input:  results/1-bg_snp/plink_no-qc/chrN_background.{bed,bim,fam}
 # Output: results/1-bg_snp/plink_step1/step1_500k.{bed,bim,fam}
@@ -44,18 +44,23 @@ STEP1_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_step1"
 TMP_DIR="${PROJECT_DIR}/tmp/prune"
 LOG_DIR="${PROJECT_DIR}/logs"
 
+# GCS location of raw (no-QC) per-chromosome PLINK files from Hail export
+GCS_PLINK_BASE="gs://fc-secure-b43840eb-548f-464d-bece-31ac7a969abd/results/FNCV_RVAS_MS/background_snps_20260226"
+
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="${LOG_DIR}/02_qc_merge_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/01b_qc_merge_${TIMESTAMP}.log"
 MERGE_LIST="${PRUNE_DIR}/merge_list.txt"
 
 # ---------------------------------------------------------------------------
-# QC thresholds
+# QC thresholds (read from config.json plink_qc section for cross-step consistency)
 # ---------------------------------------------------------------------------
-GENO=0.05
-MAF=0.01
-HWE="1e-6"
+MAF=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['plink_qc']['maf'])")
+HWE=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['plink_qc']['hwe'])")
+GENO=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['plink_qc']['geno'])")
+MIND=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['plink_qc']['mind'])")
+MAX_ALLELES=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['plink_qc']['max_alleles'])")
+SNPS_ONLY=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['plink_qc']['snps_only'])")
 HWE_SAMPLE_TERM=0        # explicit sample-size term to suppress PLINK2 warning
-MIND=0.1
 
 # ---------------------------------------------------------------------------
 # LD pruning parameters
@@ -112,7 +117,7 @@ log "Input dir    : ${INPUT_DIR}"
 log "QC dir       : ${QC_DIR}"
 log "Prune dir    : ${PRUNE_DIR}"
 log "Step1 dir    : ${STEP1_DIR}"
-log "QC params    : MAF=${MAF}, GENO=${GENO}, HWE=${HWE} (st=${HWE_SAMPLE_TERM}), MIND=${MIND}"
+log "QC params    : MAF=${MAF}, GENO=${GENO}, HWE=${HWE} (st=${HWE_SAMPLE_TERM}), MIND=${MIND}, snps-only=${SNPS_ONLY}, max-alleles=${MAX_ALLELES}"
 log "LD prune     : window=${LD_WINDOW}, step=${LD_STEP}, r2=${LD_R2}"
 log "MHC exclude  : chr${MHC_CHROM}:${MHC_START}-${MHC_END}"
 log "Target SNPs  : ${TARGET_SNPS}"
@@ -145,6 +150,23 @@ for chr_num in $(seq 1 22); do
     INPUT_PREFIX="${INPUT_DIR}/${chr_name}_background"
     QC_PREFIX="${QC_DIR}/${chr_name}_background_qc"
     PRUNED_PREFIX="${PRUNE_DIR}/${chr_name}_pruned"
+
+    # Download from GCS if local input is missing
+    if [ ! -f "${INPUT_PREFIX}.bed" ]; then
+        log "[${chr_name}] Local input missing, downloading from GCS..."
+        mkdir -p "${INPUT_DIR}"
+        if gsutil -m cp \
+            "${GCS_PLINK_BASE}/${chr_name}/${chr_name}_background.bed" \
+            "${GCS_PLINK_BASE}/${chr_name}/${chr_name}_background.bim" \
+            "${GCS_PLINK_BASE}/${chr_name}/${chr_name}_background.fam" \
+            "${INPUT_DIR}/" 2>&1; then
+            log "[${chr_name}] Downloaded from GCS"
+        else
+            log "[${chr_name}] SKIPPED - GCS download failed"
+            FAILED+=("${chr_name}")
+            continue
+        fi
+    fi
 
     # Verify input exists
     if [ ! -f "${INPUT_PREFIX}.bed" ]; then
@@ -179,7 +201,8 @@ for chr_num in $(seq 1 22); do
             --geno "${GENO}" \
             --hwe "${HWE}" "${HWE_SAMPLE_TERM}" \
             --mind "${MIND}" \
-            --max-alleles 2 \
+            --snps-only "${SNPS_ONLY}" \
+            --max-alleles "${MAX_ALLELES}" \
             --make-bed \
             --out "${QC_PREFIX}" \
             --threads "${THREADS}" \
@@ -392,5 +415,5 @@ ls -lh "${FINAL_PREFIX}".{bed,bim,fam} 2>/dev/null | while read -r line; do
     log "  ${line}"
 done
 log ""
-log "Next step: bash bash/03_run_regenie_step1.sh"
+log "Next step: bash bash/01c_run_regenie_step1.sh"
 log "============================================================"

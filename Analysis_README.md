@@ -49,19 +49,46 @@ The pipeline is structured sequentially. The outputs of each phase directly dict
 
 ### Phase 2: Signal Dissection & Locus Definition
 
-**Goal:** Define the exact genomic windows (GWAS Loci) where the enrichment test will occur by generating independent loci for testing, defined by 95% credible sets.
+**Goal:** Define the exact genomic windows (GWAS Loci) where the enrichment test will occur by isolating independent association signals via conditional analysis.
 
-* **Note:** For Multiple Sclerosis, it is standard practice to exclude the MHC region (Chr6: 25-35Mb) from the general pipeline due to complex LD structures. This analysis will exclude this region.
+* **Note:** For Multiple Sclerosis, it is standard practice to exclude the MHC region (Chr6: 25-35Mb) due to complex LD. This analysis excludes the MHC throughout.
+
+Phase 2 is split into three sub-steps, each processed **per chromosome** for memory efficiency (recommended by GCTA authors):
+
+#### Step 02: LD Reference QC (`02_qc_ld_reference.sh`)
+
+Build per-chromosome LD reference panels from the raw PLINK files exported by Hail. Samples are already EUR-only (234K) from Phase 1 Hail export.
+
+* **QC pipeline (PLINK2):**
+  1. Variant QC: `--maf 0.01 --hwe 1e-6 --geno 0.05 --mind 0.05 --snps-only just-acgt --max-alleles 2`
+  2. Remove duplicate variant IDs: `--rm-dup exclude-all`
+* **Input:** `results/1-bg_snp/plink_no-qc/chrN_background.{bed,bim,fam}`
+* **Output:** `results/2-locus_definition/ld_ref/chrN_ld_ref.{bed,bim,fam}` -> GCS
+
+#### Step 02a: GWAS Summary Stats Export (`02a_export_gwas_ma.sh`)
+
+Export full-chromosome `.ma` summary statistics from the AllxAll GWAS Hail Table. GCTA-COJO requires **all SNPs** per chromosome (not just per-window) to correctly estimate phenotypic variance.
+
+* **Tool:** Hail (available at `/opt/conda` on AoU VM)
+* **Input:** AllxAll GWAS HT (`gs://fc-aou-datasets-controlled/AllxAll/...`)
+* **Output:** `results/2-locus_definition/ma/chrN.ma` (22 files) -> GCS
+* `.ma` format: `SNP A1 A2 freq b se p N` (tab-separated)
+
+#### Step 02b: GCTA-COJO Locus Definition (`02b_run_cojo.sh`)
+
+Run conditional/joint analysis per chromosome to identify independent signals.
+
 * **Methods:**
-* **Lead SNP Selection:** Identify significant hits (p < 5e-8) from `NS_326.1` summary statistics.
-* **Locus Definition:** * *GCTA-COJO*: Used for conditional analysis to find secondary independent SNPs.
-* *SuSiE Fine-Mapping*: Used to narrow the window to the 95% Credible Set.
-
-
-
-
-* **Inputs:** AoU GWAS Summary Statistics + Per-chromosome PLINK files (as LD reference).
-* **Outputs:** `target_loci.bed` (Chromosome, Start, End, Locus_ID).
+  1. **Lead SNP selection:** Identify significant hits (p < 5e-8) from GWAS HT, exclude MHC.
+  2. **Greedy clumping:** Group hits into non-overlapping windows (lead SNP +/- 500kb flank).
+  3. **Per-locus COJO:** For each locus, subset LD reference to window (+500kb LD padding), run `--cojo-slct` with `--cojo-p 5e-8`.
+  4. **Assemble outputs:** Merge independent signals into BED file.
+* *SuSiE Fine-Mapping*: Future step to narrow windows to 95% Credible Sets.
+* **Inputs:** Per-chrom LD ref PLINK + per-chrom `.ma` files + GCTA binary
+* **Outputs:**
+  - `results/2-locus_definition/target_loci.bed` (chrom, start, end, locus_id)
+  - `results/2-locus_definition/all_independent_signals.tsv`
+  - `results/2-locus_definition/cojo/chrN/{locus}.jma.cojo`
 * **Integration:** These coordinates restrict Phase 3 so that variant classification only occurs within strictly defined, disease-associated regions.
 
 ### Phase 3: Methylation-Based Variant Classification
@@ -95,10 +122,42 @@ The pipeline is structured sequentially. The outputs of each phase directly dict
 * **Outputs:** Final enrichment delta and empirical significance calculated via label-shuffling permutation tests.
 
 
-#### Order of steps
+#### Order of Steps
 
-* Step 00: Generate the phenotype and covariate files required for Regenie background. model generation (Regenie step1)
+| Step | Script | Description | Depends on |
+|------|--------|-------------|------------|
+| 00 | `00_run_phenotype_covariates.sh` | Phenotype + covariate files -> GCS | CDR access |
+| 01a | `01a_build_background_snps.sh` | Per-chrom PLINK export via Hail -> GCS | Hail/Dataproc |
+| 01b | `01b_qc_merge_background_snps.sh` | QC, LD-prune, merge, thin to 500K -> GCS | 01a |
+| 01c | `01c_run_regenie_step1.sh` | REGENIE Step 1 null model (LOCO) -> GCS | 00, 01b |
+| 02 | `02_qc_ld_reference.sh` | Per-chrom LD ref QC for GCTA-COJO -> GCS | 01a |
+| 02a | `02a_export_gwas_ma.sh` | Per-chrom .ma summary stats via Hail -> GCS | CDR GWAS HT |
+| 02b | `02b_run_cojo.sh` | GCTA-COJO per chromosome -> target_loci.bed -> GCS | 02, 02a |
 
-* Step 01: Generate and QC background SNPs used for Regenie background model generation.
+Steps 02 and 02a can run in parallel (independent inputs). Step 02b depends on both.
+Steps 01b-01c and 02-02b are independent branches and can run in parallel.
 
-* Step 02: Generate loci for FNCV RVAS
+Each script uploads its outputs to GCS and can pull inputs from GCS if missing locally.
+
+#### VM Crash Recovery
+
+All intermediate and final outputs are backed up to GCS. After a VM crash:
+
+```bash
+# Restore phenotype/covariate files from GCS (no regeneration)
+bash bash/00_run_phenotype_covariates.sh --restore
+
+# 01b auto-downloads raw PLINK files from GCS if missing locally
+nohup bash bash/01b_qc_merge_background_snps.sh > /dev/null 2>&1 &
+
+# 01c auto-downloads phenotype + PLINK step1 files from GCS if missing
+nohup bash bash/01c_run_regenie_step1.sh > /dev/null 2>&1 &
+
+# 02_qc auto-downloads raw PLINK from GCS if missing
+nohup bash bash/02_qc_ld_reference.sh > /dev/null 2>&1 &
+
+# 02b auto-downloads LD ref + .ma files from GCS if missing
+nohup bash bash/02b_run_cojo.sh > /dev/null 2>&1 &
+```
+
+All scripts support `--force` to re-run even if outputs already exist.

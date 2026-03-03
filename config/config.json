@@ -14,7 +14,9 @@
         "regenie_step1_plink": "results/1-bg_snp/plink_step1/step1_500k",
         "regenie_pred_list": "results/1-bg_snp/regenie/MS_null_model_pred.list",
         "loci_bed": "results/2-locus_definition/target_loci.bed",
-        "ld_reference": "results/1-bg_snp/plink_pruned/all_background_pruned"
+        "ld_reference": "results/2-locus_definition/ld_ref",
+        "locus_def_dir": "results/2-locus_definition",
+        "gwas_ma_dir": "results/2-locus_definition/ma"
     },
     "params": {
         "random_seed": 42,
@@ -28,6 +30,14 @@
         "age_reference_year": 2024,
         "ms_omop_concept_ids": [374919],
         "ms_icd10_codes": ["G35"]
+    },
+    "plink_qc": {
+        "maf": 0.01,
+        "hwe": "1e-6",
+        "geno": 0.05,
+        "mind": 0.05,
+        "max_alleles": 2,
+        "snps_only": "just-acgt"
     },
     "sampling": {
         "target_total_snps": 1000000,

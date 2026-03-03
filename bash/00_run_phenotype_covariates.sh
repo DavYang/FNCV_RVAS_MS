@@ -26,6 +26,9 @@ set -eo pipefail
 #   # Force overwrite of existing GCS outputs
 #   bash bash/00_run_phenotype_covariates.sh --force
 #
+#   # Restore files from GCS to local disk (crash recovery, no regeneration)
+#   bash bash/00_run_phenotype_covariates.sh --restore
+#
 # Monitor:
 #   tail -f logs/00_phenotype_covariates_*.log
 #   cat logs/00_phenotype_covariates.pid
@@ -66,6 +69,27 @@ echo "PID file    : ${PID_FILE}"
 echo "Log file    : ${LOG_FILE}"
 echo ""
 
+# ---------------------------------------------------------------------------
+# Parse flags early so --restore can skip BigQuery/CDR checks
+# ---------------------------------------------------------------------------
+EXTRA_ARGS=""
+RESTORE_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --test-mode) EXTRA_ARGS="$EXTRA_ARGS --test-mode" ;;
+        --force)     EXTRA_ARGS="$EXTRA_ARGS --force" ;;
+        --test-n=*)  EXTRA_ARGS="$EXTRA_ARGS $arg" ;;
+        --restore)   RESTORE_ONLY=1 ;;
+        *)
+            echo "WARNING: Unknown argument '$arg' — passing through to Python script"
+            EXTRA_ARGS="$EXTRA_ARGS $arg"
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Environment checks (WORKSPACE_BUCKET + GOOGLE_PROJECT always required)
+# ---------------------------------------------------------------------------
 if [ -z "$WORKSPACE_BUCKET" ]; then
     echo "ERROR: WORKSPACE_BUCKET environment variable not set"
     exit 1
@@ -81,17 +105,43 @@ if [ -z "$GOOGLE_PROJECT" ]; then
 fi
 echo "Project     : $GOOGLE_PROJECT"
 
-if [ -z "$WORKSPACE_CDR" ]; then
-    echo "ERROR: WORKSPACE_CDR environment variable not set"
-    exit 1
-fi
-echo "CDR dataset : $WORKSPACE_CDR"
-
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "ERROR: Config file not found: ${CONFIG_FILE}"
     exit 1
 fi
 echo "Config      : $CONFIG_FILE"
+
+# ---------------------------------------------------------------------------
+# Restore mode: download existing outputs from GCS without regenerating
+# (skips CDR, Python script, and BigQuery checks)
+# ---------------------------------------------------------------------------
+LOCAL_PHENO_DIR=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['outputs']['phenotype_dir'])")
+GCS_PHENO_DIR="${WORKSPACE_BUCKET}/${LOCAL_PHENO_DIR}"
+
+if [ "${RESTORE_ONLY}" -eq 1 ]; then
+    echo "[--restore] Downloading existing phenotype/covariate files from GCS..."
+    mkdir -p "${LOCAL_PHENO_DIR}"
+    gsutil -u "${GOOGLE_PROJECT}" cp "${GCS_PHENO_DIR}/MS_phenotype.txt" "${LOCAL_PHENO_DIR}/" \
+        && echo "  Downloaded MS_phenotype.txt" \
+        || { echo "ERROR: Failed to download MS_phenotype.txt from GCS"; exit 1; }
+    gsutil -u "${GOOGLE_PROJECT}" cp "${GCS_PHENO_DIR}/MS_covariates.txt" "${LOCAL_PHENO_DIR}/" \
+        && echo "  Downloaded MS_covariates.txt" \
+        || { echo "ERROR: Failed to download MS_covariates.txt from GCS"; exit 1; }
+    echo ""
+    echo "Restored to: ${LOCAL_PHENO_DIR}/"
+    ls -lh "${LOCAL_PHENO_DIR}"/MS_*.txt
+    rm -f "${PID_FILE}"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Additional checks only needed for full regeneration (not --restore)
+# ---------------------------------------------------------------------------
+if [ -z "$WORKSPACE_CDR" ]; then
+    echo "ERROR: WORKSPACE_CDR environment variable not set"
+    exit 1
+fi
+echo "CDR dataset : $WORKSPACE_CDR"
 
 if [ ! -f "$PYTHON_SCRIPT" ]; then
     echo "ERROR: Python script not found: ${PYTHON_SCRIPT}"
@@ -99,22 +149,6 @@ if [ ! -f "$PYTHON_SCRIPT" ]; then
 fi
 echo "Script      : $PYTHON_SCRIPT"
 echo ""
-
-# ---------------------------------------------------------------------------
-# Parse optional flags passed through to Python script
-# ---------------------------------------------------------------------------
-EXTRA_ARGS=""
-for arg in "$@"; do
-    case "$arg" in
-        --test-mode) EXTRA_ARGS="$EXTRA_ARGS --test-mode" ;;
-        --force)     EXTRA_ARGS="$EXTRA_ARGS --force" ;;
-        --test-n=*)  EXTRA_ARGS="$EXTRA_ARGS $arg" ;;
-        *)
-            echo "WARNING: Unknown argument '$arg' — passing through to Python script"
-            EXTRA_ARGS="$EXTRA_ARGS $arg"
-            ;;
-    esac
-done
 
 # ---------------------------------------------------------------------------
 # Run Python script
@@ -141,15 +175,9 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "  GCS : ${WORKSPACE_BUCKET}/results/0-phenotype/MS_phenotype.txt"
     echo "  GCS : ${WORKSPACE_BUCKET}/results/0-phenotype/MS_covariates.txt"
     echo ""
-    echo "REGENIE Step 1 usage:"
-    echo "  regenie \\"
-    echo "    --step 1 \\"
-    echo "    --bed results/1-bg_snp/plink_qc/all_background_final_qc \\"
-    echo "    --phenoFile results/0-phenotype/MS_phenotype.txt \\"
-    echo "    --covarFile results/0-phenotype/MS_covariates.txt \\"
-    echo "    --covarColList Age,Sex,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10 \\"
-    echo "    --bt --bsize 1000 --lowmem \\"
-    echo "    --out results/1-bg_snp/regenie/MS_null_model"
+    echo "Next step:"
+    echo "  bash bash/01b_qc_merge_background_snps.sh"
+    echo "  bash bash/01c_run_regenie_step1.sh"
 else
     echo "Phase 0 FAILED (exit code: ${EXIT_CODE}) after ${ELAPSED_FMT}"
     echo "Check log: ${LOG_FILE}"

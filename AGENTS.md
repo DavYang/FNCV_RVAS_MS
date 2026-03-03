@@ -75,3 +75,27 @@ Here's how the All of Us infrastructure is organized:
 - **Use for:** Truly temporary files during analysis session
 
 Results should be copied and saved both ways, both on the current VM and GCS (virtual machine, google cloud storage)
+
+---
+
+## Working Directory Convention
+
+All bash and Python scripts assume **CWD = project root** (`/home/jupyter/FNCV_RVAS_MS` on AoU VM). Always `cd` to project root before running any script. All relative paths in scripts and config are resolved from this directory.
+
+---
+
+## Pre-Installed Tools on AoU Researcher Workbench
+
+Refer to `prompt_info/AoU_programs.md` for a full list of packages in the `/opt/conda` environment. Key tools available:
+
+- **Hail** (0.2.126) -- distributed genomics, available on VM (not just Dataproc)
+- **Python** (3.10.12) with pandas, numpy, scipy, scikit-learn
+- **Google Cloud SDK** (gsutil, BigQuery client)
+- **R** (4.3.1) with Bioconductor packages
+
+External tools installed separately by this project:
+- **PLINK2** -- binary QC, LD pruning, subsetting
+- **GCTA** -- COJO conditional/joint analysis (`tools/gcta64`, installed via `python/install_gcta.py`)
+- **REGENIE** -- whole genome regression
+
+Reference: https://support.researchallofus.org/hc/en-us/articles/6736634017428-Pre-installed-tools-on-Researcher-Workbench

@@ -2,14 +2,14 @@
 set -eo pipefail
 
 # ---------------------------------------------------------------------------
-# 03_run_regenie_step1.sh
+# 01c_run_regenie_step1.sh
 #
 # Phase 1: Run REGENIE Step 1 (Leave-One-Chromosome-Out whole-genome regression)
 # to fit the null model for binary trait (MS) correcting for age, sex, and
 # top 10 ancestry PCs.
 #
 # Inputs  (all local on VM):
-#   results/1-bg_snp/plink_step1/step1_500k.{bed,bim,fam}  (500K downsampled; see 02b_downsample_background_snps.sh)
+#   results/1-bg_snp/plink_step1/step1_500k.{bed,bim,fam}  (500K pruned; see 01b_qc_merge_background_snps.sh)
 #   results/0-phenotype/MS_phenotype.txt
 #   results/0-phenotype/MS_covariates.txt
 #
@@ -20,16 +20,16 @@ set -eo pipefail
 #
 # Usage:
 #   # Production run (nohup)
-#   nohup bash bash/03_run_regenie_step1.sh > /dev/null 2>&1 &
+#   nohup bash bash/01c_run_regenie_step1.sh > /dev/null 2>&1 &
 #
 #   # Force re-run even if outputs exist
-#   bash bash/03_run_regenie_step1.sh --force
+#   bash bash/01c_run_regenie_step1.sh --force
 #
 # Monitor:
-#   tail -f logs/03_regenie_step1_*.log
-#   cat logs/03_regenie_step1.pid
-#   ps -p $(cat logs/03_regenie_step1.pid) -o pid,etime,cmd
-#   kill $(cat logs/03_regenie_step1.pid)
+#   tail -f logs/01c_regenie_step1_*.log
+#   cat logs/01c_regenie_step1.pid
+#   ps -p $(cat logs/01c_regenie_step1.pid) -o pid,etime,cmd
+#   kill $(cat logs/01c_regenie_step1.pid)
 # ---------------------------------------------------------------------------
 
 trap '' HUP
@@ -84,8 +84,8 @@ _upload_results() {
 mkdir -p "${OUT_DIR}" "${TMP_DIR}" "${LOG_DIR}"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="${LOG_DIR}/03_regenie_step1_${TIMESTAMP}.log"
-PID_FILE="${LOG_DIR}/03_regenie_step1.pid"
+LOG_FILE="${LOG_DIR}/01c_regenie_step1_${TIMESTAMP}.log"
+PID_FILE="${LOG_DIR}/01c_regenie_step1.pid"
 
 exec < /dev/null
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -124,6 +124,37 @@ if ! command -v regenie &> /dev/null; then
 fi
 REGENIE_VERSION=$(regenie --version 2>&1 | head -1 || true)
 echo "REGENIE     : ${REGENIE_VERSION}"
+
+# ---------------------------------------------------------------------------
+# Download inputs from GCS if missing locally (crash recovery)
+# ---------------------------------------------------------------------------
+_ensure_local() {
+    local local_path="$1"
+    local gcs_path="$2"
+    if [ ! -f "${local_path}" ]; then
+        echo "  Downloading: ${gcs_path}"
+        mkdir -p "$(dirname "${local_path}")"
+        gsutil -u "${GOOGLE_PROJECT}" cp "${gcs_path}" "${local_path}"
+    fi
+}
+
+if [ -n "${WORKSPACE_BUCKET}" ]; then
+    if [[ "${WORKSPACE_BUCKET}" != gs://* ]]; then
+        WORKSPACE_BUCKET="gs://${WORKSPACE_BUCKET}"
+    fi
+
+    echo "Checking for missing input files (will download from GCS if needed)..."
+
+    # Phenotype and covariate files
+    _ensure_local "${PHENO_FILE}" "${WORKSPACE_BUCKET}/results/0-phenotype/MS_phenotype.txt"
+    _ensure_local "${COVAR_FILE}" "${WORKSPACE_BUCKET}/results/0-phenotype/MS_covariates.txt"
+
+    # PLINK step1 files
+    for ext in bed bim fam; do
+        _ensure_local "${PLINK_PREFIX}.${ext}" "${WORKSPACE_BUCKET}/results/1-bg_snp/plink_step1/step1_500k.${ext}"
+    done
+    echo ""
+fi
 
 # Validate PLINK fileset
 for ext in bed bim fam; do

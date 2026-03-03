@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
-"""
-Phase 2a: Lead SNP extraction, greedy clumping, and GCTA-COJO signal dissection.
+"""Phase 2b: Lead SNP extraction, greedy clumping, and GCTA-COJO signal dissection.
+
+Processes each chromosome independently using:
+  - Pre-built per-chromosome .ma files (from 02a_export_gwas_ma.py)
+  - Per-chromosome LD reference PLINK files (from 02_qc_ld_reference.sh)
+
+For each chromosome with significant GWAS hits:
+  1. Greedy clumping to define candidate loci
+  2. PLINK2 subset of LD ref to locus window (+500kb LD padding)
+  3. GCTA-COJO --cojo-slct for stepwise conditional analysis
+  4. Parse .jma.cojo output for independent signals
 
 Outputs:
   - results/2-locus_definition/all_independent_signals.tsv
   - results/2-locus_definition/target_loci.bed
-  - results/2-locus_definition/cojo/{locus_id}.jma.cojo  (per-locus GCTA output)
+  - results/2-locus_definition/cojo/chrN/{locus_id}.jma.cojo  (per locus)
+
+Usage:
+    python python/02b_define_loci.py --config config/config.json
+    python python/02b_define_loci.py --config config/config.json --force
+    python python/02b_define_loci.py --config config/config.json --chrom chr6
 """
 
 import argparse
+import json
+import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -20,7 +37,19 @@ from typing import Dict, List, Optional, Tuple
 import hail as hl
 import pandas as pd
 
-from utils import load_config, setup_logger
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logger(name: str) -> logging.Logger:
+    """Set up a logger writing to stdout with timestamps."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    return logging.getLogger(name)
+
 
 logger = setup_logger("define_loci")
 
@@ -28,7 +57,6 @@ logger = setup_logger("define_loci")
 # Constants
 # ---------------------------------------------------------------------------
 
-# AllxAll GWAS HT field name candidates (checked in order; first match wins)
 _FIELD_CANDIDATES: Dict[str, List[str]] = {
     'beta':   ['beta', 'effect_size', 'b'],
     'se':     ['standard_error', 'se', 'stderr'],
@@ -48,17 +76,50 @@ CHR_SIZES: Dict[str, int] = {
     'chr22': 50818468,
 }
 
+# Default GCTA-COJO parameters
+DEFAULT_COJO_P = 5e-8
+DEFAULT_COJO_WIND = 10000
+DEFAULT_COJO_COLLINEAR = 0.9
+
+# LD padding around each locus for PLINK subset
+LD_PAD_BP = 500_000
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def load_config(config_path: str) -> dict:
+    """Load JSON config file."""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, "r") as f:
+        return json.load(f)
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Phase 2a: GCTA-COJO locus definition")
-    parser.add_argument('--config', default='config/config.json',
-                        help='Path to config.json')
-    parser.add_argument('--output-dir', default=None,
-                        help='Override base output directory')
+    parser = argparse.ArgumentParser(
+        description="Phase 2b: GCTA-COJO locus definition (per-chromosome)"
+    )
+    parser.add_argument(
+        '--config', default='config/config.json',
+        help='Path to config.json'
+    )
+    parser.add_argument(
+        '--output-dir', default=None,
+        help='Override base output directory for locus definition'
+    )
+    parser.add_argument(
+        '--chrom', default=None,
+        help='Process a single chromosome (e.g. chr6). Default: all with hits.'
+    )
+    parser.add_argument(
+        '--force', action='store_true',
+        help='Re-run COJO even if .jma.cojo output exists'
+    )
     return parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -70,14 +131,14 @@ def _fmt_elapsed(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
     m, s = divmod(int(seconds), 60)
-    return f"{m}m {s:02d}s"
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s"
 
 
 def _resolve_field(ht: hl.Table, canonical: str, candidates: List[str]) -> str:
-    """
-    Return the first matching field name from candidates present in ht.row.
-    Raises ValueError with a diagnostic message if none found.
-    """
+    """Return the first matching field name from candidates present in ht.row."""
     row_fields = set(ht.row)
     for name in candidates:
         if name in row_fields:
@@ -89,21 +150,12 @@ def _resolve_field(ht: hl.Table, canonical: str, candidates: List[str]) -> str:
     )
 
 
-def _normalize_contig(contig: str) -> str:
-    """Ensure contig has chr-prefix for GRCh38."""
-    if not contig.startswith('chr'):
-        return f"chr{contig}"
-    return contig
-
-
 def _run_command(
     cmd: List[str],
     log_path: str,
     label: str,
 ) -> Tuple[bool, str]:
-    """
-    Run a subprocess, tee stdout+stderr to log_path, and return (success, stderr_tail).
-    """
+    """Run a subprocess, tee stdout+stderr to log_path, return (success, stderr_tail)."""
     logger.info(f"  Running: {' '.join(cmd)}")
     try:
         with open(log_path, 'w') as fh:
@@ -115,7 +167,6 @@ def _run_command(
             )
         return True, ""
     except subprocess.CalledProcessError as exc:
-        # Read last 20 lines of log for error context
         tail = ""
         try:
             with open(log_path) as fh:
@@ -126,6 +177,13 @@ def _run_command(
         logger.error(f"  {label} FAILED (exit {exc.returncode})\n{tail}")
         return False, tail
 
+
+def _normalize_contig(contig: str) -> str:
+    """Ensure contig has chr-prefix for GRCh38."""
+    if not contig.startswith('chr'):
+        return f"chr{contig}"
+    return contig
+
 # ---------------------------------------------------------------------------
 # Step 1: Load and normalise GWAS HT
 # ---------------------------------------------------------------------------
@@ -135,11 +193,10 @@ def load_gwas_ht(
     p_thresh: float,
     mhc_interval: str,
 ) -> Tuple[hl.Table, hl.Table, Dict[str, str]]:
-    """
-    Load GWAS HT, resolve field names, filter p < p_thresh, exclude MHC.
+    """Load GWAS HT, resolve field names, filter p < p_thresh, exclude MHC.
 
     Returns:
-        gwas_ht    - full GWAS table (used for per-window .ma export)
+        gwas_ht    - full GWAS table (for reference)
         sig_ht     - significant-only table (p < p_thresh, no MHC)
         field_map  - mapping of canonical name -> actual HT field name
     """
@@ -152,12 +209,10 @@ def load_gwas_ht(
         for canonical, candidates in _FIELD_CANDIDATES.items()
     }
 
-    # Detect contig format (chr-prefixed or bare)
     sample_contig = gwas_ht.locus.contig.collect()[0]
     has_chr_prefix = sample_contig.startswith('chr')
     logger.info(f"  Contig format in HT: '{sample_contig}' (chr-prefix: {has_chr_prefix})")
 
-    # Normalize MHC interval to match HT contig format
     if has_chr_prefix:
         mhc_str = mhc_interval if mhc_interval.startswith('chr') else f"chr{mhc_interval}"
     else:
@@ -192,8 +247,7 @@ def greedy_clump(
     flank: int,
     has_chr_prefix: bool,
 ) -> List[Dict]:
-    """
-    Greedy positional clumping of significant SNPs into non-overlapping windows.
+    """Greedy positional clumping of significant SNPs into non-overlapping windows.
 
     Returns list of dicts: {chrom, start, end, lead_snp_id, lead_pos, lead_p}
     """
@@ -220,7 +274,7 @@ def greedy_clump(
         end = pos + flank
 
         windows.append({
-            'chrom': chrom,
+            'chrom': _normalize_contig(chrom) if not chrom.startswith('chr') else chrom,
             'start': start,
             'end': end,
             'lead_snp_id': row['snp_id'],
@@ -228,7 +282,6 @@ def greedy_clump(
             'lead_p': row['p_value'],
         })
 
-        # Mark all SNPs within this window as consumed
         mask = (df['contig'] == chrom) & (df['position'] >= start) & (df['position'] <= end)
         consumed_idx = df[mask].index
         for idx in consumed_idx:
@@ -238,84 +291,44 @@ def greedy_clump(
     return windows
 
 # ---------------------------------------------------------------------------
-# Step 3: Export .ma summary stats file (local)
-# ---------------------------------------------------------------------------
-
-def export_ma_file(
-    gwas_ht: hl.Table,
-    field_map: Dict[str, str],
-    chrom: str,
-    start: int,
-    end: int,
-    ma_path: str,
-) -> bool:
-    """
-    Filter GWAS HT to window, write GCTA .ma format to a local file.
-
-    GCTA .ma columns: SNP A1 A2 freq b se p N
-    """
-    logger.info(f"  Exporting .ma file for {chrom}:{start}-{end} -> {ma_path} ...")
-    t0 = time.time()
-
-    interval = hl.locus_interval(chrom, start, end, reference_genome='GRCh38',
-                                  includes_end=True)
-    win_ht = gwas_ht.filter(interval.contains(gwas_ht.locus))
-
-    win_ht = win_ht.annotate(
-        SNP=(hl.str(win_ht.locus.contig) + ':' +
-             hl.str(win_ht.locus.position) + ':' +
-             win_ht.alleles[0] + ':' + win_ht.alleles[1]),
-        A1=win_ht.alleles[1],
-        A2=win_ht.alleles[0],
-        freq=win_ht[field_map['af']],
-        b=win_ht[field_map['beta']],
-        se=win_ht[field_map['se']],
-        p=win_ht[field_map['pval']],
-        N=hl.int32(win_ht[field_map['n']]),
-    )
-
-    # Export to a temp GCS path then localise, or export directly to local path
-    # via pandas (avoids GCS write for ephemeral .ma files)
-    df = win_ht.select('SNP', 'A1', 'A2', 'freq', 'b', 'se', 'p', 'N').to_pandas()
-
-    if df.empty:
-        logger.warning(f"  No variants in window {chrom}:{start}-{end}; skipping.")
-        return False
-
-    df.to_csv(ma_path, sep='\t', index=False)
-    logger.info(f"  .ma file: {len(df):,} variants ({_fmt_elapsed(time.time() - t0)})")
-    return True
-
-# ---------------------------------------------------------------------------
-# Step 4: PLINK subset per locus
+# Step 3: PLINK subset for locus (from per-chrom LD ref)
 # ---------------------------------------------------------------------------
 
 def extract_plink_subset(
     bfile: str,
-    chrom: str,
     start: int,
     end: int,
     work_dir: str,
+    locus_id: str,
     plink_threads: int = 4,
     plink_mem_mb: int = 8000,
 ) -> Optional[str]:
-    """
-    Extract a PLINK subset for the locus window (±1 Mb for LD context) from the
-    genome-wide LD reference bfile. Returns path to subset bfile prefix, or None
-    on failure.
-    """
-    # Expand window by 500 kb on each side for LD context
-    ld_start = max(1, start - 500_000)
-    ld_end = end + 500_000
-    chrom_num = chrom.replace('chr', '')
+    """Extract a PLINK subset for the locus window (+LD padding) from a
+    per-chromosome LD reference bfile.
 
-    subset_prefix = os.path.join(work_dir, f"subset_{chrom}_{start}_{end}")
+    No --chr needed since bfile is already single-chromosome.
+
+    Args:
+        bfile: PLINK bfile prefix (per-chrom LD ref).
+        start: Locus start position.
+        end: Locus end position.
+        work_dir: Temporary working directory.
+        locus_id: Locus identifier for file naming.
+        plink_threads: Number of threads for PLINK2.
+        plink_mem_mb: Memory limit in MB for PLINK2.
+
+    Returns:
+        Path to subset bfile prefix, or None on failure.
+    """
+    ld_start = max(1, start - LD_PAD_BP)
+    ld_end = end + LD_PAD_BP
+
+    subset_prefix = os.path.join(work_dir, f"subset_{locus_id}")
     log_path = f"{subset_prefix}_plink.log"
 
     cmd = [
         'plink2',
         '--bfile', bfile,
-        '--chr', chrom_num,
         '--from-bp', str(ld_start),
         '--to-bp', str(ld_end),
         '--make-bed',
@@ -325,7 +338,7 @@ def extract_plink_subset(
         '--no-psam-pheno',
     ]
 
-    success, _ = _run_command(cmd, log_path, f"plink2 subset {chrom}:{start}-{end}")
+    success, _ = _run_command(cmd, log_path, f"plink2 subset {locus_id}")
     if not success:
         return None
 
@@ -338,7 +351,7 @@ def extract_plink_subset(
     return subset_prefix
 
 # ---------------------------------------------------------------------------
-# Step 5: Run GCTA-COJO
+# Step 4: Run GCTA-COJO
 # ---------------------------------------------------------------------------
 
 def run_gcta_cojo(
@@ -346,31 +359,40 @@ def run_gcta_cojo(
     bfile: str,
     ma_path: str,
     out_prefix: str,
-    chrom: str,
     p_thresh: float,
 ) -> bool:
+    """Run GCTA-COJO --cojo-slct on a pre-extracted per-chrom PLINK subset.
+
+    No --chr flag needed since bfile is already single-chromosome.
+
+    Args:
+        gcta_bin: Path to GCTA binary.
+        bfile: PLINK bfile prefix for LD reference subset.
+        ma_path: Path to full-chromosome .ma file.
+        out_prefix: Output prefix for COJO results.
+        p_thresh: P-value threshold for --cojo-p.
+
+    Returns:
+        True if COJO ran successfully.
     """
-    Run GCTA-COJO --cojo-slct on a pre-extracted PLINK subset.
-    Stdout/stderr written to {out_prefix}.gcta.log.
-    """
-    chrom_num = chrom.replace('chr', '')
     log_path = f"{out_prefix}.gcta.log"
 
     cmd = [
         gcta_bin,
         '--bfile', bfile,
-        '--chr', chrom_num,
         '--cojo-file', ma_path,
         '--cojo-slct',
         '--cojo-p', str(p_thresh),
+        '--cojo-wind', str(DEFAULT_COJO_WIND),
+        '--cojo-collinear', str(DEFAULT_COJO_COLLINEAR),
         '--out', out_prefix,
     ]
 
-    success, _ = _run_command(cmd, log_path, f"GCTA-COJO {chrom}")
+    success, _ = _run_command(cmd, log_path, f"GCTA-COJO")
     return success
 
 # ---------------------------------------------------------------------------
-# Step 6: Parse COJO output
+# Step 5: Parse COJO output
 # ---------------------------------------------------------------------------
 
 def parse_cojo_output(
@@ -378,10 +400,8 @@ def parse_cojo_output(
     locus_id: str,
     chrom: str,
 ) -> Optional[pd.DataFrame]:
-    """
-    Parse GCTA .jma.cojo file. Returns DataFrame with independent signals,
-    or None if file missing/empty.
-    """
+    """Parse GCTA .jma.cojo file. Returns DataFrame with independent signals,
+    or None if file missing/empty."""
     if not os.path.exists(jma_path):
         logger.warning(f"  .jma.cojo not found: {jma_path} (no independent signals selected)")
         return None
@@ -402,7 +422,7 @@ def parse_cojo_output(
     return df
 
 # ---------------------------------------------------------------------------
-# Step 7: Assemble BED from COJO signals
+# Step 6: Assemble BED from COJO signals
 # ---------------------------------------------------------------------------
 
 def build_loci_bed(
@@ -412,20 +432,21 @@ def build_loci_bed(
     mhc_start: int,
     mhc_end: int,
 ) -> pd.DataFrame:
-    """
-    Build target_loci.bed from COJO independent signals.
+    """Build target_loci.bed from COJO independent signals.
 
-    Each signal becomes a locus: signal_pos ± flank, clipped to chr bounds.
+    Each signal becomes a locus: signal_pos +/- flank, clipped to chr bounds.
     MHC signals are excluded. Columns: chrom, start, end, locus_id.
     """
     rows = []
 
     for _, sig in all_signals_df.iterrows():
         chrom = sig['chrom']
-        # GCTA .jma.cojo column for position is 'bp'
         pos = int(sig.get('bp', sig.get('pos', 0)))
         if pos == 0:
-            logger.warning(f"  Could not determine position for signal in {sig.get('locus_id')}; skipping")
+            logger.warning(
+                f"  Could not determine position for signal in "
+                f"{sig.get('locus_id')}; skipping"
+            )
             continue
 
         start = max(1, pos - flank)
@@ -433,7 +454,6 @@ def build_loci_bed(
         if chrom in CHR_SIZES:
             end = min(end, CHR_SIZES[chrom])
 
-        # MHC exclusion on final signals
         if chrom == mhc_chrom and not (end < mhc_start or start > mhc_end):
             logger.info(f"  Excluding MHC-overlapping signal: {chrom}:{pos}")
             continue
@@ -453,12 +473,12 @@ def build_loci_bed(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Run Phase 2a: lead SNP extraction + GCTA-COJO signal dissection."""
+    """Run Phase 2b: lead SNP extraction + per-chromosome GCTA-COJO."""
     args = parse_args()
 
     run_start = time.time()
     logger.info("=" * 60)
-    logger.info("PHASE 2a: LOCUS DEFINITION (GCTA-COJO)")
+    logger.info("PHASE 2b: LOCUS DEFINITION (GCTA-COJO, per-chromosome)")
     logger.info("=" * 60)
     logger.info(f"  Timestamp : {datetime.now().isoformat()}")
     logger.info(f"  Config    : {args.config}")
@@ -466,49 +486,47 @@ def main() -> None:
     config = load_config(args.config)
 
     # --- Paths ---
-    project_dir = os.path.abspath(os.path.dirname(os.path.dirname(args.config)))
-    base_dir = args.output_dir or os.path.join(project_dir, config['outputs']['base_dir'])
-    locus_dir = os.path.join(base_dir, '2-locus_definition')
+    locus_dir = args.output_dir or config['outputs'].get(
+        'locus_def_dir', 'results/2-locus_definition'
+    )
     cojo_dir = os.path.join(locus_dir, 'cojo')
+    ma_dir = os.path.join(locus_dir, 'ma')
+    ld_ref_dir = config['outputs'].get(
+        'ld_reference', 'results/2-locus_definition/ld_ref'
+    )
+
     os.makedirs(cojo_dir, exist_ok=True)
 
     loci_bed_path = os.path.join(locus_dir, 'target_loci.bed')
     signals_path = os.path.join(locus_dir, 'all_independent_signals.tsv')
 
     gwas_path = config['inputs']['phenotype_gwas']
-    ld_reference = os.path.abspath(
-        os.path.join(project_dir, config['outputs']['ld_reference'])
-    )
-    gcta_bin = os.path.abspath(
-        os.path.join(project_dir, config['tools']['gcta'])
-    )
+    gcta_bin = os.path.abspath(config['tools']['gcta'])
 
     p_thresh = float(config['params']['gwas_p_threshold'])
     mhc_interval = config['params']['mhc_interval']
     flank = int(config['params']['locus_flank_window'])
 
-    logger.info(f"  GWAS HT   : {gwas_path}")
-    logger.info(f"  LD ref    : {ld_reference}")
-    logger.info(f"  GCTA bin  : {gcta_bin}")
-    logger.info(f"  P thresh  : {p_thresh}")
-    logger.info(f"  MHC excl  : {mhc_interval}")
-    logger.info(f"  Flank     : {flank:,} bp")
-    logger.info(f"  Output    : {locus_dir}")
+    logger.info(f"  GWAS HT      : {gwas_path}")
+    logger.info(f"  LD ref dir   : {ld_ref_dir}")
+    logger.info(f"  .ma dir      : {ma_dir}")
+    logger.info(f"  GCTA bin     : {gcta_bin}")
+    logger.info(f"  P thresh     : {p_thresh}")
+    logger.info(f"  COJO wind    : {DEFAULT_COJO_WIND} kb")
+    logger.info(f"  MHC excl     : {mhc_interval}")
+    logger.info(f"  Flank        : {flank:,} bp")
+    logger.info(f"  Output       : {locus_dir}")
+    logger.info(f"  Force        : {args.force}")
     logger.info("")
 
     # Validate dependencies
-    if not os.path.exists(f"{ld_reference}.bed"):
-        raise FileNotFoundError(
-            f"LD reference bfile not found: {ld_reference}.bed\n"
-            "Ensure Phase 1 QC + merge has completed."
-        )
     if not os.path.exists(gcta_bin):
         raise FileNotFoundError(
             f"GCTA binary not found: {gcta_bin}\n"
             "Run python/install_gcta.py first."
         )
 
-    # Initialize Hail
+    # Initialize Hail (needed for loading GWAS HT)
     logger.info("Initializing Hail ...")
     hl.init(log='/tmp/hail_define_loci.log')
     hl.default_reference('GRCh38')
@@ -516,91 +534,137 @@ def main() -> None:
     logger.info("")
 
     try:
-        # Step 1: Load GWAS
+        # Step 1: Load GWAS and identify significant hits
         gwas_ht, sig_ht, field_map = load_gwas_ht(gwas_path, p_thresh, mhc_interval)
-
-        # Detect contig prefix for interval construction
-        sample_contig = gwas_ht.locus.contig.collect()[0]
-        has_chr_prefix = sample_contig.startswith('chr')
 
         # Step 2: Greedy clumping
         logger.info("")
         logger.info("Step 2: Greedy clumping ...")
-        windows = greedy_clump(sig_ht, field_map['pval'], flank, has_chr_prefix)
+        windows = greedy_clump(sig_ht, field_map['pval'], flank, True)
         logger.info(f"  -> {len(windows)} analysis windows")
 
-        # Step 3-5: Per-locus COJO loop
+        # Filter to single chromosome if requested
+        if args.chrom:
+            chrom_filter = args.chrom if args.chrom.startswith('chr') else f"chr{args.chrom}"
+            windows = [w for w in windows if w['chrom'] == chrom_filter]
+            logger.info(f"  -> {len(windows)} windows on {chrom_filter}")
+
+        if not windows:
+            logger.warning("No analysis windows to process. Exiting.")
+            hl.stop()
+            return
+
+        # Group windows by chromosome
+        chrom_windows: Dict[str, List[Dict]] = {}
+        for win in windows:
+            chrom_windows.setdefault(win['chrom'], []).append(win)
+
+        logger.info(f"  Chromosomes with hits: {sorted(chrom_windows.keys())}")
+
+        # Step 3-5: Per-chromosome COJO loop
         logger.info("")
-        logger.info("Step 3: Running GCTA-COJO per locus ...")
+        logger.info("Step 3: Running GCTA-COJO per chromosome ...")
         all_signals: List[pd.DataFrame] = []
 
-        # Temp dir for .ma files and PLINK subsets (local, ephemeral)
         work_dir = tempfile.mkdtemp(prefix='cojo_work_')
         logger.info(f"  Working dir: {work_dir}")
 
         try:
-            for i, win in enumerate(windows):
-                chrom = win['chrom']
-                start = win['start']
-                end = win['end']
-                locus_id = f"locus_{i:04d}_{chrom}_{start}_{end}"
+            for chrom in sorted(chrom_windows.keys()):
+                chr_windows = chrom_windows[chrom]
+                chr_num = chrom.replace('chr', '')
 
-                logger.info(f"  [{i+1}/{len(windows)}] {locus_id}")
+                logger.info("")
+                logger.info(f"--- {chrom} ({len(chr_windows)} loci) ---")
 
-                # Resume: skip if COJO output already exists in cojo_dir
-                jma_final = os.path.join(cojo_dir, f"{locus_id}.jma.cojo")
-                if os.path.exists(jma_final):
-                    logger.info(f"    SKIP (jma.cojo exists)")
+                # Validate per-chrom LD reference exists
+                ld_ref_prefix = os.path.join(ld_ref_dir, f"{chrom}_ld_ref")
+                if not os.path.exists(f"{ld_ref_prefix}.bed"):
+                    logger.error(
+                        f"  LD reference not found: {ld_ref_prefix}.bed\n"
+                        f"  Run bash/02_qc_ld_reference.sh first."
+                    )
+                    continue
+
+                # Validate per-chrom .ma file exists
+                ma_path = os.path.join(ma_dir, f"{chrom}.ma")
+                if not os.path.exists(ma_path):
+                    logger.error(
+                        f"  .ma file not found: {ma_path}\n"
+                        f"  Run bash/02a_export_gwas_ma.sh first."
+                    )
+                    continue
+
+                n_ld_vars = sum(1 for _ in open(f"{ld_ref_prefix}.bim"))
+                n_ma_vars = sum(1 for _ in open(ma_path)) - 1
+                logger.info(f"  LD ref: {n_ld_vars:,} variants")
+                logger.info(f"  .ma   : {n_ma_vars:,} variants")
+
+                # Create per-chrom cojo output directory
+                chr_cojo_dir = os.path.join(cojo_dir, chrom)
+                os.makedirs(chr_cojo_dir, exist_ok=True)
+
+                for i, win in enumerate(chr_windows):
+                    start = win['start']
+                    end = win['end']
+                    locus_id = f"locus_{chrom}_{start}_{end}"
+
+                    logger.info(
+                        f"  [{i+1}/{len(chr_windows)}] {locus_id} "
+                        f"(lead: {win['lead_snp_id']}, p={win['lead_p']:.2e})"
+                    )
+
+                    # Resume: skip if COJO output already exists
+                    jma_final = os.path.join(chr_cojo_dir, f"{locus_id}.jma.cojo")
+                    if os.path.exists(jma_final) and not args.force:
+                        logger.info(f"    SKIP (jma.cojo exists)")
+                        sig_df = parse_cojo_output(jma_final, locus_id, chrom)
+                        if sig_df is not None:
+                            all_signals.append(sig_df)
+                        continue
+
+                    # 3a: Extract PLINK subset for locus window
+                    subset_bfile = extract_plink_subset(
+                        ld_ref_prefix, start, end, work_dir, locus_id,
+                        plink_threads=4, plink_mem_mb=8000,
+                    )
+                    if subset_bfile is None:
+                        logger.warning(
+                            f"    PLINK subset failed for {locus_id}; skipping COJO"
+                        )
+                        continue
+
+                    # 3b: Run GCTA-COJO
+                    cojo_tmp_prefix = os.path.join(work_dir, locus_id)
+                    success = run_gcta_cojo(
+                        gcta_bin, subset_bfile, ma_path,
+                        cojo_tmp_prefix, p_thresh,
+                    )
+
+                    # Copy COJO outputs to persistent cojo_dir
+                    for ext in ['.jma.cojo', '.cma.cojo', '.ldr.cojo', '.gcta.log']:
+                        src = f"{cojo_tmp_prefix}{ext}"
+                        if os.path.exists(src):
+                            shutil.copy2(
+                                src, os.path.join(chr_cojo_dir, f"{locus_id}{ext}")
+                            )
+
+                    if not success:
+                        logger.warning(f"    GCTA-COJO failed for {locus_id}")
+                        continue
+
+                    # 3c: Parse output
                     sig_df = parse_cojo_output(jma_final, locus_id, chrom)
                     if sig_df is not None:
                         all_signals.append(sig_df)
-                    continue
-
-                # 3a: Export .ma file (local)
-                ma_path = os.path.join(work_dir, f"{locus_id}.ma")
-                ok = export_ma_file(gwas_ht, field_map, chrom, start, end, ma_path)
-                if not ok:
-                    continue
-
-                # 3b: Extract PLINK subset
-                subset_bfile = extract_plink_subset(
-                    ld_reference, chrom, start, end, work_dir,
-                    plink_threads=4,
-                    plink_mem_mb=8000,
-                )
-                if subset_bfile is None:
-                    logger.warning(f"    PLINK subset failed for {locus_id}; skipping COJO")
-                    continue
-
-                # 3c: Run GCTA-COJO (output to tmp, then copy to cojo_dir)
-                cojo_tmp_prefix = os.path.join(work_dir, locus_id)
-                success = run_gcta_cojo(
-                    gcta_bin, subset_bfile, ma_path,
-                    cojo_tmp_prefix, chrom, p_thresh,
-                )
-
-                # Copy COJO outputs to persistent cojo_dir regardless of success
-                for ext in ['.jma.cojo', '.cma.cojo', '.gcta.log']:
-                    src = f"{cojo_tmp_prefix}{ext}"
-                    if os.path.exists(src):
-                        shutil.copy2(src, os.path.join(cojo_dir, f"{locus_id}{ext}"))
-
-                if not success:
-                    logger.warning(f"    GCTA-COJO failed for {locus_id}")
-                    continue
-
-                # 3d: Parse output
-                sig_df = parse_cojo_output(jma_final, locus_id, chrom)
-                if sig_df is not None:
-                    all_signals.append(sig_df)
 
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
             logger.info(f"  Cleaned up working dir: {work_dir}")
 
-        # Step 4: Assemble outputs
+        # Step 6: Assemble outputs
         logger.info("")
-        logger.info("Step 4: Assembling outputs ...")
+        logger.info("Step 6: Assembling outputs ...")
 
         if not all_signals:
             logger.warning(
@@ -612,7 +676,9 @@ def main() -> None:
 
         all_signals_df = pd.concat(all_signals, ignore_index=True)
         all_signals_df.to_csv(signals_path, sep='\t', index=False)
-        logger.info(f"  Independent signals: {len(all_signals_df):,} -> {signals_path}")
+        logger.info(
+            f"  Independent signals: {len(all_signals_df):,} -> {signals_path}"
+        )
 
         # Parse MHC coords for BED exclusion
         mhc_parts = mhc_interval.replace('chr', '').split(':')
@@ -638,7 +704,10 @@ def main() -> None:
     elapsed = time.time() - run_start
     logger.info("")
     logger.info("=" * 60)
-    logger.info(f"Phase 2a complete in {_fmt_elapsed(elapsed)}")
+    logger.info(f"Phase 2b complete in {_fmt_elapsed(elapsed)}")
+    logger.info(f"  Signals : {signals_path}")
+    logger.info(f"  BED     : {loci_bed_path}")
+    logger.info(f"  COJO    : {cojo_dir}/")
     logger.info("=" * 60)
 
 
