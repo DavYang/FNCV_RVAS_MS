@@ -30,7 +30,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import hail as hl
 import pandas as pd
@@ -69,11 +69,12 @@ def load_config(config_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _FIELD_CANDIDATES: Dict[str, List[str]] = {
-    'beta':   ['beta', 'effect_size', 'b'],
-    'se':     ['standard_error', 'se', 'stderr'],
-    'pval':   ['p_value', 'p_value_EUR', 'pval', 'p'],
-    'af':     ['AF', 'AF_EUR', 'allele_frequency', 'freq'],
+    'beta':   ['BETA', 'beta', 'effect_size', 'b'],
+    'se':     ['SE', 'standard_error', 'se', 'stderr'],
+    'pval':   ['Pvalue', 'p_value', 'p_value_EUR', 'pval', 'p'],
+    'af':     ['AF_Allele2', 'AF', 'AF_EUR', 'allele_frequency', 'freq'],
     'n':      ['n_complete_samples', 'N', 'n_samples', 'n'],
+    'ac':     ['AC_Allele2', 'AC', 'allele_count'],
 }
 
 CHR_SIZES: Dict[str, int] = {
@@ -103,17 +104,32 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{h}h {m:02d}m {s:02d}s"
 
 
-def _resolve_field(ht: hl.Table, canonical: str, candidates: List[str]) -> str:
-    """Return the first matching field name from candidates present in ht.row."""
+def _resolve_field(
+    ht: hl.Table, canonical: str, candidates: List[str], required: bool = True,
+) -> Optional[str]:
+    """Return the first matching field name from candidates present in ht.row.
+
+    Args:
+        ht: Hail Table to search.
+        canonical: Canonical field name for logging.
+        candidates: Ordered list of candidate field names to try.
+        required: If True, raise ValueError when no match found.
+
+    Returns:
+        Matched field name, or None if not required and no match found.
+    """
     row_fields = set(ht.row)
     for name in candidates:
         if name in row_fields:
             logger.info(f"  Field '{canonical}' resolved to '{name}'")
             return name
-    raise ValueError(
-        f"Could not find field '{canonical}' in GWAS HT. "
-        f"Tried: {candidates}. Available fields: {sorted(row_fields)}"
-    )
+    if required:
+        raise ValueError(
+            f"Could not find field '{canonical}' in GWAS HT. "
+            f"Tried: {candidates}. Available fields: {sorted(row_fields)}"
+        )
+    logger.info(f"  Field '{canonical}' not found (optional) -- tried: {candidates}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -195,12 +211,30 @@ def main() -> None:
         gwas_ht = hl.read_table(gwas_path)
         logger.info(f"  GWAS HT loaded ({_fmt_elapsed(time.time() - t0)})")
 
-        # Resolve field names
+        # Resolve field names (n and ac are optional; N derived from AC/AF if needed)
         logger.info("Resolving GWAS field names ...")
-        field_map = {
-            canonical: _resolve_field(gwas_ht, canonical, candidates)
-            for canonical, candidates in _FIELD_CANDIDATES.items()
-        }
+        field_map: Dict[str, Optional[str]] = {}
+        for canonical, candidates in _FIELD_CANDIDATES.items():
+            required = canonical not in ('n', 'ac')
+            field_map[canonical] = _resolve_field(
+                gwas_ht, canonical, candidates, required=required,
+            )
+
+        # Determine N strategy
+        if field_map['n'] is not None:
+            n_strategy = 'direct'
+            logger.info(f"  N strategy: direct from field '{field_map['n']}'")
+        elif field_map['ac'] is not None and field_map['af'] is not None:
+            n_strategy = 'derived'
+            logger.info(
+                f"  N strategy: derived from {field_map['ac']} / (2 * {field_map['af']})"
+            )
+        else:
+            raise ValueError(
+                "Cannot determine sample size (N). GWAS HT has neither a direct N "
+                "field nor AC + AF fields to derive it. "
+                f"Available fields: {sorted(set(gwas_ht.row))}"
+            )
         logger.info("")
 
         # Process each chromosome
@@ -227,6 +261,18 @@ def main() -> None:
             )
             chr_ht = hl.filter_intervals(gwas_ht, [interval])
 
+            # Derive N expression based on strategy
+            if n_strategy == 'direct':
+                n_expr = hl.int32(chr_ht[field_map['n']])
+            else:
+                # N = AC_Allele2 / (2 * AF_Allele2) -- diploid sample count
+                af_val = hl.float64(chr_ht[field_map['af']])
+                ac_val = hl.float64(chr_ht[field_map['ac']])
+                n_expr = hl.or_missing(
+                    af_val > 0,
+                    hl.int32(hl.floor(ac_val / (2.0 * af_val) + 0.5)),
+                )
+
             # Annotate with .ma columns
             chr_ht = chr_ht.annotate(
                 SNP=(
@@ -240,7 +286,7 @@ def main() -> None:
                 b=hl.float64(chr_ht[field_map['beta']]),
                 se=hl.float64(chr_ht[field_map['se']]),
                 p=hl.float64(chr_ht[field_map['pval']]),
-                N=hl.int32(chr_ht[field_map['n']]),
+                N=n_expr,
             )
 
             # Select only .ma columns and export to pandas

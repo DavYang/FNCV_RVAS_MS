@@ -58,10 +58,10 @@ logger = setup_logger("define_loci")
 # ---------------------------------------------------------------------------
 
 _FIELD_CANDIDATES: Dict[str, List[str]] = {
-    'beta':   ['beta', 'effect_size', 'b'],
-    'se':     ['standard_error', 'se', 'stderr'],
-    'pval':   ['p_value', 'p_value_EUR', 'pval', 'p'],
-    'af':     ['AF', 'AF_EUR', 'allele_frequency', 'freq'],
+    'beta':   ['BETA', 'beta', 'effect_size', 'b'],
+    'se':     ['SE', 'standard_error', 'se', 'stderr'],
+    'pval':   ['Pvalue', 'p_value', 'p_value_EUR', 'pval', 'p'],
+    'af':     ['AF_Allele2', 'AF', 'AF_EUR', 'allele_frequency', 'freq'],
     'n':      ['n_complete_samples', 'N', 'n_samples', 'n'],
 }
 
@@ -137,17 +137,32 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{h}h {m:02d}m {s:02d}s"
 
 
-def _resolve_field(ht: hl.Table, canonical: str, candidates: List[str]) -> str:
-    """Return the first matching field name from candidates present in ht.row."""
+def _resolve_field(
+    ht: hl.Table, canonical: str, candidates: List[str], required: bool = True,
+) -> Optional[str]:
+    """Return the first matching field name from candidates present in ht.row.
+
+    Args:
+        ht: Hail Table to search.
+        canonical: Canonical field name for logging.
+        candidates: Ordered list of candidate field names to try.
+        required: If True, raise ValueError when no match found.
+
+    Returns:
+        Matched field name, or None if not required and no match found.
+    """
     row_fields = set(ht.row)
     for name in candidates:
         if name in row_fields:
             logger.info(f"  Field '{canonical}' resolved to '{name}'")
             return name
-    raise ValueError(
-        f"Could not find field '{canonical}' in GWAS HT. "
-        f"Tried: {candidates}. Available fields: {sorted(row_fields)}"
-    )
+    if required:
+        raise ValueError(
+            f"Could not find field '{canonical}' in GWAS HT. "
+            f"Tried: {candidates}. Available fields: {sorted(row_fields)}"
+        )
+    logger.info(f"  Field '{canonical}' not found (optional) -- tried: {candidates}")
+    return None
 
 
 def _run_command(
@@ -204,10 +219,13 @@ def load_gwas_ht(
     gwas_ht = hl.read_table(gwas_path)
 
     logger.info("Resolving GWAS field names ...")
-    field_map = {
-        canonical: _resolve_field(gwas_ht, canonical, candidates)
-        for canonical, candidates in _FIELD_CANDIDATES.items()
-    }
+    field_map: Dict[str, Optional[str]] = {}
+    for canonical, candidates in _FIELD_CANDIDATES.items():
+        # Only pval is strictly required for greedy clumping
+        required = canonical in ('pval',)
+        field_map[canonical] = _resolve_field(
+            gwas_ht, canonical, candidates, required=required,
+        )
 
     sample_contig = gwas_ht.locus.contig.collect()[0]
     has_chr_prefix = sample_contig.startswith('chr')
