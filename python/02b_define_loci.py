@@ -314,6 +314,7 @@ def greedy_clump(
 
 def extract_plink_subset(
     bfile: str,
+    chrom: str,
     start: int,
     end: int,
     work_dir: str,
@@ -324,10 +325,9 @@ def extract_plink_subset(
     """Extract a PLINK subset for the locus window (+LD padding) from a
     per-chromosome LD reference bfile.
 
-    No --chr needed since bfile is already single-chromosome.
-
     Args:
         bfile: PLINK bfile prefix (per-chrom LD ref).
+        chrom: Chromosome name as it appears in the .bim (e.g. 'chr21').
         start: Locus start position.
         end: Locus end position.
         work_dir: Temporary working directory.
@@ -347,6 +347,7 @@ def extract_plink_subset(
     cmd = [
         'plink2',
         '--bfile', bfile,
+        '--chr', chrom,
         '--from-bp', str(ld_start),
         '--to-bp', str(ld_end),
         '--make-bed',
@@ -643,7 +644,7 @@ def main() -> None:
 
                     # 3a: Extract PLINK subset for locus window
                     subset_bfile = extract_plink_subset(
-                        ld_ref_prefix, start, end, work_dir, locus_id,
+                        ld_ref_prefix, chrom, start, end, work_dir, locus_id,
                         plink_threads=4, plink_mem_mb=8000,
                     )
                     if subset_bfile is None:
