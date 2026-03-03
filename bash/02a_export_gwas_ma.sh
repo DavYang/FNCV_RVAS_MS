@@ -22,8 +22,8 @@ set -eo pipefail
 #   # Force re-export (overwrite existing .ma files)
 #   bash bash/02a_export_gwas_ma.sh --force
 #
-#   # Single chromosome
-#   bash bash/02a_export_gwas_ma.sh --chrom chr21
+#   # Single chromosome (use = syntax)
+#   bash bash/02a_export_gwas_ma.sh --chrom=chr21
 #
 #   # Test mode: process only test chromosome (chr21) for iterative testing
 #   bash bash/02a_export_gwas_ma.sh --test
@@ -61,8 +61,7 @@ for arg in "$@"; do
         --force) FORCE=1; EXTRA_ARGS+=("--force") ;;
         --test)  TEST_MODE=1; EXTRA_ARGS+=("--chrom" "${TEST_CHR}") ;;
         --chrom=*) EXTRA_ARGS+=("--chrom" "${arg#--chrom=}") ;;
-        --chrom) EXTRA_ARGS+=("--chrom") ;;
-        *) EXTRA_ARGS+=("$arg") ;;
+        *) echo "WARNING: Unknown argument '$arg' -- ignoring" ;;
     esac
 done
 

@@ -3,7 +3,7 @@
 
 Processes each chromosome independently using:
   - Pre-built per-chromosome .ma files (from 02a_export_gwas_ma.py)
-  - Per-chromosome LD reference PLINK files (from 02_qc_ld_reference.sh)
+  - Per-chromosome LD reference PLINK files (from 01b_qc_merge_background_snps.sh)
 
 For each chromosome with significant GWAS hits:
   1. Greedy clumping to define candidate loci
@@ -492,7 +492,7 @@ def main() -> None:
     cojo_dir = os.path.join(locus_dir, 'cojo')
     ma_dir = os.path.join(locus_dir, 'ma')
     ld_ref_dir = config['outputs'].get(
-        'ld_reference', 'results/2-locus_definition/ld_ref'
+        'ld_reference', 'results/1-bg_snp/plink_qc'
     )
 
     os.makedirs(cojo_dir, exist_ok=True)
@@ -578,11 +578,11 @@ def main() -> None:
                 logger.info(f"--- {chrom} ({len(chr_windows)} loci) ---")
 
                 # Validate per-chrom LD reference exists
-                ld_ref_prefix = os.path.join(ld_ref_dir, f"{chrom}_ld_ref")
+                ld_ref_prefix = os.path.join(ld_ref_dir, f"{chrom}_background_qc")
                 if not os.path.exists(f"{ld_ref_prefix}.bed"):
                     logger.error(
                         f"  LD reference not found: {ld_ref_prefix}.bed\n"
-                        f"  Run bash/02_qc_ld_reference.sh first."
+                        f"  Run bash/01b_qc_merge_background_snps.sh first."
                     )
                     continue
 

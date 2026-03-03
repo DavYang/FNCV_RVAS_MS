@@ -5,11 +5,11 @@ set -eo pipefail
 # 02b_run_cojo.sh
 #
 # Phase 2 Step 2: Run GCTA-COJO per chromosome for locus definition.
-# Uses per-chromosome LD reference panels (from 02_qc_ld_reference.sh) and
+# Uses per-chromosome LD reference panels (from 01b_qc_merge_background_snps.sh) and
 # per-chromosome .ma summary statistics (from 02a_export_gwas_ma.sh).
 #
 # Inputs  (local on VM):
-#   results/2-locus_definition/ld_ref/chrN_ld_ref.{bed,bim,fam}
+#   results/1-bg_snp/plink_qc/chrN_background_qc.{bed,bim,fam}
 #   results/2-locus_definition/ma/chrN.ma
 #   tools/gcta64
 #
@@ -24,8 +24,8 @@ set -eo pipefail
 #   # Force re-run (overwrite existing COJO results)
 #   bash bash/02b_run_cojo.sh --force
 #
-#   # Single chromosome
-#   bash bash/02b_run_cojo.sh --chrom chr6
+#   # Single chromosome (use = syntax)
+#   bash bash/02b_run_cojo.sh --chrom=chr6
 #
 #   # Test mode: process only test chromosome (chr21) for iterative testing
 #   bash bash/02b_run_cojo.sh --test
@@ -45,7 +45,7 @@ PROJECT_DIR="/home/jupyter/FNCV_RVAS_MS"
 CONFIG_FILE="${PROJECT_DIR}/config/config.json"
 PYTHON_SCRIPT="${PROJECT_DIR}/python/02b_define_loci.py"
 OUTPUT_DIR="${PROJECT_DIR}/results/2-locus_definition"
-LD_REF_DIR="${PROJECT_DIR}/results/2-locus_definition/ld_ref"
+LD_REF_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_qc"
 MA_DIR="${PROJECT_DIR}/results/2-locus_definition/ma"
 GCTA_BIN="${PROJECT_DIR}/tools/gcta64"
 LOG_DIR="${PROJECT_DIR}/logs"
@@ -66,8 +66,7 @@ for arg in "$@"; do
         --force) FORCE=1; EXTRA_ARGS+=("--force") ;;
         --test)  TEST_MODE=1; EXTRA_ARGS+=("--chrom" "${TEST_CHR}") ;;
         --chrom=*) EXTRA_ARGS+=("--chrom" "${arg#--chrom=}") ;;
-        --chrom) EXTRA_ARGS+=("--chrom") ;;
-        *) EXTRA_ARGS+=("$arg") ;;
+        *) echo "WARNING: Unknown argument '$arg' -- ignoring" ;;
     esac
 done
 
@@ -129,9 +128,9 @@ CHECK_CHR="chr1"
 if [ "${TEST_MODE}" -eq 1 ]; then
     CHECK_CHR="${TEST_CHR}"
 fi
-if [ ! -f "${LD_REF_DIR}/${CHECK_CHR}_ld_ref.bed" ]; then
-    log "ERROR: LD reference not found: ${LD_REF_DIR}/${CHECK_CHR}_ld_ref.bed"
-    log "  Run: bash bash/02_qc_ld_reference.sh $([ ${TEST_MODE} -eq 1 ] && echo '--test')"
+if [ ! -f "${LD_REF_DIR}/${CHECK_CHR}_background_qc.bed" ]; then
+    log "ERROR: LD reference not found: ${LD_REF_DIR}/${CHECK_CHR}_background_qc.bed"
+    log "  Run: bash bash/01b_qc_merge_background_snps.sh"
     PREFLIGHT_OK=0
 fi
 
@@ -175,7 +174,7 @@ if [ -n "${WORKSPACE_BUCKET}" ]; then
     # Download LD ref files from GCS if missing
     MISSING_LD=0
     for chr_num in $(seq 1 22); do
-        if [ ! -f "${LD_REF_DIR}/chr${chr_num}_ld_ref.bed" ]; then
+        if [ ! -f "${LD_REF_DIR}/chr${chr_num}_background_qc.bed" ]; then
             MISSING_LD=1
             break
         fi
@@ -183,7 +182,7 @@ if [ -n "${WORKSPACE_BUCKET}" ]; then
 
     if [ "${MISSING_LD}" -eq 1 ]; then
         log "Some LD ref files missing locally. Downloading from GCS..."
-        GCS_LD="${WORKSPACE_BUCKET}/results/2-locus_definition/ld_ref/"
+        GCS_LD="${WORKSPACE_BUCKET}/results/1-bg_snp/plink_qc/"
         mkdir -p "${LD_REF_DIR}"
         gsutil -u "${GOOGLE_PROJECT}" -m cp "${GCS_LD}*.bed" "${GCS_LD}*.bim" "${GCS_LD}*.fam" "${LD_REF_DIR}/" 2>&1 | tee -a "${LOG_FILE}" || true
         log "GCS download of LD ref complete"

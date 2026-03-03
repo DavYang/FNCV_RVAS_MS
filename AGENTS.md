@@ -94,7 +94,7 @@ Refer to `prompt_info/AoU_programs.md` for a full list of packages in the `/opt/
 - **R** (4.3.1) with Bioconductor packages
 
 External tools installed separately by this project:
-- **PLINK2** -- binary QC, LD pruning, subsetting
+- **PLINK2** -- binary QC, dedup, subsetting
 - **GCTA** -- COJO conditional/joint analysis (`tools/gcta64`, installed via `python/install_gcta.py`)
 - **REGENIE** -- whole genome regression
 

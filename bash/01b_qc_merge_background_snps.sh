@@ -2,33 +2,32 @@
 set -e
 
 # ---------------------------------------------------------------------------
-# QC, LD-prune, and merge per-chromosome PLINK files into a single
-# genome-wide fileset ready for REGENIE Step 1 null model fitting.
+# QC and merge per-chromosome PLINK files for downstream use.
 # ---------------------------------------------------------------------------
 # Pipeline per chromosome:
-#   1. Variant QC  (--maf, --geno, --hwe, --mind, --max-alleles 2)
-#   2. LD prune    (--indep-pairwise; MHC excluded on chr6)
-#   3. Extract pruned-in variants into a compact PLINK fileset
+#   1. Variant QC  (--maf, --geno, --hwe, --mind, --snps-only, --max-alleles 2)
+#   2. Remove duplicate variant IDs (--rm-dup exclude-all)
 #
 # After all 22 chromosomes are QCed:
-#   4. Merge pruned per-chrom files (~15-25K variants each)
-#   5. Thin down to TARGET_SNPS if total exceeds it (to be used by Regenie)
+#   3. Merge QC'd per-chrom files into a genome-wide fileset
+#   4. Thin down to TARGET_SNPS if total exceeds it (for REGENIE Step 1)
 #
-# This replaces the previous two-script workflow (02 + 02b) that tried
-# to merge 3.3M QC'd variants (~90 GB .bed), which exceeded disk space.
-# LD pruning per chromosome reduces the merge to ~200-500K variants.
+# The per-chromosome QC'd files also serve as the LD reference panels
+# for GCTA-COJO in Phase 2, making a separate LD-ref QC step unnecessary.
 # ---------------------------------------------------------------------------
 # Usage:
 #   nohup bash bash/01b_qc_merge_background_snps.sh > /dev/null 2>&1 &
 #
-#   # Force re-run (deletes pruned + merged outputs)
+#   # Force re-run (deletes QC'd + merged outputs)
 #   bash bash/01b_qc_merge_background_snps.sh --force
 #
 # Monitor:
 #   tail -f logs/01b_qc_merge_*.log
 #
 # Input:  results/1-bg_snp/plink_no-qc/chrN_background.{bed,bim,fam}
-# Output: results/1-bg_snp/plink_step1/step1_500k.{bed,bim,fam}
+# Output:
+#   Per-chrom QC'd: results/1-bg_snp/plink_qc/chrN_background_qc.{bed,bim,fam}
+#   Step 1 merged:  results/1-bg_snp/plink_step1/step1_500k.{bed,bim,fam}
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -39,9 +38,7 @@ CONFIG_FILE="${PROJECT_DIR}/config/config.json"
 
 INPUT_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_no-qc"
 QC_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_qc"
-PRUNE_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_pruned"
 STEP1_DIR="${PROJECT_DIR}/results/1-bg_snp/plink_step1"
-TMP_DIR="${PROJECT_DIR}/tmp/prune"
 LOG_DIR="${PROJECT_DIR}/logs"
 
 # GCS location of raw (no-QC) per-chromosome PLINK files from Hail export
@@ -49,7 +46,7 @@ GCS_PLINK_BASE="gs://fc-secure-b43840eb-548f-464d-bece-31ac7a969abd/results/FNCV
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${LOG_DIR}/01b_qc_merge_${TIMESTAMP}.log"
-MERGE_LIST="${PRUNE_DIR}/merge_list.txt"
+MERGE_LIST="${QC_DIR}/merge_list.txt"
 
 # ---------------------------------------------------------------------------
 # QC thresholds (read from config.json plink_qc section for cross-step consistency)
@@ -63,24 +60,12 @@ SNPS_ONLY=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['pl
 HWE_SAMPLE_TERM=0        # explicit sample-size term to suppress PLINK2 warning
 
 # ---------------------------------------------------------------------------
-# LD pruning parameters
-# ---------------------------------------------------------------------------
-LD_WINDOW=1000
-LD_STEP=100
-LD_R2=0.9
-
-# ---------------------------------------------------------------------------
-# Final target
+# Final target (for REGENIE Step 1 thinning)
 # ---------------------------------------------------------------------------
 TARGET_SNPS=500000
 
-# MHC exclusion from config
-MHC_INTERVAL=$(python3 -c "import json; print(json.load(open('${CONFIG_FILE}'))['params']['mhc_interval'])")
-MHC_CHROM=$(echo "$MHC_INTERVAL" | awk -F'[:-]' '{print $1}' | sed 's/chr//')
-MHC_START=$(echo "$MHC_INTERVAL" | awk -F'[:-]' '{print $2}')
-MHC_END=$(echo "$MHC_INTERVAL" | awk -F'[:-]' '{print $3}')
-
 RANDOM_SEED=$(python3 -c "import json; c=json.load(open('${CONFIG_FILE}')); print(c.get('sampling',{}).get('random_seed', c.get('params',{}).get('random_seed', 42)))")
+
 
 THREADS=50
 MEMORY=16000
@@ -99,7 +84,7 @@ done
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-mkdir -p "${QC_DIR}" "${PRUNE_DIR}" "${STEP1_DIR}" "${TMP_DIR}" "${LOG_DIR}"
+mkdir -p "${QC_DIR}" "${STEP1_DIR}" "${LOG_DIR}"
 
 exec < /dev/null
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -111,37 +96,33 @@ log() {
 }
 
 log "============================================================"
-log "  QC + LD Prune + Merge Background SNPs for REGENIE Step 1"
+log "  QC + Merge Background SNPs"
 log "============================================================"
 log "Input dir    : ${INPUT_DIR}"
 log "QC dir       : ${QC_DIR}"
-log "Prune dir    : ${PRUNE_DIR}"
 log "Step1 dir    : ${STEP1_DIR}"
 log "QC params    : MAF=${MAF}, GENO=${GENO}, HWE=${HWE} (st=${HWE_SAMPLE_TERM}), MIND=${MIND}, snps-only=${SNPS_ONLY}, max-alleles=${MAX_ALLELES}"
-log "LD prune     : window=${LD_WINDOW}, step=${LD_STEP}, r2=${LD_R2}"
-log "MHC exclude  : chr${MHC_CHROM}:${MHC_START}-${MHC_END}"
 log "Target SNPs  : ${TARGET_SNPS}"
 log "Force rerun  : ${FORCE}"
 log "============================================================"
 log ""
 
 # ---------------------------------------------------------------------------
-# If --force, clean pruned and merged outputs (keep QC'd per-chrom files)
+# If --force, clean QC'd and merged outputs for full re-run
 # ---------------------------------------------------------------------------
 if [ "${FORCE}" -eq 1 ]; then
-    log "[--force] Cleaning pruned and merged outputs..."
-    rm -f "${PRUNE_DIR}"/*.{bed,bim,fam,log,prune.in,prune.out} 2>/dev/null || true
+    log "[--force] Cleaning QC'd and merged outputs..."
+    rm -f "${QC_DIR}"/*.{bed,bim,fam,log,nosex} 2>/dev/null || true
     rm -f "${STEP1_DIR}"/step1_*.{bed,bim,fam,log} 2>/dev/null || true
     rm -f "${MERGE_LIST}" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------
-# Step 1+2: Per-chromosome QC then LD prune
+# Step 1+2: Per-chromosome variant QC + duplicate removal
 # ---------------------------------------------------------------------------
 FAILED=()
 TOTAL_PRE=0
 TOTAL_QC=0
-TOTAL_PRUNED=0
 
 rm -f "${MERGE_LIST}"
 
@@ -149,7 +130,6 @@ for chr_num in $(seq 1 22); do
     chr_name="chr${chr_num}"
     INPUT_PREFIX="${INPUT_DIR}/${chr_name}_background"
     QC_PREFIX="${QC_DIR}/${chr_name}_background_qc"
-    PRUNED_PREFIX="${PRUNE_DIR}/${chr_name}_pruned"
 
     # Download from GCS if local input is missing
     if [ ! -f "${INPUT_PREFIX}.bed" ]; then
@@ -178,103 +158,63 @@ for chr_num in $(seq 1 22); do
     PRE_COUNT=$(wc -l < "${INPUT_PREFIX}.bim")
     TOTAL_PRE=$((TOTAL_PRE + PRE_COUNT))
 
-    # Resume: skip if pruned output already exists
-    if [ -f "${PRUNED_PREFIX}.bed" ] && [ "${FORCE}" -eq 0 ]; then
-        PRUNED_COUNT=$(wc -l < "${PRUNED_PREFIX}.bim")
-        TOTAL_PRUNED=$((TOTAL_PRUNED + PRUNED_COUNT))
-        log "[${chr_name}] SKIP (pruned exists) - ${PRUNED_COUNT} pruned variants"
-        echo "${PRUNED_PREFIX}" >> "${MERGE_LIST}"
+    # Resume: skip if QC output already exists
+    if [ -f "${QC_PREFIX}.bed" ] && [ "${FORCE}" -eq 0 ]; then
+        QC_COUNT=$(wc -l < "${QC_PREFIX}.bim")
+        TOTAL_QC=$((TOTAL_QC + QC_COUNT))
+        log "[${chr_name}] SKIP (QC exists) - ${QC_COUNT} variants"
+        echo "${QC_PREFIX}" >> "${MERGE_LIST}"
         continue
     fi
 
-    # --- Step 1: QC ---
-    # Resume: reuse QC output if it exists
-    if [ -f "${QC_PREFIX}.bed" ]; then
-        QC_COUNT=$(wc -l < "${QC_PREFIX}.bim")
-        log "[${chr_name}] QC exists - ${QC_COUNT} variants"
-    else
-        log "[${chr_name}] QC starting - ${PRE_COUNT} variants pre-QC"
+    # --- Step 1: Variant QC ---
+    log "[${chr_name}] QC starting - ${PRE_COUNT} variants pre-QC"
+    QC_TMP="${QC_DIR}/${chr_name}_qc_tmp"
 
-        if ! plink2 \
-            --bfile "${INPUT_PREFIX}" \
-            --maf "${MAF}" \
-            --geno "${GENO}" \
-            --hwe "${HWE}" "${HWE_SAMPLE_TERM}" \
-            --mind "${MIND}" \
-            --snps-only "${SNPS_ONLY}" \
-            --max-alleles "${MAX_ALLELES}" \
-            --make-bed \
-            --out "${QC_PREFIX}" \
-            --threads "${THREADS}" \
-            --memory "${MEMORY}" 2>&1; then
-            log "[${chr_name}] QC FAILED"
-            FAILED+=("${chr_name}")
-            continue
-        fi
-
-        QC_COUNT=$(wc -l < "${QC_PREFIX}.bim")
-        REMOVED=$((PRE_COUNT - QC_COUNT))
-        log "[${chr_name}] QC done - ${QC_COUNT} variants (${REMOVED} removed)"
-    fi
-    TOTAL_QC=$((TOTAL_QC + QC_COUNT))
-
-    # --- Step 2: LD prune ---
-    log "[${chr_name}] LD pruning starting..."
-    PRUNE_TMP="${TMP_DIR}/${chr_name}_prune"
-
-    # Build MHC exclusion list for chr6
-    MHC_EXCLUDE_FLAG=""
-    if [ "${chr_num}" -eq 6 ]; then
-        MHC_EXCLUDE_FILE="${TMP_DIR}/mhc_snps_chr6.txt"
-        awk -v chrom="${MHC_CHROM}" \
-            -v start="${MHC_START}" \
-            -v end="${MHC_END}" \
-            '$1 == chrom && $4 >= start && $4 <= end { print $2 }' \
-            "${QC_PREFIX}.bim" > "${MHC_EXCLUDE_FILE}"
-        N_MHC=$(wc -l < "${MHC_EXCLUDE_FILE}")
-        log "[${chr_name}] Excluding ${N_MHC} MHC variants before pruning"
-        MHC_EXCLUDE_FLAG="--exclude ${MHC_EXCLUDE_FILE}"
-    fi
-
-    # Compute prune.in / prune.out lists
-    # shellcheck disable=SC2086
     if ! plink2 \
-        --bfile "${QC_PREFIX}" \
-        ${MHC_EXCLUDE_FLAG} \
-        --indep-pairwise "${LD_WINDOW}" "${LD_STEP}" "${LD_R2}" \
-        --threads "${THREADS}" \
-        --memory "${MEMORY}" \
-        --seed "${RANDOM_SEED}" \
-        --out "${PRUNE_TMP}" 2>&1; then
-        log "[${chr_name}] LD PRUNE FAILED"
-        FAILED+=("${chr_name}")
-        continue
-    fi
-
-    N_PRUNE_IN=$(wc -l < "${PRUNE_TMP}.prune.in")
-    N_PRUNE_OUT=$(wc -l < "${PRUNE_TMP}.prune.out")
-    log "[${chr_name}] LD prune: ${N_PRUNE_IN} kept, ${N_PRUNE_OUT} removed"
-
-    # Extract pruned-in variants into compact PLINK fileset
-    if ! plink2 \
-        --bfile "${QC_PREFIX}" \
-        --extract "${PRUNE_TMP}.prune.in" \
+        --bfile "${INPUT_PREFIX}" \
+        --maf "${MAF}" \
+        --geno "${GENO}" \
+        --hwe "${HWE}" "${HWE_SAMPLE_TERM}" \
+        --mind "${MIND}" \
+        --snps-only "${SNPS_ONLY}" \
+        --max-alleles "${MAX_ALLELES}" \
         --make-bed \
-        --out "${PRUNED_PREFIX}" \
+        --out "${QC_TMP}" \
         --threads "${THREADS}" \
         --memory "${MEMORY}" 2>&1; then
-        log "[${chr_name}] EXTRACT PRUNED FAILED"
+        log "[${chr_name}] QC FAILED"
         FAILED+=("${chr_name}")
         continue
     fi
 
-    PRUNED_COUNT=$(wc -l < "${PRUNED_PREFIX}.bim")
-    TOTAL_PRUNED=$((TOTAL_PRUNED + PRUNED_COUNT))
-    log "[${chr_name}] Pruned fileset: ${PRUNED_COUNT} variants"
-    echo "${PRUNED_PREFIX}" >> "${MERGE_LIST}"
+    QC_TMP_COUNT=$(wc -l < "${QC_TMP}.bim")
+    REMOVED=$((PRE_COUNT - QC_TMP_COUNT))
+    log "[${chr_name}] QC done - ${QC_TMP_COUNT} variants (${REMOVED} removed)"
 
-    # Cleanup temp prune files
-    rm -f "${PRUNE_TMP}".{prune.in,prune.out,log}
+    # --- Step 2: Remove duplicate variant IDs ---
+    log "[${chr_name}] Removing duplicate variant IDs..."
+
+    if ! plink2 \
+        --bfile "${QC_TMP}" \
+        --rm-dup exclude-all \
+        --make-bed \
+        --out "${QC_PREFIX}" \
+        --threads "${THREADS}" \
+        --memory "${MEMORY}" 2>&1; then
+        log "[${chr_name}] DEDUP FAILED"
+        FAILED+=("${chr_name}")
+        continue
+    fi
+
+    QC_COUNT=$(wc -l < "${QC_PREFIX}.bim")
+    DUPS_REMOVED=$((QC_TMP_COUNT - QC_COUNT))
+    TOTAL_QC=$((TOTAL_QC + QC_COUNT))
+    log "[${chr_name}] Final: ${QC_COUNT} variants (${DUPS_REMOVED} duplicates removed)"
+    echo "${QC_PREFIX}" >> "${MERGE_LIST}"
+
+    # Cleanup intermediate tmp files
+    rm -f "${QC_TMP}".{bed,bim,fam,log,nosex}
 done
 
 log ""
@@ -283,7 +223,6 @@ log "  Per-chromosome summary"
 log "============================================================"
 log "Total pre-QC variants  : ${TOTAL_PRE}"
 log "Total post-QC variants : ${TOTAL_QC}"
-log "Total pruned variants  : ${TOTAL_PRUNED}"
 
 if [ ${#FAILED[@]} -gt 0 ]; then
     log "FAILED chromosomes: ${FAILED[*]}"
@@ -291,13 +230,13 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 
-log "All 22 chromosomes passed QC + LD pruning"
+log "All 22 chromosomes passed QC"
 log ""
 
 # ---------------------------------------------------------------------------
-# Step 3: Merge pruned per-chrom files
+# Step 3: Merge QC'd per-chrom files
 # ---------------------------------------------------------------------------
-MERGED_PREFIX="${PRUNE_DIR}/all_background_pruned"
+MERGED_PREFIX="${QC_DIR}/all_background_qc"
 
 if [ -f "${MERGED_PREFIX}.bed" ] && [ "${FORCE}" -eq 0 ]; then
     log "Merged file already exists: ${MERGED_PREFIX}.bed"
@@ -305,7 +244,7 @@ if [ -f "${MERGED_PREFIX}.bed" ] && [ "${FORCE}" -eq 0 ]; then
 else
     N_FILES=$(wc -l < "${MERGE_LIST}")
     log "============================================================"
-    log "  Merging ${N_FILES} pruned chromosome files"
+    log "  Merging ${N_FILES} QC'd chromosome files"
     log "============================================================"
 
     if plink2 \
@@ -377,23 +316,25 @@ if [ -n "${WORKSPACE_BUCKET}" ]; then
     if [[ "${WORKSPACE_BUCKET}" != gs://* ]]; then
         WORKSPACE_BUCKET="gs://${WORKSPACE_BUCKET}"
     fi
+
+    # Upload per-chrom QC files (also used as LD reference for GCTA-COJO)
+    GCS_QC_DEST="${WORKSPACE_BUCKET}/results/1-bg_snp/plink_qc/"
+    log "Uploading per-chrom QC files to: ${GCS_QC_DEST}"
+    gsutil -u "${GOOGLE_PROJECT}" -m cp \
+        "${QC_DIR}"/chr*_background_qc.{bed,bim,fam} "${GCS_QC_DEST}"
+    log "Per-chrom QC upload complete"
+
+    # Upload Step 1 thinned fileset
     GCS_DEST="${WORKSPACE_BUCKET}/results/1-bg_snp/plink_step1/"
-    log "Uploading to: ${GCS_DEST}"
+    log "Uploading Step 1 fileset to: ${GCS_DEST}"
     gsutil -u "${GOOGLE_PROJECT}" -m cp "${FINAL_PREFIX}".* "${GCS_DEST}"
-    log "Upload complete"
+    log "Step 1 upload complete"
 else
     log "WARNING: WORKSPACE_BUCKET not set -- skipping GCS upload."
     log "  To upload manually:"
+    log "  gsutil -u \$GOOGLE_PROJECT -m cp ${QC_DIR}/chr*_background_qc.{bed,bim,fam} \$WORKSPACE_BUCKET/results/1-bg_snp/plink_qc/"
     log "  gsutil -u \$GOOGLE_PROJECT -m cp ${FINAL_PREFIX}.* \$WORKSPACE_BUCKET/results/1-bg_snp/plink_step1/"
 fi
-
-# ---------------------------------------------------------------------------
-# Cleanup temp files
-# ---------------------------------------------------------------------------
-log ""
-log "Cleaning up temp files..."
-rm -rf "${TMP_DIR}"
-log "Done."
 
 # ---------------------------------------------------------------------------
 # Final summary
@@ -406,10 +347,9 @@ log ""
 log "============================================================"
 log "  Pipeline COMPLETED in ${ELAPSED_FMT}"
 log "============================================================"
-log "Per-chrom QC    : ${QC_DIR}/chrN_background_qc.{bed,bim,fam}"
-log "Per-chrom pruned: ${PRUNE_DIR}/chrN_pruned.{bed,bim,fam}"
-log "Merged pruned   : ${MERGED_PREFIX}.{bed,bim,fam}"
-log "Step 1 final    : ${FINAL_PREFIX}.{bed,bim,fam}"
+log "Per-chrom QC : ${QC_DIR}/chrN_background_qc.{bed,bim,fam}"
+log "Merged QC    : ${MERGED_PREFIX}.{bed,bim,fam}"
+log "Step 1 final : ${FINAL_PREFIX}.{bed,bim,fam}"
 log ""
 ls -lh "${FINAL_PREFIX}".{bed,bim,fam} 2>/dev/null | while read -r line; do
     log "  ${line}"

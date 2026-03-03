@@ -13,7 +13,7 @@ The study tests if variants with specific methylation signatures (FNCVs) drive d
 ## Software Stack
 
 * **Hail:** Distributed data wrangling (extracting common SNPs from AoU MatrixTables).
-* **PLINK (1.9/2.0):** Quality control, variant filtering, LD pruning, and fileset merging.
+* **PLINK (1.9/2.0):** Quality control, variant filtering, deduplication, and fileset merging.
 * **GCTA-COJO:** Conditional and joint analysis to isolate independent association signals.
 * **SuSiE:** Bayesian fine-mapping to define 95% Credible Sets for target loci boundaries.
 * **REGENIE:** Whole genome regression for the null model (Step 1) and SKAT-O aggregation testing (Step 2).
@@ -53,17 +53,7 @@ The pipeline is structured sequentially. The outputs of each phase directly dict
 
 * **Note:** For Multiple Sclerosis, it is standard practice to exclude the MHC region (Chr6: 25-35Mb) due to complex LD. This analysis excludes the MHC throughout.
 
-Phase 2 is split into three sub-steps, each processed **per chromosome** for memory efficiency (recommended by GCTA authors):
-
-#### Step 02: LD Reference QC (`02_qc_ld_reference.sh`)
-
-Build per-chromosome LD reference panels from the raw PLINK files exported by Hail. Samples are already EUR-only (234K) from Phase 1 Hail export.
-
-* **QC pipeline (PLINK2):**
-  1. Variant QC: `--maf 0.01 --hwe 1e-6 --geno 0.05 --mind 0.05 --snps-only just-acgt --max-alleles 2`
-  2. Remove duplicate variant IDs: `--rm-dup exclude-all`
-* **Input:** `results/1-bg_snp/plink_no-qc/chrN_background.{bed,bim,fam}`
-* **Output:** `results/2-locus_definition/ld_ref/chrN_ld_ref.{bed,bim,fam}` -> GCS
+Phase 2 uses the per-chromosome QC'd PLINK files from Step 01b as the LD reference panels for GCTA-COJO. This eliminates the need for a separate LD-ref QC step since 01b now applies the same rigorous QC (variant filters + duplicate removal) used for all downstream analyses.
 
 #### Step 02a: GWAS Summary Stats Export (`02a_export_gwas_ma.sh`)
 
@@ -84,7 +74,7 @@ Run conditional/joint analysis per chromosome to identify independent signals.
   3. **Per-locus COJO:** For each locus, subset LD reference to window (+500kb LD padding), run `--cojo-slct` with `--cojo-p 5e-8`.
   4. **Assemble outputs:** Merge independent signals into BED file.
 * *SuSiE Fine-Mapping*: Future step to narrow windows to 95% Credible Sets.
-* **Inputs:** Per-chrom LD ref PLINK + per-chrom `.ma` files + GCTA binary
+* **Inputs:** Per-chrom QC'd PLINK (from 01b, as LD ref) + per-chrom `.ma` files + GCTA binary
 * **Outputs:**
   - `results/2-locus_definition/target_loci.bed` (chrom, start, end, locus_id)
   - `results/2-locus_definition/all_independent_signals.tsv`
@@ -128,14 +118,13 @@ Run conditional/joint analysis per chromosome to identify independent signals.
 |------|--------|-------------|------------|
 | 00 | `00_run_phenotype_covariates.sh` | Phenotype + covariate files -> GCS | CDR access |
 | 01a | `01a_build_background_snps.sh` | Per-chrom PLINK export via Hail -> GCS | Hail/Dataproc |
-| 01b | `01b_qc_merge_background_snps.sh` | QC, LD-prune, merge, thin to 500K -> GCS | 01a |
+| 01b | `01b_qc_merge_background_snps.sh` | QC, dedup, merge, thin to 500K -> GCS (per-chrom QC also serves as LD ref) | 01a |
 | 01c | `01c_run_regenie_step1.sh` | REGENIE Step 1 null model (LOCO) -> GCS | 00, 01b |
-| 02 | `02_qc_ld_reference.sh` | Per-chrom LD ref QC for GCTA-COJO -> GCS | 01a |
 | 02a | `02a_export_gwas_ma.sh` | Per-chrom .ma summary stats via Hail -> GCS | CDR GWAS HT |
-| 02b | `02b_run_cojo.sh` | GCTA-COJO per chromosome -> target_loci.bed -> GCS | 02, 02a |
+| 02b | `02b_run_cojo.sh` | GCTA-COJO per chromosome -> target_loci.bed -> GCS | 01b, 02a |
 
-Steps 02 and 02a can run in parallel (independent inputs). Step 02b depends on both.
-Steps 01b-01c and 02-02b are independent branches and can run in parallel.
+Step 02a can run in parallel with 01b (independent inputs). Step 02b depends on both 01b and 02a.
+Steps 01b-01c and 02a-02b are independent branches and can run in parallel.
 
 Each script uploads its outputs to GCS and can pull inputs from GCS if missing locally.
 
@@ -153,10 +142,7 @@ nohup bash bash/01b_qc_merge_background_snps.sh > /dev/null 2>&1 &
 # 01c auto-downloads phenotype + PLINK step1 files from GCS if missing
 nohup bash bash/01c_run_regenie_step1.sh > /dev/null 2>&1 &
 
-# 02_qc auto-downloads raw PLINK from GCS if missing
-nohup bash bash/02_qc_ld_reference.sh > /dev/null 2>&1 &
-
-# 02b auto-downloads LD ref + .ma files from GCS if missing
+# 02b auto-downloads per-chrom QC (LD ref) + .ma files from GCS if missing
 nohup bash bash/02b_run_cojo.sh > /dev/null 2>&1 &
 ```
 

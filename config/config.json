@@ -14,7 +14,7 @@
         "regenie_step1_plink": "results/1-bg_snp/plink_step1/step1_500k",
         "regenie_pred_list": "results/1-bg_snp/regenie/MS_null_model_pred.list",
         "loci_bed": "results/2-locus_definition/target_loci.bed",
-        "ld_reference": "results/2-locus_definition/ld_ref",
+        "ld_reference": "results/1-bg_snp/plink_qc",
         "locus_def_dir": "results/2-locus_definition",
         "gwas_ma_dir": "results/2-locus_definition/ma"
     },
