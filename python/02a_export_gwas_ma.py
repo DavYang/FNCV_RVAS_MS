@@ -289,8 +289,10 @@ def main() -> None:
                 N=n_expr,
             )
 
-            # Select only .ma columns and export to pandas
-            df = chr_ht.select('SNP', 'A1', 'A2', 'freq', 'b', 'se', 'p', 'N').to_pandas()
+            # Drop keys so locus/alleles don't leak into output, then select .ma cols
+            ma_cols = ['SNP', 'A1', 'A2', 'freq', 'b', 'se', 'p', 'N']
+            df = chr_ht.key_by().select(*ma_cols).to_pandas()
+            df = df[ma_cols]
 
             if df.empty:
                 logger.warning(f"[{chrom}] No variants found -- skipping")
