@@ -12,7 +12,7 @@ set -eo pipefail
 #
 # Usage:
 #   bash bash/02c_export_top_gwas_snps.sh
-#   bash bash/02c_export_top_gwas_snps.sh --p-threshold=1e-5
+#   bash bash/02c_export_top_gwas_snps.sh --p-threshold=5e-6
 #   bash bash/02c_export_top_gwas_snps.sh --force
 #
 # Monitor:

@@ -14,11 +14,12 @@ The central hypothesis is that rare variants exhibiting methylation outlier sign
 
 The pipeline utilizes a distributed cloud architecture (Hail, Google Cloud Services) integrating the following tools:
 
-* **Hail (Python/Spark):** Used for genomic data wrangling, specifically extracting common background SNPs and and EUR sample genotypes from AoU MatrixTables (mt).
+* **Hail (Python/Spark):** Used for genomic data wrangling, specifically extracting common background SNPs and EUR sample genotypes from AoU MatrixTables (mt).
 * **PLINK (1.9/2.0):** Used for Quality Control (QC), Linkage Disequilibrium (LD) pruning, and merging of chromosome-level filesets.
-* **GCTA-COJO:** Performs Conditional and Joint Analysis to identify independent association signals within complex loci.
-* **SuSiE (R):** Performs Bayesian Fine-Mapping to define the 95% Credible Sets that serve as the boundaries for the target loci.
 * **REGENIE:** The primary statistical engine. Step 1 fits the whole-genome null model; Step 2 performs the SKAT-O aggregation tests.
+* **pyliftover (Python):** Lifts GWAS Catalog SNP positions from GRCh37 to GRCh38 for positional cross-referencing.
+
+> **Benched (not currently used):** GCTA-COJO (conditional/joint analysis), SuSiE (Bayesian fine-mapping), PLINK LD clumping. These approaches were evaluated but deprioritized due to computational overhead and LD reference panel complexity.
 
 ---
 
@@ -67,25 +68,45 @@ The pipeline is designed sequentially. The output of each phase forms the direct
 
 * **Integration:** These LOCO predictions act as the baseline null model for **Phase 4**, ensuring that significant results are due to rare variant burden and not general relatedness.
 
-### Phase 2: Signal Dissection & Locus Definition
+### Phase 2: Locus Definition via GWAS Catalog Cross-Reference
 
-**Goal:** Define the exact genomic windows (Target Loci) where the enrichment test will occur.
+**Goal:** Define the exact genomic windows (Target Loci) where the enrichment test will occur, anchored to known EUR MS GWAS loci from the literature.
 
 * **Methodology:**
-1. **Lead SNP Selection:** Identify all significant hits ($p < 5 \times 10^{-8}$) from `NS_326.1` summary statistics. Threshold reduced to ($p < 5 \times 10^{-6}$) after reviw of the data. 
-2. **Signal Separation (GCTA-COJO):** Use the 22 per-chromosome PLINK files as an LD reference to identify all independent secondary signals within GWAS peaks.
-3. **Fine-Mapping (SuSiE):** For each independent signal, run SuSiE to identify the 95% Credible Set.
-4. **Anchoring:** Define the "Locus Window" as the minimum/maximum position of the Credible Set, plus 1kb padding.
-5. **MHC Exclusion:** Remove any loci falling within the Chr6 MHC region.
 
+**Step A — Export AoU top SNPs (HPC/workbench):**
+1. Export all AoU `NS_326.1` GWAS SNPs at $p < 5 \times 10^{-6}$ from per-chromosome `.ma` summary statistic files.
+2. Output: `results/2-locus_definition/top_gwas_snps.tsv` (fields: SNP, chrom, pos, ref, alt, beta, se, p, freq).
+
+**Step B — Parse GWAS Catalog (HPC):**
+1. Load the full GWAS Catalog associations TSV (`gwas-catalog-download-associations-v1.0-full.tsv`, GRCh37 positions).
+2. Filter to: MS trait (case-insensitive match on `DISEASE/TRAIT`), $p < 5 \times 10^{-8}$, autosomes, non-null positions.
+3. **EUR-only study filter:** `INITIAL SAMPLE SIZE` must contain "European ancestry" and must **not** mention any non-EUR ancestry group (African, Asian, Japanese, Hispanic, admixed, Latino, multi, etc.). This excludes multi-ancestry GWAS entirely.
+4. Liftover `CHR_POS` from GRCh37 to GRCh38 using `pyliftover` + UCSC `hg19ToHg38.over.chain.gz`.
+5. Output: `gwas_catalog_ms_eur_hg38.tsv` → upload to GCS workspace bucket.
+
+**Step C — Cross-reference & window generation (AoU workbench):**
+1. For each AoU top SNP (GRCh38), check whether any EUR MS catalog SNP falls within $\pm 250$ kb (positional match, both now GRCh38).
+2. **Validated SNPs** (catalog hit within ±250kb): generate $\pm 250$ kb window around the AoU SNP position.
+3. **Unmatched SNPs** (no catalog hit): written to `novel_snps.tsv`, excluded from locus generation.
+4. Merge overlapping windows (sort-and-merge on chromosome/start).
+5. Exclude MHC region (Chr6: 25Mb–35Mb).
+6. Assign `locus_id = chrN_<lead_snp_pos>` (lowest $p$ within merged window).
 
 * **Inputs:**
-* AoU GWAS Summary Statistics.
-* Per-chromosome PLINK files (LD Reference, dense panel generated from re-QCing the sampled SNPs from the Hail mt).
+    * AoU GWAS summary statistics (`.ma` files, per-chromosome).
+    * GWAS Catalog full associations TSV (local HPC copy).
 
+* **Outputs:**
+    * `results/2-locus_definition/top_gwas_snps.tsv` — AoU top SNPs at $p < 5 \times 10^{-6}$.
+    * `gwas_catalog_ms_eur_hg38.tsv` — filtered EUR MS catalog SNPs (GRCh38).
+    * `results/2-locus_definition/gwas_catalog_validated_snps.tsv` — AoU SNPs matched to catalog.
+    * `results/2-locus_definition/novel_snps.tsv` — AoU top SNPs with no catalog support.
+    * `results/2-locus_definition/target_loci.bed` (Columns: Chrom, Start, End, Locus_ID).
 
-* **Outputs:** `target_loci.bed` (Columns: Chrom, Start, End, Locus_ID).
-* **Integration:** These coordinates restrict **Phase 3** so that variant classification only occurs within biologically relevant, disease-associated regions.
+* **Integration:** These coordinates restrict **Phase 3** so that variant classification only occurs within biologically relevant, literature-supported disease-associated regions.
+
+> **Benched approaches:** GCTA-COJO signal dissection, SuSiE fine-mapping, and PLINK LD clumping were evaluated for locus definition but deprioritized due to computational overhead and LD reference panel complexity. Scripts `02b_run_cojo.sh` and `02b_define_loci.py` are retained but not currently used.
 
 ### Phase 3: Methylation-Based Variant Classification
 
