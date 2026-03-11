@@ -4,14 +4,15 @@ set -eo pipefail
 # ---------------------------------------------------------------------------
 # 02a_export_gwas_ma.sh
 #
-# Phase 2 Step 1: Export per-chromosome GCTA-COJO .ma summary statistics
-# from the AllxAll GWAS Hail Table. Runs Hail on the VM (/opt/conda env).
+# Phase 2 Step 1: Export per-chromosome summary statistics (.ma format)
+# from the AllxAll EUR MS GWAS Hail Table. Runs Hail on the VM (/opt/conda env).
 #
-# GCTA-COJO requires full-chromosome .ma files (all SNPs) to correctly
-# estimate phenotypic variance. This script wraps python/02a_export_gwas_ma.py.
+# Output .ma files are consumed by 02c_export_top_gwas_snps.sh which filters
+# to SNPs at p < gwas_p_threshold (5e-6) to generate top_gwas_snps.tsv for
+# cross-referencing against EUR MS GWAS Catalog loci (windowed approach).
 #
 # Inputs  (GCS, read via Hail):
-#   AllxAll GWAS HT (config: inputs.phenotype_gwas)
+#   AllxAll EUR MS GWAS HT (config: inputs.phenotype_gwas)
 #
 # Outputs (local, then uploaded to GCS):
 #   results/2-locus_definition/ma/chrN.ma  (22 files)
@@ -35,7 +36,8 @@ set -eo pipefail
 
 trap '' HUP
 
-PROJECT_DIR="/home/jupyter/FNCV_RVAS_MS"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -78,7 +80,7 @@ log() {
 START_SECONDS=$(date +%s)
 
 log "============================================================"
-log "  02a_export_gwas_ma.sh -- Export .ma files for GCTA-COJO"
+log "  02a_export_gwas_ma.sh -- Export per-chromosome GWAS .ma files"
 log "============================================================"
 log "  Timestamp : ${TIMESTAMP}"
 log "  PID       : $$"
@@ -174,7 +176,7 @@ for f in "${OUTPUT_DIR}"/*.ma; do
     fi
 done
 log ""
-log "Next step: bash bash/02b_run_cojo.sh"
+log "Next step: bash bash/02c_export_top_gwas_snps.sh"
 log "============================================================"
 
 rm -f "${PID_FILE}"

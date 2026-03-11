@@ -4,9 +4,14 @@ set -eo pipefail
 # ---------------------------------------------------------------------------
 # 02c_export_top_gwas_snps.sh
 #
-# Export top GWAS SNPs from per-chromosome .ma files (produced by 02a).
-# Filters to SNPs below a configurable p-value threshold and writes a
-# single consolidated TSV for cross-referencing with published MS loci.
+# Phase 2 Step 2: Filter per-chromosome .ma files (from 02a) to SNPs reaching
+# the significance threshold (default p < 5e-6) and write a consolidated TSV
+# (top_gwas_snps.tsv). Cross-referenced against published EUR-only MS GWAS
+# Catalog loci in the windowed locus definition step (02e).
+#
+# Outputs:
+#   results/2-locus_definition/top_gwas_snps.tsv  (local)
+#   $WORKSPACE_BUCKET/results/2-locus_definition/top_gwas_snps.tsv  (GCS)
 #
 # No Hail/Spark required -- pure pandas, runs on the VM in seconds.
 #
@@ -118,5 +123,42 @@ if [ "${EXIT_CODE}" -ne 0 ]; then
     exit "${EXIT_CODE}"
 fi
 
+# ---------------------------------------------------------------------------
+# Upload top_gwas_snps.tsv to GCS
+# ---------------------------------------------------------------------------
+TOP_SNPS_FILE=$(python3 -c "
+import json, os
+c = json.load(open('${CONFIG_FILE}'))
+locus_def_dir = c['outputs'].get('locus_def_dir', 'results/2-locus_definition')
+print(os.path.join(locus_def_dir, 'top_gwas_snps.tsv'))
+")
+
+# Resolve GCS destination from config, expanding \$WORKSPACE_BUCKET
+GCS_DEST_TEMPLATE=$(python3 -c "
+import json
+c = json.load(open('${CONFIG_FILE}'))
+print(c.get('params', {}).get('top_gwas_snps_gcs_path', ''))
+")
+GCS_DEST="${GCS_DEST_TEMPLATE//\$WORKSPACE_BUCKET/${WORKSPACE_BUCKET}}"
+
+log ""
+log "============================================================"
+log "  Upload to GCS"
+log "============================================================"
+
+if [ -z "${GCS_DEST}" ] || [ -z "${WORKSPACE_BUCKET}" ]; then
+    log "WARNING: WORKSPACE_BUCKET not set or top_gwas_snps_gcs_path not configured."
+    log "  Set WORKSPACE_BUCKET and params.top_gwas_snps_gcs_path in config/config.json."
+    log "  To upload manually:"
+    log "  gsutil cp ${TOP_SNPS_FILE} \$WORKSPACE_BUCKET/results/2-locus_definition/top_gwas_snps.tsv"
+else
+    log "Uploading: ${TOP_SNPS_FILE}"
+    log "       to: ${GCS_DEST}"
+    gsutil cp "${TOP_SNPS_FILE}" "${GCS_DEST}" 2>&1 | tee -a "${LOG_FILE}"
+    log "Upload complete."
+fi
+
 log ""
 log "02c complete"
+log "  Output : ${TOP_SNPS_FILE}"
+log "  Next   : bash bash/02e_define_loci_catalog.sh"

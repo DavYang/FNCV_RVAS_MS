@@ -105,13 +105,7 @@ if [ -z "${CATALOG_LOCAL}" ]; then
     CATALOG_LOCAL="${LOCUS_DEF_DIR}/gwas_catalog_ms_eur_hg38.tsv"
 fi
 
-# Check top_gwas_snps.tsv
 TOP_SNPS_FILE="${LOCUS_DEF_DIR}/top_gwas_snps.tsv"
-if [ ! -f "${TOP_SNPS_FILE}" ]; then
-    log "ERROR: top_gwas_snps.tsv not found: ${TOP_SNPS_FILE}"
-    log "  Run: bash bash/02c_export_top_gwas_snps.sh"
-    exit 1
-fi
 
 log "Pre-flight checks PASSED"
 log "  Top SNPs : ${TOP_SNPS_FILE}"
@@ -119,14 +113,47 @@ log "  Catalog  : ${CATALOG_LOCAL}"
 log ""
 
 # ---------------------------------------------------------------------------
+# Download top_gwas_snps.tsv from GCS if not already local
+# ---------------------------------------------------------------------------
+if [ ! -f "${TOP_SNPS_FILE}" ] || [ -n "${FORCE}" ]; then
+    TOP_SNPS_GCS_TEMPLATE=$(python3 -c "
+import json
+c = json.load(open('${CONFIG_FILE}'))
+print(c.get('params', {}).get('top_gwas_snps_gcs_path', ''))
+" 2>/dev/null)
+    TOP_SNPS_GCS="${TOP_SNPS_GCS_TEMPLATE//\$WORKSPACE_BUCKET/${WORKSPACE_BUCKET}}"
+
+    if [ -z "${TOP_SNPS_GCS}" ] || [ -z "${WORKSPACE_BUCKET}" ]; then
+        log "ERROR: top_gwas_snps.tsv not found locally and params.top_gwas_snps_gcs_path not set."
+        log "  Run: bash bash/02c_export_top_gwas_snps.sh"
+        exit 1
+    fi
+
+    log "Downloading top_gwas_snps.tsv from GCS: ${TOP_SNPS_GCS}"
+    mkdir -p "${LOCUS_DEF_DIR}"
+    gsutil cp "${TOP_SNPS_GCS}" "${TOP_SNPS_FILE}" 2>&1 | tee -a "${LOG_FILE}"
+
+    if [ ! -f "${TOP_SNPS_FILE}" ]; then
+        log "ERROR: Download failed -- file not found after gsutil cp: ${TOP_SNPS_FILE}"
+        exit 1
+    fi
+    log "Downloaded: ${TOP_SNPS_FILE}"
+else
+    log "top_gwas_snps.tsv already local: ${TOP_SNPS_FILE} (use --force to re-download)"
+fi
+
+log ""
+
+# ---------------------------------------------------------------------------
 # Download GWAS Catalog from GCS if not already local
 # ---------------------------------------------------------------------------
 if [ ! -f "${CATALOG_LOCAL}" ] || [ -n "${FORCE}" ]; then
-    CATALOG_GCS=$(python3 -c "
+    CATALOG_GCS_TEMPLATE=$(python3 -c "
 import json
 c = json.load(open('${CONFIG_FILE}'))
 print(c.get('params', {}).get('gwas_catalog_gcs_path', ''))
 " 2>/dev/null)
+    CATALOG_GCS="${CATALOG_GCS_TEMPLATE//\$WORKSPACE_BUCKET/${WORKSPACE_BUCKET}}"
 
     if [ -z "${CATALOG_GCS}" ]; then
         log "ERROR: Catalog not found locally and params.gwas_catalog_gcs_path is not set."

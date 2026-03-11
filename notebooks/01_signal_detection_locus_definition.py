@@ -3,41 +3,40 @@ import marimo
 __generated_with = "0.20.4"
 app = marimo.App(
     width="full",
-    app_title="Phase 2: Signal Detection & Locus Definition",
+    app_title="Phase 2d: GWAS Catalog EUR MS Loci (HPC)",
 )
 
 
 @app.cell(hide_code=True)
 def _():
     import marimo as mo
-
     return (mo,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # Phase 2: Signal Detection & Locus Definition
+    # Phase 2d: GWAS Catalog EUR MS Loci
 
     **Environment:** HPC (`/gs/gsfs0/shared-lab/greally-lab/David/GA4K/6_AoU-AxA/FNCV_RVAS_MS`)
 
-    This notebook runs the HPC portion of Phase 2 — parsing the GWAS Catalog to extract
-    EUR-only Multiple Sclerosis loci, lifting coordinates from GRCh37 to GRCh38, and
-    uploading the processed file to the AoU workspace GCS bucket.
+    This notebook runs **step 2d** of the Phase 2 pipeline on the HPC — parsing the raw GWAS
+    Catalog TSV to extract EUR-only Multiple Sclerosis loci, lifting coordinates from GRCh37
+    to GRCh38, and uploading the result to the AoU workspace GCS bucket for use in step 2e.
 
     | Step | Script | Environment |
     |---|---|---|
-    | 2a–2c | `02a/b/c_*.sh` | AoU workbench |
+    | 2a | `02a_export_gwas_ma.sh` | AoU VM |
+    | 2c | `02c_export_top_gwas_snps.sh` | AoU VM |
     | **2d (this notebook)** | `02d_parse_gwas_catalog.sh` | **HPC** |
-    | 2e | `02e_define_loci_catalog.sh` | AoU workbench |
+    | 2e | `02e_define_loci_catalog.sh` | AoU VM |
 
-    ### Filtering criteria
+    ## Filtering criteria
     - `DISEASE/TRAIT` is **exactly** `"Multiple sclerosis"` (case-insensitive exact match;
       excludes MTAG, OCB status, drug-induced, severity, and relapse sub-traits)
     - `P-VALUE` < 5e-8, autosomes only, non-null `CHR_POS`
     - **EUR-only:** `INITIAL SAMPLE SIZE` must contain `"European ancestry"` and must not
-      mention any non-EUR or unknown ancestry group (African, Asian, Hispanic, admixed,
-      unknown ancestry, etc.) — multi-ancestry GWAS excluded entirely
+      mention any non-EUR or unknown ancestry group — multi-ancestry GWAS excluded entirely
     - Liftover `CHR_POS` GRCh37 → GRCh38 via `pyliftover` + UCSC `hg19ToHg38.over.chain.gz`
     - Deduplicated on `chrom + pos_hg38 + rsid` (lowest p-value kept)
     """)
@@ -46,9 +45,7 @@ def _(mo):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md("""
-    ## 0. Setup & Configuration
-    """)
+    mo.md("## 0. Setup & Configuration")
     return
 
 
@@ -84,10 +81,15 @@ def _():
     return (
         CATALOG_RAW,
         CHAIN_FILE,
+        CONFIG_PATH,
         GCS_DEST,
+        LOCUS_DEF_DIR,
         MHC_INTERVAL,
         OUTPUT_FILE,
+        P_THRESHOLD,
         PLOT_PATH,
+        config,
+        json,
         os,
         subprocess,
     )
@@ -95,9 +97,7 @@ def _():
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md("""
-    ## 1. Pre-flight Checks
-    """)
+    mo.md("## 1. Pre-flight Checks")
     return
 
 
@@ -154,7 +154,7 @@ def _(CATALOG_RAW, CHAIN_FILE, OUTPUT_FILE, os):
     print("\n".join(results))
     print()
     print("All checks passed -- ready to run." if checks_passed else "One or more checks FAILED.")
-    return
+    return checks_passed, results, shutil
 
 
 @app.cell(hide_code=True)
@@ -165,30 +165,29 @@ def _(mo):
     Runs `bash/02d_parse_gwas_catalog.sh` which:
     1. Validates inputs from `config/config.json`
     2. Calls `python/02d_parse_gwas_catalog.py` (chunked 50k-row reads, ~500 MB TSV)
-    3. Filters to EUR-only MS associations at p < 5e-8
+    3. Filters to EUR-only MS associations at p < 5e-8 (exact trait match)
     4. Downloads chain file if not cached, lifts GRCh37 → GRCh38
     5. Writes `results/2-locus_definition/gwas_catalog_ms_eur_hg38.tsv`
 
     Runtime: typically **2–5 minutes**. Logs: `logs/02d_parse_gwas_catalog_<timestamp>.log`
 
-    > To overwrite an existing output, change `FORCE` to `True` below.
+    > To overwrite an existing output, set `FORCE = True` below.
     """)
     return
 
 
 @app.cell
 def _():
-    FORCE = True
+    FORCE = False
     return (FORCE,)
 
 
 @app.cell
-def _(FORCE):
-    force_flag = "--force" if FORCE else ""
-    cmd = f"bash bash/02d_parse_gwas_catalog.sh {force_flag}".strip()
-    print(f"Running: {cmd}")
-    import subprocess as _sp
-    _result = _sp.run(cmd, shell=True, text=True)
+def _(FORCE, subprocess):
+    _force_flag = "--force" if FORCE else ""
+    _cmd = f"bash bash/02d_parse_gwas_catalog.sh {_force_flag}".strip()
+    print(f"Running: {_cmd}")
+    _result = subprocess.run(_cmd, shell=True, text=True)
     if _result.returncode != 0:
         raise RuntimeError(f"Script exited with code {_result.returncode}")
     return
@@ -196,9 +195,7 @@ def _(FORCE):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md("""
-    ## 3. Inspect Output
-    """)
+    mo.md("## 3. Inspect Output")
     return
 
 
@@ -250,9 +247,7 @@ def _(df):
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md("""
-    ## 4. Manhattan Plot
-    """)
+    mo.md("## 4. Manhattan Plot")
     return
 
 
@@ -263,9 +258,6 @@ def _(MHC_INTERVAL, PLOT_PATH, df, os, pd):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # ---------------------------------------------------------------------------
-    # Parse MHC interval from config and exclude loci
-    # ---------------------------------------------------------------------------
     _mhc_chrom, _mhc_coords = MHC_INTERVAL.split(":")
     _mhc_start, _mhc_end = [int(x) for x in _mhc_coords.split("-")]
 
@@ -286,9 +278,6 @@ def _(MHC_INTERVAL, PLOT_PATH, df, os, pd):
     )
     _plot_df = _plot_df.sort_values(["chrom", "pos_hg38"]).reset_index(drop=True)
 
-    # ---------------------------------------------------------------------------
-    # Cumulative genomic x-positions
-    # ---------------------------------------------------------------------------
     CHROM_SIZES = {
         "chr1": 248956422, "chr2": 242193529, "chr3": 198295559, "chr4": 190214555,
         "chr5": 181538259, "chr6": 170805979, "chr7": 159345973, "chr8": 145138636,
@@ -316,9 +305,6 @@ def _(MHC_INTERVAL, PLOT_PATH, df, os, pd):
     PALETTE = ["#1f4e79", "#2e86ab"]
     _colour_map = {c: PALETTE[i % 2] for i, c in enumerate(CHROM_ORDER)}
 
-    # ---------------------------------------------------------------------------
-    # Plot
-    # ---------------------------------------------------------------------------
     _fig, _ax = plt.subplots(figsize=(18, 5))
 
     for _chrom in CHROM_ORDER:
@@ -355,7 +341,7 @@ def _(MHC_INTERVAL, PLOT_PATH, df, os, pd):
     print(f"Saved: {PLOT_PATH}")
 
     _fig
-    return
+    return CHROM_ORDER, CHROM_SIZES, PALETTE, matplotlib, np, plt
 
 
 @app.cell(hide_code=True)
@@ -413,6 +399,7 @@ def _(mo):
     Once the upload is confirmed, switch to the **AoU Researcher Workbench** and run:
 
     ```bash
+    # Step 2e: cross-reference AoU top SNPs vs catalog, define ±250 kb windows
     nohup bash bash/02e_define_loci_catalog.sh > /dev/null 2>&1 &
     tail -f logs/02e_define_loci_catalog_*.log
     ```

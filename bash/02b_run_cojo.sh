@@ -1,12 +1,20 @@
 #!/bin/bash
-set -eo pipefail
+# DEPRECATED: GCTA-COJO locus definition has been replaced by a windowed approach.
+#
+# The new Phase 2 pipeline is:
+#   02a_export_gwas_ma.sh       -- export per-chromosome .ma files from AllxAll GWAS HT
+#   02c_export_top_gwas_snps.sh -- filter to p < 5e-6, write top_gwas_snps.tsv, upload to GCS
+#   02d_parse_gwas_catalog.sh   -- parse EUR-only MS GWAS Catalog loci (HPC), upload to GCS
+#   02e_define_loci_catalog.sh  -- cross-reference AoU SNPs vs catalog, define ±250kb windows
+echo "ERROR: 02b_run_cojo.sh is deprecated. GCTA-COJO is no longer used in this pipeline."
+echo "See bash/02c_export_top_gwas_snps.sh and bash/02e_define_loci_catalog.sh."
+exit 1
 
 # ---------------------------------------------------------------------------
-# 02b_run_cojo.sh
+# 02b_run_cojo.sh  [DEPRECATED]
 #
-# Phase 2 Step 2: Run GCTA-COJO per chromosome for locus definition.
-# Uses per-chromosome LD reference panels (from 01b_qc_merge_background_snps.sh) and
-# per-chromosome .ma summary statistics (from 02a_export_gwas_ma.sh).
+# Previously: Run GCTA-COJO per chromosome for locus definition.
+# Replaced by windowed cross-reference approach (02e_define_loci_catalog.sh).
 #
 # Inputs  (local on VM):
 #   results/1-bg_snp/plink_qc/chrN_background_qc.{bed,bim,fam}

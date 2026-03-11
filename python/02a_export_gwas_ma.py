@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Export per-chromosome GCTA-COJO .ma summary statistics from AllxAll GWAS HT.
+"""Export per-chromosome summary statistics (.ma format) from the AllxAll GWAS HT.
 
-GCTA requires full-chromosome .ma files (all SNPs, not just per-window) to
-correctly estimate phenotypic variance. This script reads the AllxAll GWAS
-Hail Table, resolves field names, and writes one .ma file per autosome.
+Reads the AllxAll EUR MS GWAS Hail Table, resolves field names, and writes one
+.ma file per autosome. These files are consumed by 02c_export_top_gwas_snps.py
+which filters to SNPs at p < gwas_p_threshold (default 5e-6) and produces
+top_gwas_snps.tsv for cross-referencing against published EUR MS GWAS Catalog
+loci in the windowed locus definition step (02e_define_loci_catalog.py).
 
 .ma format (tab-separated, with header):
     SNP  A1  A2  freq  b  se  p  N
 
-    SNP  = variant ID (chrN:pos:ref:alt, matching Hail export_plink .bim)
+    SNP  = variant ID (chrN:pos:ref:alt)
     A1   = effect allele (alt)
     A2   = other allele (ref)
     freq = frequency of A1
@@ -166,7 +168,7 @@ def main() -> None:
 
     run_start = time.time()
     logger.info("=" * 60)
-    logger.info("02a: Export per-chromosome GWAS .ma files for GCTA-COJO")
+    logger.info("02a: Export per-chromosome GWAS .ma files")
     logger.info("=" * 60)
     logger.info(f"  Timestamp : {datetime.now().isoformat()}")
     logger.info(f"  Config    : {args.config}")
@@ -328,6 +330,7 @@ def main() -> None:
 
     elapsed = time.time() - run_start
     logger.info(f"02a complete in {_fmt_elapsed(elapsed)}")
+    logger.info("Next step: bash bash/02c_export_top_gwas_snps.sh")
 
 
 if __name__ == "__main__":
