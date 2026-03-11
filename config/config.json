@@ -27,7 +27,7 @@
         "test_chromosome": "chr21",
         "test_interval_file": "0000021371.interval_list",
         "gwas_p_threshold": 5e-6,
-        "gwas_catalog_gcs_path": "gs://fc-secure-b43840eb-548f-464d-bece-31ac7a969abd/reference/gwas_catalog_ms_eur_hg38.tsv",
+        "gwas_catalog_gcs_path": "results/reference/gwas_catalog_ms_eur_hg38.tsv",
         "gwas_catalog_hg38_path": "results/2-locus_definition/gwas_catalog_ms_eur_hg38.tsv",
         "gwas_catalog_p_threshold": 5e-8,
         "catalog_validation_window_bp": 250000,
