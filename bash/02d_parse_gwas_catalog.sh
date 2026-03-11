@@ -1,9 +1,10 @@
 #!/bin/bash
+#S
 set -eo pipefail
 
 # ---------------------------------------------------------------------------
 # 02d_parse_gwas_catalog.sh
-#
+# RAN ON LOCAL HPC
 # Parse the full GWAS Catalog associations TSV to extract EUR-only MS loci
 # and liftover positions from GRCh37 to GRCh38.
 #

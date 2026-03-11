@@ -14,7 +14,8 @@ All input/output paths are read from config/config.json:
     params.gwas_catalog_gcs_path     -- GCS destination for upload
 
 Filtering criteria:
-    - DISEASE/TRAIT contains "multiple sclerosis" (case-insensitive)
+    - DISEASE/TRAIT is exactly "Multiple sclerosis" (case-insensitive exact match;
+      excludes MTAG, OCB status, drug-induced, severity, relapse sub-traits)
     - P-VALUE < gwas_catalog_p_threshold
     - CHR_ID in 1-22 (autosomes only)
     - CHR_POS non-null
@@ -72,6 +73,7 @@ NON_EUR_KEYWORDS: List[str] = [
     "indigenous",
     "amerindian",
     "native american",
+    "unknown ancestry",
 ]
 
 AUTOSOMES = {str(i) for i in range(1, 23)}
@@ -186,12 +188,12 @@ def filter_catalog(df: pd.DataFrame, p_threshold: float) -> pd.DataFrame:
     """
     n_start = len(df)
 
-    # MS trait filter (case-insensitive partial match)
-    mask_trait = df["DISEASE/TRAIT"].str.contains(
-        "multiple sclerosis", case=False, na=False
-    )
+    # MS trait filter: exact match to "Multiple sclerosis" only.
+    # Excludes sub-phenotypes such as MTAG, OCB status, severity scores,
+    # drug-induced outcomes, and relapse traits.
+    mask_trait = df["DISEASE/TRAIT"].str.strip().str.lower() == "multiple sclerosis"
     df = df[mask_trait].copy()
-    logger.debug(f"  After MS trait filter: {len(df):,} / {n_start:,}")
+    logger.debug(f"  After MS exact trait filter: {len(df):,} / {n_start:,}")
 
     if df.empty:
         return df
